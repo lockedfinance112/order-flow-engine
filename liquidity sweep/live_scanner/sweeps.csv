@@ -1,0 +1,5 @@
+timestamp,symbol,type,sweep_level,sweep_id
+2026-07-01T07:17:45.133821+00:00,btcusdt,bullish,58450.0,mock_sweep_btc_bull_2
+2026-07-01T07:17:46.134955+00:00,ethusdt,bearish,1585.0,mock_sweep_eth_bear_2
+2026-07-02T10:03:45.078646+00:00,btcusdt,bullish,58450.0,mock_sweep_btc_bull_2
+2026-07-02T10:03:46.080765+00:00,ethusdt,bearish,1585.0,mock_sweep_eth_bear_2

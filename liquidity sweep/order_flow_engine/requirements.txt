@@ -1,0 +1,4 @@
+websockets
+rich
+pandas
+python-dotenv
