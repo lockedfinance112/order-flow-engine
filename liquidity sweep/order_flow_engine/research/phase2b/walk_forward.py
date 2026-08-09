@@ -1,4 +1,6 @@
+import numpy as np
 import logging
+from research.phase2b.statistics import float_val, calculate_stats
 
 logger = logging.getLogger("OrderFlow.Phase2b.WalkForward")
 
@@ -19,24 +21,38 @@ class WalkForwardValidator:
             train_sigs = self.signals[:current_idx]
             val_sigs = self.signals[current_idx:current_idx + step_size]
             
-            # Evaluate on validation window
-            selected_val = [s for s in val_sigs if hypothesis_filter(s)]
-            # Simple outcomes
+            # Filter and parse validation signals
+            eligible_val = []
+            selected_val = []
+            
+            for s in val_sigs:
+                res = hypothesis_filter(s)
+                if res is not None:
+                    eligible_val.append(s)
+                    if res is True:
+                        selected_val.append(s)
+            
+            # Extract valid 15m returns
             val_returns = []
             for s in selected_val:
                 if s.get("horizon_15m_status") == "CAPTURED":
-                    val_returns.append(float(s.get("return_15m_pct", 0.0)))
-                    
-            win_rate = sum(1 for r in val_returns if r > 0) / len(val_returns) if val_returns else 0.0
-            avg_ret = sum(val_returns) / len(val_returns) if val_returns else 0.0
+                    val = float_val(s.get("return_15m_pct"))
+                    if val is not None:
+                        val_returns.append(val)
+            
+            stats = calculate_stats(val_returns)
             
             results.append({
                 "train_end_index": current_idx,
                 "validation_start": current_idx,
                 "validation_end": current_idx + step_size,
+                "eligible_n": len(eligible_val),
                 "candidate_n": len(selected_val),
-                "win_rate": win_rate,
-                "mean_return": avg_ret
+                "validation_n": len(val_sigs),
+                "win_rate": stats["win_rate"],
+                "mean_return": stats["avg_return"],
+                "median_return": stats["median_return"],
+                "expectancy": stats["expectancy"]
             })
             
             current_idx += step_size

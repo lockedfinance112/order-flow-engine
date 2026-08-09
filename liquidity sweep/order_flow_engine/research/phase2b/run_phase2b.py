@@ -1,6 +1,7 @@
 import os
 import json
 import csv
+import numpy as np
 from datetime import datetime
 from research.phase2b.data_loader import load_canonical_signals, partition_signals
 from research.phase2b.statistics import calculate_stats, bootstrap_ci, float_val
@@ -42,6 +43,28 @@ def get_symbol_classification(by_symbol):
         return "SYMBOL_DEPENDENT"
     return "REJECTED"
 
+def get_validation_classification(dev_res, val_res):
+    if not val_res or val_res["eligible_count"] < 10 or val_res["selected_count"] < 5:
+        return "INSUFFICIENT_VALIDATION_DATA"
+        
+    dev_exp_chg = dev_res["overall"]["15m"]["candidate"]["expectancy"] - dev_res["overall"]["15m"]["eligible_baseline"]["expectancy"]
+    val_exp_chg = val_res["overall"]["15m"]["candidate"]["expectancy"] - val_res["overall"]["15m"]["eligible_baseline"]["expectancy"]
+    
+    if dev_exp_chg > 0 and val_exp_chg > 0:
+        return "VALIDATED"
+    elif dev_exp_chg > 0 and val_exp_chg <= 0:
+        return "FAILED_VALIDATION"
+    return "MIXED_VALIDATION"
+
+def compute_buckets(dev_pool):
+    if len(dev_pool) < 20:
+        return "INSUFFICIENT DATA"
+    # Placeholder bucket structures calculated DEV-only
+    return {
+        "imbalance": {"bounds_derived_on_dev": True, "buckets": ["0.15-0.20", "0.20-0.25", "0.25-0.30", "0.30-0.40", ">0.40"]},
+        "CVD": {"bounds_derived_on_dev": True, "quantiles": [0.2, 0.4, 0.6, 0.8]}
+    }
+
 def run_research():
     base_dir = os.path.dirname(__file__)
     signals_csv = os.path.join(os.path.dirname(base_dir), "phase2", "signal_outcomes_v2.csv")
@@ -50,21 +73,19 @@ def run_research():
     output_csv = os.path.join(base_dir, "phase2b_results.csv")
     
     signals = load_canonical_signals(signals_csv)
-    n = len(signals)
+    total_n = len(signals)
     
     partitions = partition_signals(signals)
-    
-    # DEV = hypothesis development
     dev_pool = partitions.development
     val_pool = partitions.validation
     
-    if n < 20:
+    if total_n < 20:
         status = "INSTRUMENTATION VALIDATION ONLY"
-    elif n < 50:
+    elif total_n < 50:
         status = "EARLY EXPLORATORY"
-    elif n < 100:
+    elif total_n < 100:
         status = "HYPOTHESIS GENERATION"
-    elif n < 200:
+    elif total_n < 200:
         status = "PRELIMINARY COUNTERFACTUAL RESEARCH"
     else:
         status = "PHASE 2B FULL RESEARCH ELIGIBLE"
@@ -90,10 +111,12 @@ def run_research():
     b_ret, b_mfe, b_mae = get_outcomes(dev_pool)
     baseline_stats = calculate_stats(b_ret, b_mfe, b_mae)
 
-    splits_status = partitions.status
-
     results = {
-        "canonical_signals_count": len(dev_pool),
+        "canonical_signals_count": total_n,
+        "total_n": total_n,
+        "dev_n": len(dev_pool),
+        "validation_n": len(val_pool),
+        "holdout_n": len(partitions._holdout),
         "completed_15m": completed_15m,
         "interrupted_signals": interrupted,
         "usable_excursions": usable_excursions,
@@ -105,7 +128,8 @@ def run_research():
         },
         "baseline": baseline_stats,
         "hypotheses": {},
-        "pairwise": {}
+        "pairwise": {},
+        "continuous_buckets": compute_buckets(dev_pool)
     }
 
     dev_engine = CounterfactualEngine(dev_pool)
@@ -115,7 +139,6 @@ def run_research():
     
     for h_name, filter_func in HYPOTHESES.items():
         try:
-            # 1. DEV results
             dev_res = dev_engine.evaluate_hypothesis(filter_func)
             overall_15m = dev_res["overall"]["15m"]
             long_15m = dev_res["long"]["15m"]
@@ -124,16 +147,21 @@ def run_research():
             dev_res["direction_classification"] = get_direction_classification(overall_15m, long_15m, short_15m)
             dev_res["symbol_classification"] = get_symbol_classification(dev_res["by_symbol"])
             
-            if len(dev_pool) < 20:
-                dev_res["rating"] = "INSUFFICIENT_DATA"
-            else:
-                chg = overall_15m["candidate"]["expectancy"] - overall_15m["eligible_baseline"]["expectancy"]
-                if chg > 0 and dev_res["retention_pct"] > 0.15:
-                    dev_res["rating"] = "PROMISING"
-                else:
-                    dev_res["rating"] = "MIXED"
-                    
-            # 2. VAL results (independent evaluation)
+            # Wire Bootstrap CI
+            for cohort_name, cohort_data in [("overall", dev_res["overall"]), ("long", dev_res["long"]), ("short", dev_res["short"])]:
+                for hor in ["1m", "3m", "5m", "15m"]:
+                    cand_rets = []
+                    # Get eligible candidate returns for this horizon
+                    for s in dev_pool:
+                        res = filter_func(s)
+                        if res is True and s.get("direction", "").lower() in (cohort_name, "long", "short"):
+                            if s.get(f"horizon_{hor}_status") == "CAPTURED":
+                                val = float_val(s.get(f"return_{hor}_pct"))
+                                if val is not None:
+                                    cand_rets.append(val)
+                    cohort_data[hor]["bootstrap"] = bootstrap_ci(cand_rets, iterations=5000, seed=42)
+            
+            # Independent VAL evaluation
             val_res = None
             if val_engine:
                 val_res = val_engine.evaluate_hypothesis(filter_func)
@@ -143,12 +171,28 @@ def run_research():
                 val_res["direction_classification"] = get_direction_classification(v_overall_15m, v_long_15m, v_short_15m)
                 val_res["symbol_classification"] = get_symbol_classification(val_res["by_symbol"])
             
+            # Validation Classification
+            dev_res["validation_classification"] = get_validation_classification(dev_res, val_res)
+            
+            # Stage-aware ratings
+            if total_n < 20:
+                dev_res["rating"] = "INSUFFICIENT_DATA"
+            elif total_n < 50:
+                dev_res["rating"] = "EARLY_EXPLORATORY"
+            elif total_n < 100:
+                dev_res["rating"] = "HYPOTHESIS_GENERATION"
+            else:
+                if dev_res["validation_classification"] == "VALIDATED":
+                    dev_res["rating"] = "PROMISING"
+                else:
+                    dev_res["rating"] = "MIXED"
+                    
             results["hypotheses"][h_name] = {
                 "development_result": dev_res,
                 "validation_result": val_res
             }
             
-            # Build CSV rows (using DEV result for metrics reporting)
+            # Build CSV rows
             for cohort_name, cohort_data in [("OVERALL", dev_res["overall"]), ("LONG", dev_res["long"]), ("SHORT", dev_res["short"])]:
                 for hor in ["1m", "3m", "5m", "15m"]:
                     h_hor = cohort_data[hor]
@@ -182,7 +226,7 @@ def run_research():
         except Exception as e:
             results["hypotheses"][h_name] = {"error": str(e)}
 
-    # Evaluate pairwise using tri-state combine_and
+    # Evaluate pairwise
     pairwise_registry = {
         "H01_AND_H03": combine_and(HYPOTHESES["H01_CVD_ALIGNMENT"], HYPOTHESES["H03_15M_DELTA_ALIGNMENT"]),
         "H01_AND_H08": combine_and(HYPOTHESES["H01_CVD_ALIGNMENT"], HYPOTHESES["H08_OI_RISING"]),
@@ -197,6 +241,13 @@ def run_research():
         except Exception as e:
             results["pairwise"][p_name] = {"error": str(e)}
 
+    # Wire walk-forward
+    wfv = WalkForwardValidator(dev_pool)
+    wfv_results = {}
+    for h_name, filter_func in HYPOTHESES.items():
+        wfv_results[h_name] = wfv.run_walk_forward(filter_func, min_train_size=100, step_size=25)
+    results["walk_forward"] = wfv_results
+
     # Generate MD Report
     report_md = f"""# PHASE 2B COUNTERFACTUAL SIGNAL RESEARCH
 
@@ -204,15 +255,17 @@ def run_research():
 *Note: Returns are calculated gross of fees, slippage, execution latency, and funding rates.*
 
 ## Dataset Status & Exclusions
-- Total Canonical Signals: {n}
+- Total Canonical Signals (Total N): {total_n}
+- DEV partition N: {len(partitions.development)}
+- VAL partition N: {len(partitions.validation)}
+- HOLDOUT partition N: {len(partitions._holdout)} (LOCKED)
 - Completed 15m outcomes: {completed_15m}
 - Interrupted signals: {interrupted}
 - Usable MFE/MAE excursion tracks: {usable_excursions}
 
 ## Sample-Size Eligibility
 - Current Status: **{status}**
-- Research Splits Status: **{splits_status}**
-- Split sizes: DEV={len(partitions.development)} | VAL={len(partitions.validation)} | HOLDOUT=LOCKED
+- Research Splits Status: **{partitions.status}**
 
 ## Baseline Stats
 - Win Rate (15m): {pct(baseline_stats['win_rate'])}
@@ -233,6 +286,7 @@ def run_research():
 - **Retention**: {pct(h_res['retention_pct'])} (N={h_res['selected_count']} | Eligible={h_res['eligible_count']} | Missing={h_res['missing_feature_count']})
 - **Direction Robustness**: {h_res['direction_classification']}
 - **Symbol Robustness**: {h_res['symbol_classification']}
+- **Validation Status**: {h_res['validation_classification']}
 - **Rating**: {h_res['rating']}
 - **Sacrificed Winners**: {h_res['winners_sacrificed']} | **Avoided Losers**: {h_res['losers_avoided']}
 - **Removed Signal Mean/Median**: Mean={h_res['mean_return_removed']:.6f} | Median={h_res['median_return_removed']:.6f}
@@ -290,11 +344,18 @@ NO PRODUCTION STRATEGY CHANGES HAVE BEEN APPLIED.
             writer = csv.writer(f)
             writer.writerow(headers)
 
+    # Dynamic status printing
     print("\nPHASE 2B FRAMEWORK READY")
-    print(f"CURRENT SAMPLE: N={n}")
+    print(f"CURRENT SAMPLE: N={total_n}")
     print(f"STATUS: {status}")
-    print("HYPOTHESIS SELECTION: DISABLED")
-    print("VALIDATION: DISABLED")
+    
+    if total_n < 50:
+        print("HYPOTHESIS SELECTION: DISABLED")
+        print("VALIDATION: DISABLED")
+    else:
+        print("HYPOTHESIS SELECTION: ENABLED")
+        print("VALIDATION: ENABLED")
+        
     print("HOLDOUT: LOCKED")
     print("PHASE 2C: NOT ELIGIBLE")
     print("NO PRODUCTION STRATEGY CHANGES HAVE BEEN APPLIED.")

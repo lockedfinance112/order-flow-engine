@@ -97,6 +97,14 @@ class TestPhase2AResearch(unittest.TestCase):
         track1 = self.recorder.active_tracks[0]
         self.assertAlmostEqual(track1["max_favorable_pct"], 0.05)
         self.assertAlmostEqual(track1["max_adverse_pct"], 0.02)
+        
+        dec2 = self.mock_decision("CONFIRMED_SHORT")
+        self.recorder.register_signal_change("ETHUSDT", "WAITING", "CONFIRMED_SHORT", 100.0, dec2, {}, {}, {}, -0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
+        self.recorder.update_price("ETHUSDT", 95.0)
+        self.recorder.update_price("ETHUSDT", 103.0)
+        track2 = self.recorder.active_tracks[1]
+        self.assertAlmostEqual(track2["max_favorable_pct"], 0.05)
+        self.assertAlmostEqual(track2["max_adverse_pct"], 0.03)
 
     def test_downtime_missed_horizons(self):
         dec = self.mock_decision("CONFIRMED_LONG")
@@ -110,6 +118,8 @@ class TestPhase2AResearch(unittest.TestCase):
         )
         track = rec2.active_tracks[0]
         self.assertEqual(track["horizon_1m_status"], "MISSED_DURING_DOWNTIME")
+        self.assertEqual(track["horizon_3m_status"], "MISSED_DURING_DOWNTIME")
+        self.assertEqual(track["horizon_5m_status"], "PENDING")
 
     def test_recovered_excursion_exclusion(self):
         dec = self.mock_decision("CONFIRMED_LONG")
@@ -145,6 +155,16 @@ class TestPhase2AResearch(unittest.TestCase):
             active_json=self.json_name
         )
         self.assertTrue(rec2._append_to_csv(track))
+
+    def test_recorder_filesystem_failure_isolated(self):
+        self.recorder.signals_csv = "/invalid/dir/path/test.csv"
+        dec = self.mock_decision("CONFIRMED_LONG")
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
+        self.recorder.active_tracks[0]["entry_time"] = time.time() - 905.0
+        try:
+            self.recorder.finalize_expired_signals()
+        except Exception as e:
+            self.fail(f"Filesystem error leaked: {e}")
 
 if __name__ == "__main__":
     unittest.main()

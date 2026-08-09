@@ -4,7 +4,10 @@
 *Note: Returns are calculated gross of fees, slippage, execution latency, and funding rates.*
 
 ## Dataset Status & Exclusions
-- Total Canonical Signals: 0
+- Total Canonical Signals (Total N): 0
+- DEV partition N: 0
+- VAL partition N: 0
+- HOLDOUT partition N: 0 (LOCKED)
 - Completed 15m outcomes: 0
 - Interrupted signals: 0
 - Usable MFE/MAE excursion tracks: 0
@@ -12,7 +15,6 @@
 ## Sample-Size Eligibility
 - Current Status: **INSTRUMENTATION VALIDATION ONLY**
 - Research Splits Status: **NOT ACTIVATED — INSUFFICIENT SAMPLE**
-- Split sizes: DEV=0 | VAL=0 | HOLDOUT=LOCKED
 
 ## Baseline Stats
 - Win Rate (15m): 0.0000%
@@ -25,6 +27,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -34,6 +37,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -43,6 +47,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -52,6 +57,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -61,6 +67,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -70,6 +77,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -79,6 +87,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -88,6 +97,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -97,6 +107,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -106,6 +117,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -115,6 +127,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -124,6 +137,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -133,6 +147,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -142,6 +157,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -151,6 +167,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
@@ -160,6 +177,7 @@
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
 - **Direction Robustness**: INSUFFICIENT_DATA
 - **Symbol Robustness**: INSUFFICIENT_DATA
+- **Validation Status**: INSUFFICIENT_VALIDATION_DATA
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
