@@ -1,9 +1,19 @@
 import os
 import csv
-import json
 import logging
 
 logger = logging.getLogger("OrderFlow.Phase2b.DataLoader")
+
+class ResearchPartitions:
+    def __init__(self, development: list, validation: list, holdout: list, status: str):
+        self.development = development
+        self.validation = validation
+        self._holdout = holdout
+        self.status = status
+
+    def unlock_holdout_for_final_evaluation(self) -> list:
+        logger.warning("Caution: Unlocking holdout dataset partition!")
+        return self._holdout
 
 def load_canonical_signals(signals_csv_path: str) -> list:
     signals = []
@@ -20,16 +30,25 @@ def load_canonical_signals(signals_csv_path: str) -> list:
         logger.error(f"Error loading signals: {e}")
     return signals
 
-def split_dataset(signals: list) -> tuple:
+def partition_signals(signals: list) -> ResearchPartitions:
     # Sort chronologically by entry_time
     sorted_signals = sorted(signals, key=lambda x: float(x.get("entry_time", 0.0)))
     total = len(sorted_signals)
     
+    if total < 100:
+        return ResearchPartitions(
+            development=sorted_signals,
+            validation=[],
+            holdout=[],
+            status="NOT ACTIVATED — INSUFFICIENT SAMPLE"
+        )
+        
     dev_cutoff = int(total * 0.6)
     val_cutoff = int(total * 0.8)
     
-    dev = sorted_signals[:dev_cutoff]
-    val = sorted_signals[dev_cutoff:val_cutoff]
-    holdout = sorted_signals[val_cutoff:]
-    
-    return dev, val, holdout
+    return ResearchPartitions(
+        development=sorted_signals[:dev_cutoff],
+        validation=sorted_signals[dev_cutoff:val_cutoff],
+        holdout=sorted_signals[val_cutoff:],
+        status="HOLDOUT SPLITS ACTIVATED"
+    )

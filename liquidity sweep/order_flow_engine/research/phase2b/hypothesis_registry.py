@@ -1,24 +1,25 @@
 import json
+from research.phase2b.statistics import float_val
 
-def float_val(v):
-    if v is None or v == "" or v == "None" or v == "N/A":
-        return 0.0
-    try:
-        return float(v)
-    except ValueError:
-        return 0.0
-
-def get_events(sig: dict) -> list:
-    evs_str = sig.get("recent_events", "[]")
+def get_events(sig: dict):
+    evs_str = sig.get("recent_events")
+    if evs_str in (None, "", "None", "N/A", "MISSING"):
+        return None
     try:
         return json.loads(evs_str)
     except Exception:
-        return []
+        return None
+
+def String(v):
+    if v in (None, "", "None", "N/A", "MISSING"):
+        return None
+    return str(v)
 
 # H01
-def h01_cvd_alignment(sig: dict) -> bool:
-    direction = sig.get("direction")
+def h01_cvd_alignment(sig: dict):
     cvd = float_val(sig.get("session_cvd_usdt"))
+    if cvd is None: return None
+    direction = sig.get("direction")
     if direction == "LONG":
         return cvd > 0
     elif direction == "SHORT":
@@ -26,11 +27,12 @@ def h01_cvd_alignment(sig: dict) -> bool:
     return False
 
 # H02
-def h02_full_delta_alignment(sig: dict) -> bool:
-    direction = sig.get("direction")
+def h02_full_delta_alignment(sig: dict):
     d1 = float_val(sig.get("delta_1m_usdt"))
     d5 = float_val(sig.get("delta_5m_usdt"))
     d15 = float_val(sig.get("delta_15m_usdt"))
+    if d1 is None or d5 is None or d15 is None: return None
+    direction = sig.get("direction")
     if direction == "LONG":
         return d1 > 0 and d5 > 0 and d15 > 0
     elif direction == "SHORT":
@@ -38,9 +40,10 @@ def h02_full_delta_alignment(sig: dict) -> bool:
     return False
 
 # H03
-def h03_15m_delta_alignment(sig: dict) -> bool:
-    direction = sig.get("direction")
+def h03_15m_delta_alignment(sig: dict):
     d15 = float_val(sig.get("delta_15m_usdt"))
+    if d15 is None: return None
+    direction = sig.get("direction")
     if direction == "LONG":
         return d15 > 0
     elif direction == "SHORT":
@@ -48,9 +51,10 @@ def h03_15m_delta_alignment(sig: dict) -> bool:
     return False
 
 # H04
-def h04_stronger_book_20(sig: dict) -> bool:
-    direction = sig.get("direction")
+def h04_stronger_book_20(sig: dict):
     imb = float_val(sig.get("imbalance"))
+    if imb is None: return None
+    direction = sig.get("direction")
     if direction == "LONG":
         return imb >= 0.20
     elif direction == "SHORT":
@@ -58,9 +62,10 @@ def h04_stronger_book_20(sig: dict) -> bool:
     return False
 
 # H05
-def h05_stronger_book_30(sig: dict) -> bool:
-    direction = sig.get("direction")
+def h05_stronger_book_30(sig: dict):
     imb = float_val(sig.get("imbalance"))
+    if imb is None: return None
+    direction = sig.get("direction")
     if direction == "LONG":
         return imb >= 0.30
     elif direction == "SHORT":
@@ -68,10 +73,16 @@ def h05_stronger_book_30(sig: dict) -> bool:
     return False
 
 # H06
-def h06_active_directional_sweep(sig: dict) -> bool:
+def h06_active_directional_sweep(sig: dict):
+    sweep_active_str = sig.get("sweep_active")
+    if sweep_active_str in (None, "", "None", "N/A", "MISSING"): return None
+    sweep_active = sweep_active_str == "True" or sweep_active_str is True
+    
+    sweep_dir = String(sig.get("sweep_direction"))
+    if sweep_dir is None: return None
+    sweep_dir = sweep_dir.upper()
+    
     direction = sig.get("direction")
-    sweep_active = sig.get("sweep_active") == "True" or sig.get("sweep_active") is True
-    sweep_dir = String(sig.get("sweep_direction", "")).upper()
     if direction == "LONG":
         return sweep_active and "BULLISH" in sweep_dir
     elif direction == "SHORT":
@@ -79,19 +90,23 @@ def h06_active_directional_sweep(sig: dict) -> bool:
     return False
 
 # H07
-def h07_high_sweep_score(sig: dict) -> bool:
+def h07_high_sweep_score(sig: dict):
     score = float_val(sig.get("sweep_score"))
+    if score is None: return None
     return score >= 8
 
 # H08
-def h08_oi_rising(sig: dict) -> bool:
+def h08_oi_rising(sig: dict):
     oi_chg = float_val(sig.get("open_interest_change_pct"))
+    if oi_chg is None: return None
     return oi_chg > 0
 
 # H09
-def h09_trend_5m_aligned(sig: dict) -> bool:
+def h09_trend_5m_aligned(sig: dict):
+    trend = String(sig.get("trend_5m"))
+    if trend is None: return None
+    trend = trend.lower()
     direction = sig.get("direction")
-    trend = String(sig.get("trend_5m", "")).lower()
     if direction == "LONG":
         return trend == "up"
     elif direction == "SHORT":
@@ -99,9 +114,11 @@ def h09_trend_5m_aligned(sig: dict) -> bool:
     return False
 
 # H10
-def h10_trend_15m_aligned(sig: dict) -> bool:
+def h10_trend_15m_aligned(sig: dict):
+    trend = String(sig.get("trend_15m"))
+    if trend is None: return None
+    trend = trend.lower()
     direction = sig.get("direction")
-    trend = String(sig.get("trend_15m", "")).lower()
     if direction == "LONG":
         return trend == "up"
     elif direction == "SHORT":
@@ -109,10 +126,13 @@ def h10_trend_15m_aligned(sig: dict) -> bool:
     return False
 
 # H11
-def h11_trend_5m_and_15m_aligned(sig: dict) -> bool:
+def h11_trend_5m_and_15m_aligned(sig: dict):
+    t5 = String(sig.get("trend_5m"))
+    t15 = String(sig.get("trend_15m"))
+    if t5 is None or t15 is None: return None
+    t5 = t5.lower()
+    t15 = t15.lower()
     direction = sig.get("direction")
-    t5 = String(sig.get("trend_5m", "")).lower()
-    t15 = String(sig.get("trend_15m", "")).lower()
     if direction == "LONG":
         return t5 == "up" and t15 == "up"
     elif direction == "SHORT":
@@ -120,19 +140,22 @@ def h11_trend_5m_and_15m_aligned(sig: dict) -> bool:
     return False
 
 # H12
-def h12_binance_context_confirmed(sig: dict) -> bool:
-    confirm = String(sig.get("binance_context_confirm", "")).upper()
-    return confirm == "CONFIRMED"
+def h12_binance_context_confirmed(sig: dict):
+    confirm = String(sig.get("binance_context_confirm"))
+    if confirm is None: return None
+    return confirm.upper() == "CONFIRMED"
 
 # H13
-def h13_low_book_drift(sig: dict) -> bool:
+def h13_low_book_drift(sig: dict):
     drift = float_val(sig.get("book_drift"))
+    if drift is None: return None
     return drift < 0.30
 
 # H14
-def h14_no_opposing_divergence(sig: dict) -> bool:
-    direction = sig.get("direction")
+def h14_no_opposing_divergence(sig: dict):
     events = get_events(sig)
+    if events is None: return None
+    direction = sig.get("direction")
     if direction == "LONG":
         return "BEARISH_DIVERGENCE" not in events
     elif direction == "SHORT":
@@ -140,9 +163,10 @@ def h14_no_opposing_divergence(sig: dict) -> bool:
     return False
 
 # H15
-def h15_no_opposing_absorption(sig: dict) -> bool:
-    direction = sig.get("direction")
+def h15_no_opposing_absorption(sig: dict):
     events = get_events(sig)
+    if events is None: return None
+    direction = sig.get("direction")
     if direction == "LONG":
         return "BEARISH_ABSORPTION" not in events and "CONFIRMED_BEARISH_ABSORPTION" not in events and "POSSIBLE_BEARISH_ABSORPTION" not in events
     elif direction == "SHORT":
@@ -150,19 +174,15 @@ def h15_no_opposing_absorption(sig: dict) -> bool:
     return False
 
 # H16
-def h16_directional_aggression_present(sig: dict) -> bool:
-    direction = sig.get("direction")
+def h16_directional_aggression_present(sig: dict):
     events = get_events(sig)
+    if events is None: return None
+    direction = sig.get("direction")
     if direction == "LONG":
         return "BUY_AGGRESSION" in events
     elif direction == "SHORT":
         return "SELL_AGGRESSION" in events
     return False
-
-def String(v):
-    if v is None:
-        return ""
-    return str(v)
 
 HYPOTHESES = {
     "H01_CVD_ALIGNMENT": h01_cvd_alignment,

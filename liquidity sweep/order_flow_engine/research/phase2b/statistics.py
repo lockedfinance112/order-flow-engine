@@ -1,7 +1,7 @@
 import numpy as np
 
 def float_val(v):
-    if v is None or v == "" or v == "None" or v == "N/A":
+    if v in (None, "", "None", "N/A", "MISSING"):
         return None
     try:
         return float(v)
@@ -64,12 +64,13 @@ def calculate_stats(returns: list, mfes: list = None, maes: list = None) -> dict
 
 def bootstrap_ci(returns: list, iterations=5000, seed=42) -> dict:
     n = len(returns)
-    if n < 5:
+    if n < 20:
         return {
-            "win_rate": (0.0, 0.0),
-            "mean_return": (0.0, 0.0),
-            "median_return": (0.0, 0.0),
-            "expectancy": (0.0, 0.0)
+            "status": "INSUFFICIENT_SAMPLE_FOR_BOOTSTRAP",
+            "win_rate": None,
+            "mean_return": None,
+            "median_return": None,
+            "expectancy": None
         }
         
     rng = np.random.default_rng(seed)
@@ -90,6 +91,7 @@ def bootstrap_ci(returns: list, iterations=5000, seed=42) -> dict:
         expectancies.append((wr * avg_w) - ((1 - wr) * abs(avg_l)))
         
     return {
+        "status": "OK",
         "win_rate": (float(np.percentile(win_rates, 2.5)), float(np.percentile(win_rates, 97.5))),
         "mean_return": (float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))),
         "median_return": (float(np.percentile(medians, 2.5)), float(np.percentile(medians, 97.5))),
