@@ -7,6 +7,8 @@ import shutil
 from research.phase2.phase2_recorder import Phase2SignalRecorder
 from research.phase2.data_quality_report import run_audit
 from research.phase2.baseline_signal_quality import run_analysis
+from research.phase2b.statistics import calculate_stats, bootstrap_ci
+from research.phase2b.counterfactual_engine import CounterfactualEngine
 
 class TestPhase2Research(unittest.TestCase):
     def setUp(self):
@@ -157,17 +159,13 @@ class TestPhase2Research(unittest.TestCase):
         dec = self.mock_decision("CONFIRMED_LONG", cycle=999, version=1, ts=5555.0)
         self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
         track = self.recorder.active_tracks[0]
-        
-        # Simulate successful CSV write
         self.recorder._append_to_csv(track)
         
-        # Simulate active json re-reading the same track (checkpoint failure replay simulation)
         rec2 = Phase2SignalRecorder(
             output_dir=self.test_dir,
             signals_csv=self.csv_name,
             active_json=self.json_name
         )
-        # Should cleanly treat duplicate append as success without rewriting the row
         res = rec2._append_to_csv(track)
         self.assertTrue(res)
 
@@ -180,6 +178,33 @@ class TestPhase2Research(unittest.TestCase):
             self.recorder.finalize_expired_signals()
         except Exception as e:
             self.fail(f"Filesystem error leaked: {e}")
+
+    # Counterfactual engine tests
+    def test_16_baseline_unchanged_by_experiments(self):
+        signals = [
+            {"dataset_class": "CANONICAL_PHASE2", "direction": "LONG", "horizon_15m_status": "CAPTURED", "return_15m_pct": "0.02"},
+            {"dataset_class": "CANONICAL_PHASE2", "direction": "LONG", "horizon_15m_status": "CAPTURED", "return_15m_pct": "-0.01"}
+        ]
+        engine = CounterfactualEngine(signals)
+        res = engine.evaluate_hypothesis(lambda s: float(s["return_15m_pct"]) > 0)
+        self.assertEqual(res["baseline_count"], 2)
+        self.assertEqual(res["candidate_count"], 1)
+        self.assertEqual(len(engine.baseline_signals), 2) # baseline remains unchanged
+
+    def test_17_retention_calculation(self):
+        signals = [
+            {"dataset_class": "CANONICAL_PHASE2", "direction": "LONG", "horizon_15m_status": "CAPTURED", "return_15m_pct": "0.02"},
+            {"dataset_class": "CANONICAL_PHASE2", "direction": "SHORT", "horizon_15m_status": "CAPTURED", "return_15m_pct": "-0.01"}
+        ]
+        engine = CounterfactualEngine(signals)
+        res = engine.evaluate_hypothesis(lambda s: s["direction"] == "LONG")
+        self.assertEqual(res["retention_pct"], 0.5)
+
+    def test_18_bootstrap_ci_reproducibility(self):
+        returns = [0.01, -0.02, 0.03, -0.01, 0.02, -0.03, 0.01, -0.01]
+        ci1 = bootstrap_ci(returns, iterations=100, seed=42)
+        ci2 = bootstrap_ci(returns, iterations=100, seed=42)
+        self.assertEqual(ci1["win_rate"], ci2["win_rate"])
 
 if __name__ == "__main__":
     unittest.main()
