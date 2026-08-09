@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 logger = logging.getLogger("OrderFlow.Phase2Recorder")
 
 COLUMNS = [
-    "signal_id", "symbol", "direction", "action", "entry_time", "entry_price",
+    "signal_id", "canonical_event_key", "symbol", "direction", "action", "entry_time", "entry_price",
     "scanner_cycle_id", "action_version", "decision_reason",
     "delta_1m_usdt", "delta_5m_usdt", "delta_15m_usdt", "session_cvd_usdt",
     "buy_ratio_1m", "buy_ratio_5m", "imbalance", "spread_bps",
@@ -57,11 +57,13 @@ class Phase2SignalRecorder:
         self.active_json = os.path.join(self.base_dir, active_json)
         
         self.active_tracks = []
-        self.registered_idempotency_keys = set()
+        self.completed_event_keys = set()
+        self.active_event_keys = set()
         self.last_checkpoint_time = time.time()
         self.dirty = False
         
         self._ensure_headers()
+        self._load_completed_keys()
         self._load_active_signals()
 
     def _ensure_headers(self):
@@ -72,6 +74,18 @@ class Phase2SignalRecorder:
                     writer.writerow(COLUMNS)
             except Exception as e:
                 logger.error(f"Failed to create CSV headers: {e}")
+
+    def _load_completed_keys(self):
+        if os.path.exists(self.signals_csv):
+            try:
+                with open(self.signals_csv, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        key = row.get("canonical_event_key")
+                        if key:
+                            self.completed_event_keys.add(key)
+            except Exception as e:
+                logger.error(f"Failed to load completed event keys: {e}")
 
     def _load_active_signals(self):
         if os.path.exists(self.active_json):
@@ -85,9 +99,9 @@ class Phase2SignalRecorder:
                         t["recovered_after_restart"] = True
                         t["excursion_coverage_status"] = "INTERRUPTED"
                         
-                        # Populate idempotency key from loaded track
-                        ik = f"{t['symbol'].lower()}_{t['action'].lower()}_{t['scanner_cycle_id']}_{t['action_version']}"
-                        self.registered_idempotency_keys.add(ik)
+                        key = t.get("canonical_event_key")
+                        if key:
+                            self.active_event_keys.add(key)
                         
                         horizons = [("1m", 60.0), ("3m", 180.0), ("5m", 300.0), ("15m", 900.0)]
                         for h, target in horizons:
@@ -96,7 +110,6 @@ class Phase2SignalRecorder:
                         
                         if elapsed >= 900.0:
                             t["completion_status"] = "INTERRUPTED"
-                            # Attempt write; if it fails, keep in active tracks to retry later
                             if self._append_to_csv(t):
                                 continue
                         
@@ -135,16 +148,18 @@ class Phase2SignalRecorder:
             decision = copy.deepcopy(decision_snapshot)
             scanner_cycle = decision.get("scanner_cycle_id", 0)
             action_version = decision.get("action_version", 1)
+            committed_ts = decision.get("timestamp", time.time())
 
-            # 1. Enforce Idempotency check using symbol + action + cycle + version
-            ik = f"{symbol.lower()}_{new_action.lower()}_{scanner_cycle}_{action_version}"
-            if ik in self.registered_idempotency_keys:
-                logger.info(f"[Research] Idempotent key {ik} already registered. Skipping.")
+            # 1. Build composite canonical_event_key
+            canonical_event_key = f"{symbol.lower()}_{new_action.lower()}_{scanner_cycle}_{action_version}_{committed_ts}"
+            
+            # 2. Skip if key exists in active or completed sets
+            if canonical_event_key in self.active_event_keys or canonical_event_key in self.completed_event_keys:
+                logger.info(f"[Research] Idempotent key {canonical_event_key} already recorded. Skipping.")
                 return
-            self.registered_idempotency_keys.add(ik)
+            
+            self.active_event_keys.add(canonical_event_key)
 
-            # Anchor entry_time to the committed decision timestamp
-            entry_time = decision.get("timestamp", time.time())
             direction = "LONG" if "LONG" in new_action else "SHORT"
             signal_id = str(uuid.uuid4())
             commit_sha = _get_git_commit_sha()
@@ -163,16 +178,17 @@ class Phase2SignalRecorder:
             if bc_ts:
                 try:
                     dt = datetime.fromisoformat(bc_ts.replace("Z", "+00:00"))
-                    bc_age = entry_time - dt.timestamp()
+                    bc_age = committed_ts - dt.timestamp()
                 except Exception:
                     pass
 
             track = {
                 "signal_id": signal_id,
+                "canonical_event_key": canonical_event_key,
                 "symbol": symbol.upper(),
                 "direction": direction,
                 "action": new_action,
-                "entry_time": entry_time,
+                "entry_time": committed_ts,
                 "entry_price": price,
                 "scanner_cycle_id": scanner_cycle,
                 "action_version": action_version,
@@ -274,7 +290,6 @@ class Phase2SignalRecorder:
                         fav = (entry_price - price) / entry_price
                         adv = (price - entry_price) / entry_price
                         
-                    # Set dirty = True if excursions updated
                     if track["completion_status"] == "PENDING" and track.get("excursion_coverage_status") == "COMPLETE":
                         old_fav = track["max_favorable_pct"]
                         old_adv = track["max_adverse_pct"]
@@ -320,7 +335,6 @@ class Phase2SignalRecorder:
                 elapsed = now - track["entry_time"]
                 if elapsed >= 900.0:  # 15m
                     
-                    # Determine completed/interrupted outcome statuses
                     if track["horizon_15m_status"] == "PENDING":
                         track["horizon_15m_status"] = "INTERRUPTED"
                         track["completion_status"] = "INTERRUPTED"
@@ -331,14 +345,15 @@ class Phase2SignalRecorder:
                         
                     track["completed_time"] = datetime.now(timezone.utc).isoformat()
                     
-                    # Mark any remaining pending horizons as interrupted
                     for h in ["1m", "3m", "5m", "15m"]:
                         if track[f"horizon_{h}_status"] == "PENDING":
                             track[f"horizon_{h}_status"] = "INTERRUPTED"
                     
-                    # Safe CSV append: do not delete track from active list if write fails!
                     if self._append_to_csv(track):
                         to_remove.append(track)
+                        key = track.get("canonical_event_key")
+                        if key:
+                            self.active_event_keys.discard(key)
                     
             if to_remove:
                 for track in to_remove:
@@ -350,11 +365,19 @@ class Phase2SignalRecorder:
 
     def _append_to_csv(self, track: dict) -> bool:
         try:
+            key = track.get("canonical_event_key")
+            if key and key in self.completed_event_keys:
+                logger.info(f"[Research] Key {key} already present in completed CSV. Skipping append (treated as success).")
+                return True
+                
             row = [track.get(col, "") for col in COLUMNS]
             with open(self.signals_csv, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(row)
             logger.info(f"[Research] Logged signal outcome: {track['symbol']} | {track['direction']} | {track['completion_status']}")
+            
+            if key:
+                self.completed_event_keys.add(key)
             return True
         except Exception as e:
             logger.error(f"Failed to append to CSV: {e}")

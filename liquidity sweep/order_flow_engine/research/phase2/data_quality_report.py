@@ -5,7 +5,8 @@ from datetime import datetime
 
 def run_audit():
     base_dir = os.path.dirname(__file__)
-    legacy_file = os.path.join(os.path.dirname(base_dir), "bias_signals.csv")
+    # Corrected path to engine root
+    legacy_file = os.path.join(os.path.dirname(os.path.dirname(base_dir)), "bias_signals.csv")
     phase2_file = os.path.join(base_dir, "signal_outcomes_v2.csv")
     output_json = os.path.join(base_dir, "data_quality_report.json")
 
@@ -28,6 +29,7 @@ def run_audit():
             "price_after_15m": 0
         },
         "duplicate_signal_ids": 0,
+        "duplicate_canonical_event_keys": 0,
         "duplicate_transitions": 0,
         "impossible_timestamps": 0,
         "incomplete_15m_signals": 0,
@@ -55,27 +57,24 @@ def run_audit():
                 report["phase2_canonical_signals_rows"] = len(rows)
                 
                 signal_ids = set()
+                event_keys = set()
                 transitions_seen = set()
                 
                 for row in rows:
-                    # Direction counting
                     direction = row.get("direction", "")
                     if direction == "LONG":
                         report["phase2_long_count"] += 1
                     elif direction == "SHORT":
                         report["phase2_short_count"] += 1
                         
-                    # Symbol counting
                     sym = row.get("symbol", "").upper()
                     if sym:
                         report["phase2_by_symbol"][sym] = report["phase2_by_symbol"].get(sym, 0) + 1
                         
-                    # Timestamp range
                     entry_time_raw = row.get("entry_time")
                     if entry_time_raw:
                         try:
                             ts = float(entry_time_raw)
-                            # Convert to ISO string
                             dt = datetime.fromtimestamp(ts)
                             dt_str = dt.isoformat()
                             if report["first_timestamp"] is None or dt_str < report["first_timestamp"]:
@@ -85,26 +84,28 @@ def run_audit():
                         except Exception:
                             pass
                             
-                    # Missing fields audit
                     for field in report["missing_fields"]:
                         val = row.get(field)
                         if val is None or val == "" or val == "None" or val == "N/A" or val == "MISSING":
                             report["missing_fields"][field] += 1
                             
-                    # Duplicate check
                     sig_id = row.get("signal_id")
                     if sig_id:
                         if sig_id in signal_ids:
                             report["duplicate_signal_ids"] += 1
                         signal_ids.add(sig_id)
+
+                    event_key = row.get("canonical_event_key")
+                    if event_key:
+                        if event_key in event_keys:
+                            report["duplicate_canonical_event_keys"] += 1
+                        event_keys.add(event_key)
                         
-                    # Duplicate transition check
                     trans_key = (row.get("symbol"), row.get("entry_time"), row.get("action"))
                     if trans_key in transitions_seen:
                         report["duplicate_transitions"] += 1
                     transitions_seen.add(trans_key)
                     
-                    # Impossible timestamps (e.g. entry_time > completed_time)
                     comp_time_raw = row.get("completed_time")
                     if entry_time_raw and comp_time_raw:
                         try:
@@ -115,7 +116,6 @@ def run_audit():
                         except Exception:
                             pass
                             
-                    # Status audits
                     status = row.get("completion_status")
                     if status == "INTERRUPTED":
                         report["interrupted_signals"] += 1
@@ -125,7 +125,6 @@ def run_audit():
         except Exception as e:
             print(f"Error auditing phase2 signals: {e}")
 
-    # Write report
     try:
         with open(output_json, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
@@ -137,6 +136,7 @@ def run_audit():
         print(f"Last timestamp: {report['last_timestamp']}")
         print(f"Missing price_after_15m count: {report['missing_fields']['price_after_15m']}")
         print(f"Duplicate IDs: {report['duplicate_signal_ids']}")
+        print(f"Duplicate Event Keys: {report['duplicate_canonical_event_keys']}")
         print(f"Interrupted signals: {report['interrupted_signals']}")
         print("Data Quality status: COMPLETED")
     except Exception as e:

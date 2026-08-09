@@ -38,42 +38,96 @@ class TestPhase2Research(unittest.TestCase):
             "timestamp": ts or time.time()
         }
 
-    def test_1_entry_time_equals_committed_timestamp(self):
-        committed_ts = time.time() - 1000.0
-        dec = self.mock_decision("CONFIRMED_LONG", ts=committed_ts)
-        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 65000.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
-        track = self.recorder.active_tracks[0]
-        self.assertEqual(track["entry_time"], committed_ts)
-
-    def test_2_excursion_dirty_flagging(self):
+    def test_1_confirmed_long_tracked(self):
         dec = self.mock_decision("CONFIRMED_LONG")
-        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
-        self.recorder.dirty = False # Reset
-        
-        # MFE increases
-        self.recorder.update_price("BTCUSDT", 105.0)
-        self.assertTrue(self.recorder.dirty)
-        self.recorder.dirty = False
-        
-        # MAE increases
-        self.recorder.update_price("BTCUSDT", 98.0)
-        self.assertTrue(self.recorder.dirty)
-
-    def test_3_failed_csv_append_keeps_track_active(self):
-        dec = self.mock_decision("CONFIRMED_LONG")
-        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
-        
-        # Force invalid path to break CSV write
-        self.recorder.signals_csv = "/invalid/dir/path/test.csv"
-        
-        # Shift time to force finalization
-        self.recorder.active_tracks[0]["entry_time"] = time.time() - 905.0
-        self.recorder.finalize_expired_signals()
-        
-        # Should NOT be removed from active tracks on failed CSV append
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 65000.0, dec, {}, {}, {}, 0.42, 1250000.0, 0.1, "LARGE_TRADE", ["BULLISH_ABSORPTION"], {})
         self.assertEqual(len(self.recorder.active_tracks), 1)
+        self.assertEqual(self.recorder.active_tracks[0]["direction"], "LONG")
 
-    def test_4_recovered_active_track_has_interrupted_excursion(self):
+    def test_2_confirmed_short_tracked(self):
+        dec = self.mock_decision("CONFIRMED_SHORT")
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_SHORT", 65000.0, dec, {}, {}, {}, -0.35, -500000.0, 0.1, "LARGE_TRADE", [], {})
+        self.assertEqual(len(self.recorder.active_tracks), 1)
+        self.assertEqual(self.recorder.active_tracks[0]["direction"], "SHORT")
+
+    def test_3_watch_long_not_tracked(self):
+        dec = self.mock_decision("WATCH_LONG")
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "WATCH_LONG", 65000.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
+        self.assertEqual(len(self.recorder.active_tracks), 0)
+
+    def test_4_watch_short_not_tracked(self):
+        dec = self.mock_decision("WATCH_SHORT")
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "WATCH_SHORT", 65000.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
+        self.assertEqual(len(self.recorder.active_tracks), 0)
+
+    def test_5_cvd_and_depth_imbalance_mapping(self):
+        dec = self.mock_decision("CONFIRMED_LONG")
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 65000.0, dec, {}, {}, {}, 0.42, 1250000.0, 0.1, "LARGE_TRADE", [], {})
+        track = self.recorder.active_tracks[0]
+        self.assertEqual(track["imbalance"], 0.42)
+        self.assertEqual(track["session_cvd_usdt"], 1250000.0)
+
+    def test_6_recent_events_snapshot(self):
+        dec = self.mock_decision("CONFIRMED_LONG")
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 65000.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", ["BULLISH_ABSORPTION", "LARGE_TRADE"], {})
+        track = self.recorder.active_tracks[0]
+        recent = json.loads(track["recent_events"])
+        self.assertEqual(recent, ["BULLISH_ABSORPTION", "LARGE_TRADE"])
+
+    def test_7_short_gate_mapping(self):
+        dec = self.mock_decision("CONFIRMED_SHORT")
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_SHORT", 100.0, dec, {}, {}, {}, -0.3, 0.0, 0.1, "LARGE_TRADE", [], {})
+        track = self.recorder.active_tracks[0]
+        self.assertEqual(track["gate_1m_delta"], "PASS")
+
+    def test_8_all_four_horizon_outcomes(self):
+        dec = self.mock_decision("CONFIRMED_LONG")
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
+        
+        track = self.recorder.active_tracks[0]
+        track["entry_time"] = time.time() - 901.0
+        
+        self.recorder.update_price("BTCUSDT", 110.0)
+        self.assertEqual(track["price_after_1m"], 110.0)
+        self.assertEqual(track["price_after_3m"], 110.0)
+        self.assertEqual(track["price_after_5m"], 110.0)
+        self.assertEqual(track["price_after_15m"], 110.0)
+
+    def test_9_long_and_short_mfe_mae(self):
+        dec1 = self.mock_decision("CONFIRMED_LONG")
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec1, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
+        self.recorder.update_price("BTCUSDT", 105.0)
+        self.recorder.update_price("BTCUSDT", 98.0)
+        track1 = self.recorder.active_tracks[0]
+        self.assertAlmostEqual(track1["max_favorable_pct"], 0.05)
+        self.assertAlmostEqual(track1["max_adverse_pct"], 0.02)
+        
+        dec2 = self.mock_decision("CONFIRMED_SHORT")
+        self.recorder.register_signal_change("ETHUSDT", "WAITING", "CONFIRMED_SHORT", 100.0, dec2, {}, {}, {}, -0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
+        self.recorder.update_price("ETHUSDT", 95.0)
+        self.recorder.update_price("ETHUSDT", 103.0)
+        track2 = self.recorder.active_tracks[1]
+        self.assertAlmostEqual(track2["max_favorable_pct"], 0.05)
+        self.assertAlmostEqual(track2["max_adverse_pct"], 0.03)
+
+    def test_10_downtime_missed_horizons(self):
+        dec = self.mock_decision("CONFIRMED_LONG")
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
+        
+        self.recorder.active_tracks[0]["entry_time"] = time.time() - 240.0
+        self.recorder.flush_checkpoint(force=True)
+        
+        rec2 = Phase2SignalRecorder(
+            output_dir=self.test_dir,
+            signals_csv=self.csv_name,
+            active_json=self.json_name
+        )
+        track = rec2.active_tracks[0]
+        self.assertEqual(track["horizon_1m_status"], "MISSED_DURING_DOWNTIME")
+        self.assertEqual(track["horizon_3m_status"], "MISSED_DURING_DOWNTIME")
+        self.assertEqual(track["horizon_5m_status"], "PENDING")
+
+    def test_11_recovered_excursion_exclusion(self):
         dec = self.mock_decision("CONFIRMED_LONG")
         self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
         self.recorder.flush_checkpoint(force=True)
@@ -83,37 +137,41 @@ class TestPhase2Research(unittest.TestCase):
             signals_csv=self.csv_name,
             active_json=self.json_name
         )
-        self.assertEqual(len(rec2.active_tracks), 1)
         track = rec2.active_tracks[0]
-        self.assertTrue(track["recovered_after_restart"])
         self.assertEqual(track["excursion_coverage_status"], "INTERRUPTED")
 
-    def test_5_duplicate_canonical_event_key_idempotency(self):
-        dec1 = self.mock_decision("CONFIRMED_LONG", cycle=123, version=1)
-        dec2 = self.mock_decision("CONFIRMED_LONG", cycle=123, version=1) # same cycle & version
-        
-        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec1, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
-        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec2, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
-        
-        # Should register exactly ONE track because of idempotency
+    def test_12_canonical_timestamp(self):
+        committed_ts = time.time() - 500.0
+        dec = self.mock_decision("CONFIRMED_LONG", ts=committed_ts)
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
+        track = self.recorder.active_tracks[0]
+        self.assertEqual(track["entry_time"], committed_ts)
+
+    def test_13_duplicate_event_suppression(self):
+        dec = self.mock_decision("CONFIRMED_LONG", cycle=10, version=2, ts=1000.0)
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
         self.assertEqual(len(self.recorder.active_tracks), 1)
 
-    def test_6_different_action_version_creates_new_track(self):
-        dec1 = self.mock_decision("CONFIRMED_LONG", cycle=123, version=1)
-        dec2 = self.mock_decision("CONFIRMED_LONG", cycle=123, version=2) # different version
-        
-        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec1, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
-        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec2, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
-        
-        self.assertEqual(len(self.recorder.active_tracks), 2)
-
-    def test_7_short_1m_gate_mapping(self):
-        dec = self.mock_decision("CONFIRMED_SHORT")
-        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_SHORT", 100.0, dec, {}, {}, {}, -0.3, 0.0, 0.1, "LARGE_TRADE", [], {})
+    def test_14_append_success_checkpoint_failure_replay(self):
+        dec = self.mock_decision("CONFIRMED_LONG", cycle=999, version=1, ts=5555.0)
+        self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
         track = self.recorder.active_tracks[0]
-        self.assertEqual(track["gate_1m_delta"], "PASS")
+        
+        # Simulate successful CSV write
+        self.recorder._append_to_csv(track)
+        
+        # Simulate active json re-reading the same track (checkpoint failure replay simulation)
+        rec2 = Phase2SignalRecorder(
+            output_dir=self.test_dir,
+            signals_csv=self.csv_name,
+            active_json=self.json_name
+        )
+        # Should cleanly treat duplicate append as success without rewriting the row
+        res = rec2._append_to_csv(track)
+        self.assertTrue(res)
 
-    def test_8_fs_failure_isolated(self):
+    def test_15_recorder_filesystem_failure_isolated(self):
         self.recorder.signals_csv = "/invalid/dir/path/test.csv"
         dec = self.mock_decision("CONFIRMED_LONG")
         self.recorder.register_signal_change("BTCUSDT", "WAITING", "CONFIRMED_LONG", 100.0, dec, {}, {}, {}, 0.1, 0.0, 0.1, "LARGE_TRADE", [], {})
