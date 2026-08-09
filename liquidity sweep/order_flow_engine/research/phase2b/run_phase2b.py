@@ -4,7 +4,7 @@ import csv
 from datetime import datetime
 from research.phase2b.data_loader import load_canonical_signals, partition_signals
 from research.phase2b.statistics import calculate_stats, bootstrap_ci, float_val
-from research.phase2b.hypothesis_registry import HYPOTHESES
+from research.phase2b.hypothesis_registry import HYPOTHESES, combine_and
 from research.phase2b.counterfactual_engine import CounterfactualEngine
 from research.phase2b.walk_forward import WalkForwardValidator
 
@@ -16,8 +16,8 @@ def pct(val):
 def get_direction_classification(overall, long, short):
     if overall["candidate"]["count"] < 10 or long["candidate"]["count"] < 5 or short["candidate"]["count"] < 5:
         return "INSUFFICIENT_DATA"
-    l_exp = long["candidate"]["expectancy"] - long["baseline"]["expectancy"]
-    s_exp = short["candidate"]["expectancy"] - short["baseline"]["expectancy"]
+    l_exp = long["candidate"]["expectancy"] - long["eligible_baseline"]["expectancy"]
+    s_exp = short["candidate"]["expectancy"] - short["eligible_baseline"]["expectancy"]
     
     if l_exp > 0 and s_exp > 0:
         return "BALANCED"
@@ -53,7 +53,10 @@ def run_research():
     n = len(signals)
     
     partitions = partition_signals(signals)
-    research_pool = partitions.development
+    
+    # DEV = hypothesis development
+    dev_pool = partitions.development
+    val_pool = partitions.validation
     
     if n < 20:
         status = "INSTRUMENTATION VALIDATION ONLY"
@@ -66,9 +69,9 @@ def run_research():
     else:
         status = "PHASE 2B FULL RESEARCH ELIGIBLE"
 
-    completed_15m = sum(1 for s in research_pool if s.get("horizon_15m_status") == "CAPTURED")
-    interrupted = sum(1 for s in research_pool if s.get("completion_status") == "INTERRUPTED")
-    usable_excursions = sum(1 for s in research_pool if s.get("completion_status") == "CAPTURED" and s.get("excursion_coverage_status") == "COMPLETE")
+    completed_15m = sum(1 for s in dev_pool if s.get("horizon_15m_status") == "CAPTURED")
+    interrupted = sum(1 for s in dev_pool if s.get("completion_status") == "INTERRUPTED")
+    usable_excursions = sum(1 for s in dev_pool if s.get("completion_status") == "CAPTURED" and s.get("excursion_coverage_status") == "COMPLETE")
 
     def get_outcomes(sigs):
         ret_15m = []
@@ -84,13 +87,13 @@ def run_research():
                 if a is not None: maes.append(a)
         return ret_15m, mfes, maes
 
-    b_ret, b_mfe, b_mae = get_outcomes(research_pool)
+    b_ret, b_mfe, b_mae = get_outcomes(dev_pool)
     baseline_stats = calculate_stats(b_ret, b_mfe, b_mae)
 
-    splits_status = "HOLDOUT NOT ACTIVATED — INSUFFICIENT SAMPLE" if n < 100 else "HOLDOUT SPLITS ACTIVATED"
+    splits_status = partitions.status
 
     results = {
-        "canonical_signals_count": len(research_pool),
+        "canonical_signals_count": len(dev_pool),
         "completed_15m": completed_15m,
         "interrupted_signals": interrupted,
         "usable_excursions": usable_excursions,
@@ -105,77 +108,96 @@ def run_research():
         "pairwise": {}
     }
 
-    engine = CounterfactualEngine(research_pool)
+    dev_engine = CounterfactualEngine(dev_pool)
+    val_engine = CounterfactualEngine(val_pool) if val_pool else None
+    
     csv_rows = []
     
     for h_name, filter_func in HYPOTHESES.items():
         try:
-            h_res = engine.evaluate_hypothesis(filter_func)
+            # 1. DEV results
+            dev_res = dev_engine.evaluate_hypothesis(filter_func)
+            overall_15m = dev_res["overall"]["15m"]
+            long_15m = dev_res["long"]["15m"]
+            short_15m = dev_res["short"]["15m"]
             
-            overall_15m = h_res["overall"]["15m"]
-            long_15m = h_res["long"]["15m"]
-            short_15m = h_res["short"]["15m"]
+            dev_res["direction_classification"] = get_direction_classification(overall_15m, long_15m, short_15m)
+            dev_res["symbol_classification"] = get_symbol_classification(dev_res["by_symbol"])
             
-            h_res["direction_classification"] = get_direction_classification(overall_15m, long_15m, short_15m)
-            h_res["symbol_classification"] = get_symbol_classification(h_res["by_symbol"])
-            
-            if n < 20:
-                h_res["rating"] = "INSUFFICIENT_DATA"
+            if len(dev_pool) < 20:
+                dev_res["rating"] = "INSUFFICIENT_DATA"
             else:
-                chg = overall_15m["candidate"]["expectancy"] - overall_15m["baseline"]["expectancy"]
-                if chg > 0 and h_res["retention_pct"] > 0.15:
-                    h_res["rating"] = "PROMISING"
+                chg = overall_15m["candidate"]["expectancy"] - overall_15m["eligible_baseline"]["expectancy"]
+                if chg > 0 and dev_res["retention_pct"] > 0.15:
+                    dev_res["rating"] = "PROMISING"
                 else:
-                    h_res["rating"] = "MIXED"
+                    dev_res["rating"] = "MIXED"
                     
-            results["hypotheses"][h_name] = h_res
+            # 2. VAL results (independent evaluation)
+            val_res = None
+            if val_engine:
+                val_res = val_engine.evaluate_hypothesis(filter_func)
+                v_overall_15m = val_res["overall"]["15m"]
+                v_long_15m = val_res["long"]["15m"]
+                v_short_15m = val_res["short"]["15m"]
+                val_res["direction_classification"] = get_direction_classification(v_overall_15m, v_long_15m, v_short_15m)
+                val_res["symbol_classification"] = get_symbol_classification(val_res["by_symbol"])
             
-            for cohort_name, cohort_data in [("OVERALL", h_res["overall"]), ("LONG", h_res["long"]), ("SHORT", h_res["short"])]:
+            results["hypotheses"][h_name] = {
+                "development_result": dev_res,
+                "validation_result": val_res
+            }
+            
+            # Build CSV rows (using DEV result for metrics reporting)
+            for cohort_name, cohort_data in [("OVERALL", dev_res["overall"]), ("LONG", dev_res["long"]), ("SHORT", dev_res["short"])]:
                 for hor in ["1m", "3m", "5m", "15m"]:
                     h_hor = cohort_data[hor]
-                    b_stats = h_hor["baseline"]
+                    b_stats = h_hor["total_baseline"]
+                    e_stats = h_hor["eligible_baseline"]
                     c_stats = h_hor["candidate"]
                     
                     csv_rows.append({
                         "hypothesis": h_name,
                         "cohort": cohort_name,
                         "horizon": hor,
-                        "eligible_n": h_res["eligible_count"],
+                        "eligible_n": dev_res["eligible_count"],
                         "candidate_n": c_stats["count"],
-                        "retention_pct": pct(h_res["retention_pct"]),
-                        "baseline_win_rate": pct(b_stats["win_rate"]),
+                        "retention_pct": pct(dev_res["retention_pct"]),
+                        "baseline_win_rate": pct(e_stats["win_rate"]),
                         "candidate_win_rate": pct(c_stats["win_rate"]),
-                        "delta_win_rate": pct(c_stats["win_rate"] - b_stats["win_rate"]),
-                        "baseline_expectancy": f"{b_stats['expectancy']:.6f}",
+                        "delta_win_rate": pct(c_stats["win_rate"] - e_stats["win_rate"]),
+                        "baseline_expectancy": f"{e_stats['expectancy']:.6f}",
                         "candidate_expectancy": f"{c_stats['expectancy']:.6f}",
-                        "delta_expectancy": f"{(c_stats['expectancy'] - b_stats['expectancy']):.6f}",
-                        "baseline_median_return": f"{b_stats['median_return']:.6f}",
+                        "delta_expectancy": f"{(c_stats['expectancy'] - e_stats['expectancy']):.6f}",
+                        "baseline_median_return": f"{e_stats['median_return']:.6f}",
                         "candidate_median_return": f"{c_stats['median_return']:.6f}",
-                        "delta_median_return": f"{(c_stats['median_return'] - b_stats['median_return']):.6f}",
+                        "delta_median_return": f"{(c_stats['median_return'] - e_stats['median_return']):.6f}",
                         "profit_factor": f"{c_stats['profit_factor']:.4f}",
-                        "winners_sacrificed": h_res["winners_sacrificed"],
-                        "losers_avoided": h_res["losers_avoided"],
+                        "winners_sacrificed": dev_res["winners_sacrificed"],
+                        "losers_avoided": dev_res["losers_avoided"],
                         "sample_grade": status,
-                        "rating": h_res["rating"]
+                        "rating": dev_res["rating"]
                     })
                     
         except Exception as e:
             results["hypotheses"][h_name] = {"error": str(e)}
 
+    # Evaluate pairwise using tri-state combine_and
     pairwise_registry = {
-        "H01_AND_H03": lambda s: HYPOTHESES["H01_CVD_ALIGNMENT"](s) is True and HYPOTHESES["H03_15M_DELTA_ALIGNMENT"](s) is True,
-        "H01_AND_H08": lambda s: HYPOTHESES["H01_CVD_ALIGNMENT"](s) is True and HYPOTHESES["H08_OI_RISING"](s) is True,
-        "H03_AND_H04": lambda s: HYPOTHESES["H03_15M_DELTA_ALIGNMENT"](s) is True and HYPOTHESES["H04_STRONGER_BOOK_20"](s) is True,
-        "H09_AND_H08": lambda s: HYPOTHESES["H09_TREND_5M_ALIGNED"](s) is True and HYPOTHESES["H08_OI_RISING"](s) is True,
-        "H06_AND_H01": lambda s: HYPOTHESES["H06_ACTIVE_DIRECTIONAL_SWEEP"](s) is True and HYPOTHESES["H01_CVD_ALIGNMENT"](s) is True
+        "H01_AND_H03": combine_and(HYPOTHESES["H01_CVD_ALIGNMENT"], HYPOTHESES["H03_15M_DELTA_ALIGNMENT"]),
+        "H01_AND_H08": combine_and(HYPOTHESES["H01_CVD_ALIGNMENT"], HYPOTHESES["H08_OI_RISING"]),
+        "H03_AND_H04": combine_and(HYPOTHESES["H03_15M_DELTA_ALIGNMENT"], HYPOTHESES["H04_STRONGER_BOOK_20"]),
+        "H09_AND_H08": combine_and(HYPOTHESES["H09_TREND_5M_ALIGNED"], HYPOTHESES["H08_OI_RISING"]),
+        "H06_AND_H01": combine_and(HYPOTHESES["H06_ACTIVE_DIRECTIONAL_SWEEP"], HYPOTHESES["H01_CVD_ALIGNMENT"])
     }
 
     for p_name, p_filter in pairwise_registry.items():
         try:
-            results["pairwise"][p_name] = engine.evaluate_hypothesis(p_filter)
+            results["pairwise"][p_name] = dev_engine.evaluate_hypothesis(p_filter)
         except Exception as e:
             results["pairwise"][p_name] = {"error": str(e)}
 
+    # Generate MD Report
     report_md = f"""# PHASE 2B COUNTERFACTUAL SIGNAL RESEARCH
 
 **GROSS DIRECTIONAL RETURNS**
@@ -200,11 +222,13 @@ def run_research():
 
 ## Hypothesis Performance
 """
-    for name, h_res in results["hypotheses"].items():
-        if "error" in h_res:
-            report_md += f"### {name}\n- Error: {h_res['error']}\n\n"
+    for name, h_outer in results["hypotheses"].items():
+        if "error" in h_outer:
+            report_md += f"### {name}\n- Error: {h_outer['error']}\n\n"
             continue
+        h_res = h_outer["development_result"]
         c_stats = h_res["overall"]["15m"]["candidate"]
+        e_stats = h_res["overall"]["15m"]["eligible_baseline"]
         report_md += f"""### {name}
 - **Retention**: {pct(h_res['retention_pct'])} (N={h_res['selected_count']} | Eligible={h_res['eligible_count']} | Missing={h_res['missing_feature_count']})
 - **Direction Robustness**: {h_res['direction_classification']}
@@ -212,7 +236,7 @@ def run_research():
 - **Rating**: {h_res['rating']}
 - **Sacrificed Winners**: {h_res['winners_sacrificed']} | **Avoided Losers**: {h_res['losers_avoided']}
 - **Removed Signal Mean/Median**: Mean={h_res['mean_return_removed']:.6f} | Median={h_res['median_return_removed']:.6f}
-- **Candidate Expectancy**: 1m={h_res['overall']['1m']['candidate']['expectancy']:.6f} | 15m={h_res['overall']['15m']['candidate']['expectancy']:.6f}
+- **Candidate Expectancy**: 1m={h_res['overall']['1m']['candidate']['expectancy']:.6f} (vs eligible {h_res['overall']['1m']['eligible_baseline']['expectancy']:.6f}) | 15m={c_stats['expectancy']:.6f} (vs eligible {e_stats['expectancy']:.6f})
 
 """
 

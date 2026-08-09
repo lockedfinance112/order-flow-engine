@@ -11,7 +11,9 @@ class ResearchPartitions:
         self._holdout = holdout
         self.status = status
 
-    def unlock_holdout_for_final_evaluation(self) -> list:
+    def unlock_holdout_for_final_evaluation(self, purpose: str) -> list:
+        if purpose != "PHASE2C_FINAL_EVALUATION":
+            raise PermissionError("Access Denied: Holdout partition remains locked unless purpose is PHASE2C_FINAL_EVALUATION.")
         logger.warning("Caution: Unlocking holdout dataset partition!")
         return self._holdout
 
@@ -31,7 +33,6 @@ def load_canonical_signals(signals_csv_path: str) -> list:
     return signals
 
 def partition_signals(signals: list) -> ResearchPartitions:
-    # Sort chronologically by entry_time
     sorted_signals = sorted(signals, key=lambda x: float(x.get("entry_time", 0.0)))
     total = len(sorted_signals)
     

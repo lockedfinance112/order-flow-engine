@@ -15,6 +15,15 @@ def String(v):
         return None
     return str(v)
 
+def combine_and(filter_a, filter_b):
+    def combined(sig):
+        res_a = filter_a(sig)
+        res_b = filter_b(sig)
+        if res_a is None or res_b is None:
+            return None
+        return bool(res_a and res_b)
+    return combined
+
 # H01
 def h01_cvd_alignment(sig: dict):
     cvd = float_val(sig.get("session_cvd_usdt"))
@@ -75,11 +84,17 @@ def h05_stronger_book_30(sig: dict):
 # H06
 def h06_active_directional_sweep(sig: dict):
     sweep_active_str = sig.get("sweep_active")
-    if sweep_active_str in (None, "", "None", "N/A", "MISSING"): return None
+    # If sweep is inactive and direction is empty, it is eligible False, not None
+    if sweep_active_str in (False, "False") and sig.get("sweep_direction") in (None, "", "None", "N/A", "MISSING"):
+        return False
+        
+    if sweep_active_str in (None, "", "None", "N/A", "MISSING"): 
+        return None
     sweep_active = sweep_active_str == "True" or sweep_active_str is True
     
     sweep_dir = String(sig.get("sweep_direction"))
-    if sweep_dir is None: return None
+    if sweep_dir is None: 
+        return None
     sweep_dir = sweep_dir.upper()
     
     direction = sig.get("direction")

@@ -11,7 +11,7 @@
 
 ## Sample-Size Eligibility
 - Current Status: **INSTRUMENTATION VALIDATION ONLY**
-- Research Splits Status: **HOLDOUT NOT ACTIVATED — INSUFFICIENT SAMPLE**
+- Research Splits Status: **NOT ACTIVATED — INSUFFICIENT SAMPLE**
 - Split sizes: DEV=0 | VAL=0 | HOLDOUT=LOCKED
 
 ## Baseline Stats
@@ -28,7 +28,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H02_FULL_DELTA_ALIGNMENT
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -37,7 +37,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H03_15M_DELTA_ALIGNMENT
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -46,7 +46,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H04_STRONGER_BOOK_20
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -55,7 +55,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H05_STRONGER_BOOK_30
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -64,7 +64,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H06_ACTIVE_DIRECTIONAL_SWEEP
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -73,7 +73,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H07_HIGH_SWEEP_SCORE
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -82,7 +82,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H08_OI_RISING
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -91,7 +91,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H09_TREND_5M_ALIGNED
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -100,7 +100,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H10_TREND_15M_ALIGNED
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -109,7 +109,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H11_TREND_5M_AND_15M_ALIGNED
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -118,7 +118,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H12_BINANCE_CONTEXT_CONFIRMED
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -127,7 +127,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H13_LOW_BOOK_DRIFT
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -136,7 +136,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H14_NO_OPPOSING_DIVERGENCE
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -145,7 +145,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H15_NO_OPPOSING_ABSORPTION
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -154,7 +154,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 ### H16_DIRECTIONAL_AGGRESSION_PRESENT
 - **Retention**: 0.0000% (N=0 | Eligible=0 | Missing=0)
@@ -163,7 +163,7 @@
 - **Rating**: INSUFFICIENT_DATA
 - **Sacrificed Winners**: 0 | **Avoided Losers**: 0
 - **Removed Signal Mean/Median**: Mean=0.000000 | Median=0.000000
-- **Candidate Expectancy**: 1m=0.000000 | 15m=0.000000
+- **Candidate Expectancy**: 1m=0.000000 (vs eligible 0.000000) | 15m=0.000000 (vs eligible 0.000000)
 
 
 ## Pairwise Combinations

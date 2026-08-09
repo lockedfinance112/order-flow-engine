@@ -9,7 +9,6 @@ class CounterfactualEngine:
     def evaluate_hypothesis(self, filter_func) -> dict:
         total_baseline = len(self.baseline_signals)
         
-        # Partition signals into eligible, selected, rejected, missing
         eligible_signals = []
         missing_count = 0
         selected = []
@@ -33,15 +32,16 @@ class CounterfactualEngine:
         retention_total = (selected_count / total_baseline) if total_baseline > 0 else 0.0
         retention_eligible = (selected_count / eligible_count) if eligible_count > 0 else 0.0
         
-        # Compute outcomes helper
-        def get_cohort_stats(sigs, baseline_sigs):
+        # Compute outcomes helper exposing total_baseline, eligible_baseline, candidate
+        def get_cohort_stats(sigs, baseline_sigs, eligible_sigs):
             horizons = ["1m", "3m", "5m", "15m"]
             out = {}
             for h in horizons:
                 b_ret, b_mfe, b_mae = [], [], []
+                e_ret, e_mfe, e_mae = [], [], []
                 c_ret, c_mfe, c_mae = [], [], []
                 
-                # Baseline outcomes for horizon
+                # Baseline outcomes
                 for s in baseline_sigs:
                     if s.get(f"horizon_{h}_status") == "CAPTURED":
                         val = float_val(s.get(f"return_{h}_pct"))
@@ -52,7 +52,18 @@ class CounterfactualEngine:
                         if f is not None: b_mfe.append(f)
                         if a is not None: b_mae.append(a)
                         
-                # Candidate outcomes for horizon
+                # Eligible outcomes
+                for s in eligible_sigs:
+                    if s.get(f"horizon_{h}_status") == "CAPTURED":
+                        val = float_val(s.get(f"return_{h}_pct"))
+                        if val is not None: e_ret.append(val)
+                    if s.get("completion_status") == "CAPTURED" and s.get("excursion_coverage_status") == "COMPLETE":
+                        f = float_val(s.get("max_favorable_pct"))
+                        a = float_val(s.get("max_adverse_pct"))
+                        if f is not None: e_mfe.append(f)
+                        if a is not None: e_mae.append(a)
+                        
+                # Candidate outcomes
                 for s in sigs:
                     if s.get(f"horizon_{h}_status") == "CAPTURED":
                         val = float_val(s.get(f"return_{h}_pct"))
@@ -64,21 +75,24 @@ class CounterfactualEngine:
                         if a is not None: c_mae.append(a)
                         
                 out[h] = {
-                    "baseline": calculate_stats(b_ret, b_mfe, b_mae),
+                    "total_baseline": calculate_stats(b_ret, b_mfe, b_mae),
+                    "eligible_baseline": calculate_stats(e_ret, e_mfe, e_mae),
                     "candidate": calculate_stats(c_ret, c_mfe, c_mae)
                 }
             return out
 
         # Compute Directional cohorts
-        overall_metrics = get_cohort_stats(selected, self.baseline_signals)
+        overall_metrics = get_cohort_stats(selected, self.baseline_signals, eligible_signals)
         
         b_long = [s for s in self.baseline_signals if s.get("direction") == "LONG"]
+        e_long = [s for s in eligible_signals if s.get("direction") == "LONG"]
         c_long = [s for s in selected if s.get("direction") == "LONG"]
-        long_metrics = get_cohort_stats(c_long, b_long)
+        long_metrics = get_cohort_stats(c_long, b_long, e_long)
         
         b_short = [s for s in self.baseline_signals if s.get("direction") == "SHORT"]
+        e_short = [s for s in eligible_signals if s.get("direction") == "SHORT"]
         c_short = [s for s in selected if s.get("direction") == "SHORT"]
-        short_metrics = get_cohort_stats(c_short, b_short)
+        short_metrics = get_cohort_stats(c_short, b_short, e_short)
 
         # Removed Signal Quality metrics
         removed_winners = 0
@@ -107,6 +121,7 @@ class CounterfactualEngine:
         by_symbol = {}
         for sym in symbols_present:
             b_sym = [s for s in self.baseline_signals if s.get("symbol", "").upper() == sym]
+            e_sym = [s for s in eligible_signals if s.get("symbol", "").upper() == sym]
             c_sym = [s for s in selected if s.get("symbol", "").upper() == sym]
             
             sym_total = len(b_sym)
@@ -114,19 +129,20 @@ class CounterfactualEngine:
             sym_retention = (sym_candidate / sym_total) if sym_total > 0 else 0.0
             
             sym_b_ret = [float_val(s.get("return_15m_pct")) for s in b_sym if s.get("horizon_15m_status") == "CAPTURED" and float_val(s.get("return_15m_pct")) is not None]
+            sym_e_ret = [float_val(s.get("return_15m_pct")) for s in e_sym if s.get("horizon_15m_status") == "CAPTURED" and float_val(s.get("return_15m_pct")) is not None]
             sym_c_ret = [float_val(s.get("return_15m_pct")) for s in c_sym if s.get("horizon_15m_status") == "CAPTURED" and float_val(s.get("return_15m_pct")) is not None]
             
-            b_stat = calculate_stats(sym_b_ret)
+            e_stat = calculate_stats(sym_e_ret)
             c_stat = calculate_stats(sym_c_ret)
             
             by_symbol[sym] = {
                 "count": sym_total,
                 "candidate_count": sym_candidate,
                 "retention_pct": sym_retention,
-                "baseline_expectancy": b_stat["expectancy"],
+                "baseline_expectancy": e_stat["expectancy"],
                 "candidate_expectancy": c_stat["expectancy"],
-                "expectancy_change": c_stat["expectancy"] - b_stat["expectancy"],
-                "median_return_change": c_stat["median_return"] - b_stat["median_return"]
+                "expectancy_change": c_stat["expectancy"] - e_stat["expectancy"],
+                "median_return_change": c_stat["median_return"] - e_stat["median_return"]
             }
 
         return {
