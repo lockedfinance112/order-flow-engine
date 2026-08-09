@@ -6,3 +6,8 @@ __pycache__/
 *.log
 *.json
 *.csv
+
+# Phase 2 runtime research data
+research/phase2/active_signals_v2.json
+research/phase2/signal_outcomes_v2.csv
+research/phase2/data_quality_report.json
