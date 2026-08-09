@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import json
+import copy
 from typing import Dict, Tuple, Optional, List, Any
 from datetime import datetime, timezone
 from rich.live import Live
