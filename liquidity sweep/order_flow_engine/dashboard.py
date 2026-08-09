@@ -1855,19 +1855,36 @@ class OrderFlowDashboard:
         function enrichAiSymbolInfo(symbol, info, aiData) {
             const enriched = { ...(info || {}) };
             const aiBias = String(enriched.bias || 'WAITING');
-            const scannerAction = scannerActionFor(symbol, aiData);
             const scannerSymbol = scannerSymbolFor(symbol);
+            const scannerAction = scannerSymbol.next_action || scannerActionFor(symbol, aiData) || 'WAITING';
+            
             enriched.scanner_data = scannerSymbol;
             enriched.binance_context = scannerSymbol.binance_context || enriched.binance_context || {};
-            if (scannerAction) {
-                enriched.scanner_action = scannerAction;
-                const ignoreStates = ["WARMING_UP", "DATA_INVALID", "DATA_STALE"];
-                if (aiBias !== scannerAction && !ignoreStates.includes(scannerAction)) {
-                    enriched.ai_reported_bias = enriched.ai_reported_bias || aiBias;
-                    enriched.bias = scannerAction;
-                    enriched.ai_mismatch = true;
+            enriched.scanner_action = scannerAction;
+            
+            const ignoreStates = ["WARMING_UP", "DATA_INVALID", "DATA_STALE"];
+            if (aiBias !== scannerAction && !ignoreStates.includes(scannerAction)) {
+                enriched.ai_reported_bias = enriched.ai_reported_bias || aiBias;
+                enriched.ai_mismatch = true;
+                enriched.previous_ai_explanation = enriched.explanation;
+                
+                // Construct deterministic explanation
+                const reason = scannerSymbol.decision_reason || 'Flow candidate evaluation active';
+                const gates = scannerSymbol.check_gates || {};
+                const failedGates = Object.keys(gates).filter(k => gates[k] === 'FAIL');
+                
+                let gatesText = '';
+                if (failedGates.length > 0) {
+                    gatesText = ' | Failed gates: ' + failedGates.join(', ');
                 }
+                enriched.explanation = 'AI explanation unavailable for the current scanner state. Current scanner reason: ' + reason + gatesText;
+            } else {
+                enriched.ai_mismatch = false;
+                enriched.ai_reported_bias = aiBias;
             }
+            
+            // Derive bias for rendering from scanner_action to keep it authoritative
+            enriched.bias = scannerAction;
             return enriched;
         }
 

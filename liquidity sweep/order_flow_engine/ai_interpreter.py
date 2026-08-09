@@ -427,6 +427,7 @@ class AIInterpreter:
                 "imbalance": imbalance,
                 "next_action": data.get("next_action", "WAITING"),
                 "latest_event": data.get("latest_event") or "-",
+                "active_sweep": data.get("active_sweep"),
                 "binance_context": compact_context
             }
 
@@ -439,6 +440,13 @@ class AIInterpreter:
                 "session_cvd_usdt": cvd_sess,
                 "imbalance": imbalance,
                 "next_action": data.get("next_action", "WAITING"),
+                "decision_reason": data.get("decision_reason", ""),
+                "check_gates": data.get("check_gates", {}),
+                "decision_timestamp": data.get("decision_timestamp"),
+                "scanner_cycle_id": data.get("scanner_cycle_id"),
+                "action_version": data.get("action_version"),
+                "recent_events": data.get("recent_events", []),
+                "active_sweep": data.get("active_sweep"),
                 "latest_event": data.get("latest_event") or "-",
                 "binance_context": prompt_context
             }

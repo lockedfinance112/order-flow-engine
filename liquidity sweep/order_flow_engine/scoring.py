@@ -166,31 +166,48 @@ class OrderFlowScorer:
         status = "SWEEP_CONFLUENCE" if score >= SWEEP_CONFLUENCE_THRESHOLD else "LOW_CONFLUENCE"
         return score, details, status, imbalance, depth_age_ms
 
-    def get_bias_action(
+    def evaluate_bias(
         self,
         symbol: str,
         metrics_5m: dict,
         imbalance: float,
-        recent_events: List[str]
-    ) -> Tuple[str, str]:
+        recent_events: List[str],
+        now: float,
+        cooldown_end: float
+    ) -> Dict[str, Any]:
         """
-        Runs the auditable state machine for the symbol.
-        Returns: (state_name, reason_or_failed_gates)
+        Runs the pure state machine for the symbol.
+        Returns: {
+            "action": str,
+            "reason": str,
+            "gates": dict,
+            "confirmation_candidate": bool,
+            "active_sweep": dict
+        }
         """
         symbol_lower = symbol.lower()
         state = self.metrics.get_state(symbol_lower)
-        now = time.time()
 
         # Gate 1: Check data validity
         if not state.local_book.is_valid:
-            self.symbol_gates[symbol_lower] = {"book_synced": "FAIL"}
-            return "DATA_INVALID", "Book sync invalid or sequence gap active"
+            return {
+                "action": "DATA_INVALID",
+                "reason": "Book sync invalid or sequence gap active",
+                "gates": {"book_synced": "FAIL"},
+                "confirmation_candidate": False,
+                "active_sweep": {"active": False, "direction": "", "score": 0, "age_seconds": 999.0}
+            }
 
         # Gate 2: Check freshness (3000ms stale limit)
         depth_age_ms = (now - state.last_depth_timestamp) * 1000.0 if state.last_depth_timestamp > 0 else 9999.0
         if depth_age_ms > 3000.0:
-            self.symbol_gates[symbol_lower] = {"freshness": "FAIL"}
-            return "DATA_STALE", f"Depth stale (age: {depth_age_ms:.0f}ms)"
+            return {
+                "action": "DATA_STALE",
+                "reason": f"Depth stale (age: {depth_age_ms:.0f}ms)",
+                "gates": {"freshness": "FAIL"},
+                "confirmation_candidate": False,
+                "active_sweep": {"active": False, "direction": "", "score": 0, "age_seconds": 999.0}
+            }
 
         # Gate 3: Check window warming
         m1m = self.metrics.get_metrics_for_window(symbol_lower, "1m")
@@ -200,15 +217,24 @@ class OrderFlowScorer:
             or m1m.get("status") == "WARMING_UP"
             or m15m.get("status") == "WARMING_UP"
         ):
-            self.symbol_gates[symbol_lower] = {"warmup_complete": "FAIL"}
-            return "WARMING_UP", "Rolling window is warming up"
+            return {
+                "action": "WARMING_UP",
+                "reason": "Rolling window is warming up",
+                "gates": {"warmup_complete": "FAIL"},
+                "confirmation_candidate": False,
+                "active_sweep": {"active": False, "direction": "", "score": 0, "age_seconds": 999.0}
+            }
 
         # Gate 4: Check active cooldown
-        cooldown_end = self.cooldowns.get(symbol_lower, 0.0)
         if now < cooldown_end:
             remaining = cooldown_end - now
-            self.symbol_gates[symbol_lower] = {"cooldown_inactive": "FAIL"}
-            return "COOLDOWN", f"Signal cooldown active ({remaining:.1f}s remaining)"
+            return {
+                "action": "COOLDOWN",
+                "reason": f"Signal cooldown active ({remaining:.1f}s remaining)",
+                "gates": {"cooldown_inactive": "FAIL"},
+                "confirmation_candidate": False,
+                "active_sweep": {"active": False, "direction": "", "score": 0, "age_seconds": 999.0}
+            }
 
         # Prepare parameters for evaluation
         delta_1m = m1m.get("delta_usdt", 0.0)
@@ -224,10 +250,22 @@ class OrderFlowScorer:
         recent_sweep = self.recent_confluence.get(symbol_lower)
         has_active_sweep = False
         sweep_dir = ""
-        if recent_sweep and (now - recent_sweep["timestamp"]) <= SWEEP_ACTIVE_SECONDS:
-            if recent_sweep["score"] >= SWEEP_CONFLUENCE_THRESHOLD:
-                has_active_sweep = True
-                sweep_dir = recent_sweep["direction"]
+        sweep_score = 0
+        sweep_age = 999.0
+        if recent_sweep:
+            sweep_age = now - recent_sweep["timestamp"]
+            if sweep_age <= SWEEP_ACTIVE_SECONDS:
+                sweep_score = recent_sweep["score"]
+                if sweep_score >= SWEEP_CONFLUENCE_THRESHOLD:
+                    has_active_sweep = True
+                    sweep_dir = recent_sweep["direction"]
+
+        active_sweep_info = {
+            "active": has_active_sweep,
+            "direction": sweep_dir,
+            "score": sweep_score,
+            "age_seconds": sweep_age
+        }
 
         # Define check gates for LONG
         long_gates = {
@@ -249,72 +287,152 @@ class OrderFlowScorer:
             "no_bullish_conflict": "PASS" if not any(e in BULLISH_CONFLICT_EVENTS for e in recent_events) else "FAIL"
         }
 
-        # 1. Evaluate CONFIRMED LONG
+        # 1. Evaluate LONG candidate
+        long_candidate = None
+        
+        # Check sweep LONG conditions
         if has_active_sweep and sweep_dir == "BULLISH":
-            # Gated checks with sweep priority
-            if long_gates["no_bearish_conflict"] == "PASS" and long_gates["1m_delta_positive"] == "PASS":
-                self.symbol_gates[symbol_lower] = long_gates
-                self.cooldowns[symbol_lower] = now + COOLDOWN_DURATION_SECONDS
-                return "CONFIRMED_LONG", "Bullish sweep confluence confirmed"
-            else:
-                self.symbol_gates[symbol_lower] = long_gates
-                return "WATCH_LONG", "Bullish sweep waiting for confirmation gates"
+            if long_gates["no_bearish_conflict"] == "PASS":
+                if long_gates["1m_delta_positive"] == "PASS":
+                    long_candidate = ("CONFIRMED_LONG", "Bullish sweep confluence confirmed", True)
+                else:
+                    long_candidate = ("WATCH_LONG", "Bullish sweep waiting for confirmation gates", False)
 
-        if (
-            long_gates["5m_delta_bias"] == "PASS"
-            and long_gates["buy_aggression"] == "PASS"
-            and long_gates["imbalance_bullish"] == "PASS"
-        ):
-            if long_gates["no_bearish_conflict"] == "FAIL":
-                self.symbol_gates[symbol_lower] = long_gates
-                return "WAITING", f"LONG_SUPPRESSED:Bearish conflict active"
-            
-            # If stack/pull is also positive, CONFIRM. Else, WATCH.
-            if long_gates["stacking_bullish"] == "PASS" and long_gates["1m_delta_positive"] == "PASS":
-                self.symbol_gates[symbol_lower] = long_gates
-                self.cooldowns[symbol_lower] = now + COOLDOWN_DURATION_SECONDS
-                return "CONFIRMED_LONG", "Bullish order flow bias confirmed"
-            else:
-                self.symbol_gates[symbol_lower] = long_gates
-                return "WATCH_LONG", "Flow bias watching stacking/pulling details"
+        # Check normal/bias LONG conditions
+        if not long_candidate:
+            if (
+                long_gates["5m_delta_bias"] == "PASS"
+                and long_gates["buy_aggression"] == "PASS"
+                and long_gates["imbalance_bullish"] == "PASS"
+            ):
+                if long_gates["no_bearish_conflict"] == "PASS":
+                    if long_gates["stacking_bullish"] == "PASS" and long_gates["1m_delta_positive"] == "PASS":
+                        long_candidate = ("CONFIRMED_LONG", "Bullish order flow bias confirmed", True)
+                    else:
+                        long_candidate = ("WATCH_LONG", "Flow bias watching stacking/pulling details", False)
 
-        # 2. Evaluate CONFIRMED SHORT
+        # Check normal WATCH_LONG trigger conditions
+        if not long_candidate:
+            if long_gates["5m_delta_bias"] == "PASS" or (delta_5m > 50000.0 and buy_ratio_5m >= 0.55):
+                if long_gates["no_bearish_conflict"] == "PASS":
+                    long_candidate = ("WATCH_LONG", "Delta/Aggression turning bullish", False)
+
+        # 2. Evaluate SHORT candidate
+        short_candidate = None
+        
+        # Check sweep SHORT conditions
         if has_active_sweep and sweep_dir == "BEARISH":
-            if short_gates["no_bullish_conflict"] == "PASS" and short_gates["1m_delta_negative"] == "PASS":
-                self.symbol_gates[symbol_lower] = short_gates
-                self.cooldowns[symbol_lower] = now + COOLDOWN_DURATION_SECONDS
-                return "CONFIRMED_SHORT", "Bearish sweep confluence confirmed"
+            if short_gates["no_bullish_conflict"] == "PASS":
+                if short_gates["1m_delta_negative"] == "PASS":
+                    short_candidate = ("CONFIRMED_SHORT", "Bearish sweep confluence confirmed", True)
+                else:
+                    short_candidate = ("WATCH_SHORT", "Bearish sweep waiting for confirmation gates", False)
+
+        # Check normal/bias SHORT conditions
+        if not short_candidate:
+            if (
+                short_gates["5m_delta_bias"] == "PASS"
+                and short_gates["sell_aggression"] == "PASS"
+                and short_gates["imbalance_bearish"] == "PASS"
+            ):
+                if short_gates["no_bullish_conflict"] == "PASS":
+                    if short_gates["stacking_bearish"] == "PASS" and short_gates["1m_delta_negative"] == "PASS":
+                        short_candidate = ("CONFIRMED_SHORT", "Bearish order flow bias confirmed", True)
+                    else:
+                        short_candidate = ("WATCH_SHORT", "Flow bias watching stacking/pulling details", False)
+
+        # Check normal WATCH_SHORT trigger conditions
+        if not short_candidate:
+            if short_gates["5m_delta_bias"] == "PASS" or (delta_5m < -50000.0 and buy_ratio_5m <= 0.45):
+                if short_gates["no_bullish_conflict"] == "PASS":
+                    short_candidate = ("WATCH_SHORT", "Delta/Aggression turning bearish", False)
+
+        # Deterministic Priority Resolver:
+        # confirmed candidate -> watch candidate -> waiting/suppressed
+        # If both LONG and SHORT candidates survive at same priority, return WAITING with AMBIGUOUS_DIRECTIONAL_CONFLICT
+        long_priority = 0
+        if long_candidate:
+            long_priority = 2 if long_candidate[0].startswith("CONFIRMED") else 1
+            
+        short_priority = 0
+        if short_candidate:
+            short_priority = 2 if short_candidate[0].startswith("CONFIRMED") else 1
+
+        if long_priority > 0 or short_priority > 0:
+            if long_priority == short_priority:
+                return {
+                    "action": "WAITING",
+                    "reason": "AMBIGUOUS_DIRECTIONAL_CONFLICT",
+                    "gates": {**long_gates, **short_gates},
+                    "confirmation_candidate": False,
+                    "active_sweep": active_sweep_info
+                }
+            elif long_priority > short_priority:
+                action, reason, confirmation_candidate = long_candidate
+                gates = long_gates
             else:
-                self.symbol_gates[symbol_lower] = short_gates
-                return "WATCH_SHORT", "Bearish sweep waiting for confirmation gates"
-
-        if (
-            short_gates["5m_delta_bias"] == "PASS"
-            and short_gates["sell_aggression"] == "PASS"
-            and short_gates["imbalance_bearish"] == "PASS"
-        ):
-            if short_gates["no_bullish_conflict"] == "FAIL":
-                self.symbol_gates[symbol_lower] = short_gates
-                return "WAITING", f"SHORT_SUPPRESSED:Bullish conflict active"
-
-            if short_gates["stacking_bearish"] == "PASS" and short_gates["1m_delta_negative"] == "PASS":
-                self.symbol_gates[symbol_lower] = short_gates
-                self.cooldowns[symbol_lower] = now + COOLDOWN_DURATION_SECONDS
-                return "CONFIRMED_SHORT", "Bearish order flow bias confirmed"
+                action, reason, confirmation_candidate = short_candidate
+                gates = short_gates
+        else:
+            action = "WAITING"
+            if (
+                (long_gates["5m_delta_bias"] == "PASS" and long_gates["no_bearish_conflict"] == "FAIL") or
+                (has_active_sweep and sweep_dir == "BULLISH" and long_gates["no_bearish_conflict"] == "FAIL")
+            ):
+                reason = "LONG_SUPPRESSED:Bearish conflict active"
+                gates = long_gates
+            elif (
+                (short_gates["5m_delta_bias"] == "PASS" and short_gates["no_bullish_conflict"] == "FAIL") or
+                (has_active_sweep and sweep_dir == "BEARISH" and short_gates["no_bullish_conflict"] == "FAIL")
+            ):
+                reason = "SHORT_SUPPRESSED:Bullish conflict active"
+                gates = short_gates
             else:
-                self.symbol_gates[symbol_lower] = short_gates
-                return "WATCH_SHORT", "Flow bias watching stacking/pulling details"
+                reason = "No active signal triggers"
+                gates = {**long_gates, **short_gates}
+            confirmation_candidate = False
 
-        # 3. Handle WATCH triggers
-        # If delta and aggression match but book imbalance or stacking is missing
-        if long_gates["5m_delta_bias"] == "PASS" or (delta_5m > 50000.0 and buy_ratio_5m >= 0.55):
-            self.symbol_gates[symbol_lower] = long_gates
-            return "WATCH_LONG", "Delta/Aggression turning bullish"
+        return {
+            "action": action,
+            "reason": reason,
+            "gates": gates,
+            "confirmation_candidate": confirmation_candidate,
+            "active_sweep": active_sweep_info
+        }
 
-        if short_gates["5m_delta_bias"] == "PASS" or (delta_5m < -50000.0 and buy_ratio_5m <= 0.45):
-            self.symbol_gates[symbol_lower] = short_gates
-            return "WATCH_SHORT", "Delta/Aggression turning bearish"
+    def get_bias_action(
+        self,
+        symbol: str,
+        metrics_5m: dict,
+        imbalance: float,
+        recent_events: List[str]
+    ) -> Tuple[str, str]:
+        """
+        Backward compatibility wrapper for the state machine.
+        DO NOT use in the production paths of the canonical scanner loop.
+        """
+        symbol_lower = symbol.lower()
+        now = time.time()
+        cooldown_end = self.cooldowns.get(symbol_lower, 0.0)
+        
+        res = self.evaluate_bias(
+            symbol=symbol,
+            metrics_5m=metrics_5m,
+            imbalance=imbalance,
+            recent_events=recent_events,
+            now=now,
+            cooldown_end=cooldown_end
+        )
+        
+        # Mirror gates and cooldown for compatibility
+        self.symbol_gates[symbol_lower] = res["gates"]
+        if res["confirmation_candidate"] and res["action"] in ("CONFIRMED_LONG", "CONFIRMED_SHORT"):
+            previous_action = getattr(self, "_last_actions_compat", {}).get(symbol_lower, "WAITING")
+            if res["action"] != previous_action:
+                self.cooldowns[symbol_lower] = now + COOLDOWN_DURATION_SECONDS
+                if not hasattr(self, "_last_actions_compat"):
+                    self._last_actions_compat = {}
+                self._last_actions_compat[symbol_lower] = res["action"]
+                
+        return res["action"], res["reason"]
 
-        # Save default gates
-        self.symbol_gates[symbol_lower] = {**long_gates, **short_gates}
-        return "WAITING", "No active signal triggers"

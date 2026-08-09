@@ -83,6 +83,25 @@ class OrderFlowEngine:
         self.last_ai_manual_time = 0.0
         self.paper_trader = PaperTrader(10000.0)
 
+        # Canonical decision store & engine states
+        self.current_decisions: Dict[str, dict] = {}
+        self.cooldown_ends: Dict[str, float] = {}
+        self.scanner_cycle_id = 0
+        
+        # Initialize startup default decision states for all configured symbols
+        for sym in SYMBOLS:
+            sym_lower = sym.lower()
+            self.current_decisions[sym_lower] = {
+                "action": "WARMING_UP",
+                "reason": "Awaiting first canonical scanner evaluation",
+                "gates": {},
+                "timestamp": None,
+                "scanner_cycle_id": 0,
+                "action_version": 0,
+                "active_sweep": {"active": False, "direction": "", "score": 0, "age_seconds": 999.0}
+            }
+            self.cooldown_ends[sym_lower] = 0.0
+
     def _json_response(self, payload: dict, status: str = "200 OK") -> str:
         body = json.dumps(payload)
         return (
@@ -227,23 +246,31 @@ class OrderFlowEngine:
         """Helper to build a unified dictionary snapshot of current metrics for all symbols."""
         symbol_data = {}
         for symbol in SYMBOLS:
+            sym_lower = symbol.lower()
             state = self.metrics.get_state(symbol)
             m1m = self.metrics.get_metrics_for_window(symbol, "1m")
             m5m = self.metrics.get_metrics_for_window(symbol, "5m")
             m15m = self.metrics.get_metrics_for_window(symbol, "15m")
             
+            # Read-only components read directly from canonical stored decisions
+            # DO NOT recompute scanner decisions from read-only consumers.
+            decision = self.current_decisions.get(sym_lower)
+            if not decision:
+                decision = {
+                    "action": "WARMING_UP",
+                    "reason": "Awaiting first canonical scanner evaluation",
+                    "gates": {},
+                    "timestamp": None,
+                    "scanner_cycle_id": 0,
+                    "action_version": 0,
+                    "active_sweep": {"active": False, "direction": "", "score": 0, "age_seconds": 999.0}
+                }
+
             now = time.time()
             recent_events = [
                 a["type"] for a in self.alerts_history
-                if a["symbol"].lower() == symbol.lower() and (now - a["timestamp"]) <= 300.0
+                if a["symbol"].lower() == sym_lower and (now - a["timestamp"]) <= 300.0
             ]
-            
-            bias_action, _ = self.scorer.get_bias_action(
-                symbol=symbol,
-                metrics_5m=m5m,
-                imbalance=state.bid_ask_imbalance,
-                recent_events=recent_events
-            )
             
             symbol_data[symbol] = {
                 "price": m1m.get("latest_price", 0.0),
@@ -256,13 +283,63 @@ class OrderFlowEngine:
                 "buy_ratio_5m": m5m.get("buy_ratio", 0.5),
                 "imbalance": state.bid_ask_imbalance,
                 "spread": state.spread,
-                "next_action": bias_action,
+                
+                # Canonical scanner decisions
+                "next_action": decision["action"],
+                "decision_reason": decision["reason"],
+                "check_gates": decision["gates"],
+                "decision_timestamp": decision["timestamp"],
+                "scanner_cycle_id": decision["scanner_cycle_id"],
+                "action_version": decision["action_version"],
+                "active_sweep": decision["active_sweep"],
+                "recent_events": recent_events,
+                
                 "last_large_trade_time": state.last_large_trade_time,
                 "last_event_time": state.last_event_time,
                 "latest_event": state.latest_event,
                 "last_depth_timestamp": state.last_depth_timestamp
             }
         return symbol_data
+
+    def _commit_scanner_decision(self, symbol: str, decision: dict, now: float):
+        """
+        Commits a pure scanner decision to the engine state.
+        This is the ONLY mutator of decisions, cooldowns, and action versions.
+        """
+        sym_lower = symbol.lower()
+        prev_decision = self.current_decisions.get(sym_lower)
+        previous_action = prev_decision["action"] if prev_decision else "WARMING_UP"
+        action_version = prev_decision["action_version"] if prev_decision else 0
+        
+        # Increment action version only if the action changes
+        if decision["action"] != previous_action:
+            action_version += 1
+            
+        # Check transition cooldown condition:
+        # A cooldown starts ONLY when a new confirmed signal transition is committed
+        is_new_confirmation = (
+            decision["confirmation_candidate"]
+            and decision["action"] in ("CONFIRMED_LONG", "CONFIRMED_SHORT")
+            and previous_action != decision["action"]
+        )
+        
+        if is_new_confirmation:
+            self.cooldown_ends[sym_lower] = now + 180.0 # COOLDOWN_DURATION_SECONDS
+            
+        # Update canonical current_decisions dictionary
+        # DO NOT recompute scanner decisions from read-only consumers.
+        self.current_decisions[sym_lower] = {
+            "action": decision["action"],
+            "reason": decision["reason"],
+            "gates": decision["gates"],
+            "timestamp": now,
+            "scanner_cycle_id": self.scanner_cycle_id,
+            "action_version": action_version,
+            "active_sweep": decision["active_sweep"]
+        }
+        
+        # Mirror gates in scorer for backward compatibility
+        self.scorer.symbol_gates[sym_lower] = decision["gates"]
 
     async def _handle_http_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Async web server connection handler to serve Web Dashboard and JSON metrics API."""
@@ -435,25 +512,15 @@ class OrderFlowEngine:
                     if self.dashboard.is_multi:
                         symbols_payload = {}
                         for sym in SYMBOLS:
+                            sym_lower = sym.lower()
                             state = self.metrics.get_state(sym)
                             m1m = self.metrics.get_metrics_for_window(sym, "1m")
                             m5m = self.metrics.get_metrics_for_window(sym, "5m")
                             m15m = self.metrics.get_metrics_for_window(sym, "15m")
                             
-                            # Compile list of active alerts in the last 300 seconds specifically for this symbol
-                            now_time = time.time()
-                            recent_events = [
-                                a["type"] for a in self.alerts_history
-                                if a["symbol"].lower() == sym.lower() and (now_time - a["timestamp"]) <= 300.0
-                            ]
-                            
-                            # Fetch V2.4.2 Flow Bias Next Action with conflict suppression parameters
-                            bias_action, _ = self.scorer.get_bias_action(
-                                symbol=sym,
-                                metrics_5m=m5m,
-                                imbalance=state.bid_ask_imbalance,
-                                recent_events=recent_events
-                            )
+                            # Read canonical decision
+                            decision = self.current_decisions.get(sym_lower)
+                            bias_action = decision["action"]
                             
                             self.metrics.check_duplication(sym, m5m, m15m)
                             mid_price = (state.best_bid + state.best_ask) / 2.0
@@ -461,6 +528,7 @@ class OrderFlowEngine:
                             symbols_payload[sym] = {
                                 "price": m1m.get("latest_price", 0.0),
                                 "session_cvd_usdt": state.session_cvd_usdt,
+                                "running_cvd_usdt": state.running_cvd_usdt,
                                 "running_cvd_usdt": state.running_cvd_usdt,
                                 "metrics_1m": m1m,
                                 "metrics_5m": m5m,
@@ -486,7 +554,7 @@ class OrderFlowEngine:
                                 "book_state": state.local_book.state,
                                 "stream_health_status": state.health_tracker.get_status(state.local_book.is_valid),
                                 "stream_health_metrics": state.health_tracker.get_metrics(),
-                                "check_gates": self.scorer.symbol_gates.get(sym.lower(), {}),
+                                "check_gates": decision["gates"],
                                 "active_walls": state.wall_tracker.get_active_walls(mid_price, state.bid_depth_top5_usdt)
                             }
                         
@@ -503,23 +571,14 @@ class OrderFlowEngine:
                         }
                     else:
                         sym = SYMBOLS[0]
+                        sym_lower = sym.lower()
                         m1m = self.metrics.get_metrics_for_window(sym, "1m")
                         m5m = self.metrics.get_metrics_for_window(sym, "5m")
                         m15m = self.metrics.get_metrics_for_window(sym, "15m")
                         state = self.metrics.get_state(sym)
                         
-                        now_time = time.time()
-                        recent_events = [
-                            a["type"] for a in self.alerts_history
-                            if a["symbol"].lower() == sym.lower() and (now_time - a["timestamp"]) <= 300.0
-                        ]
-                        
-                        bias_action, _ = self.scorer.get_bias_action(
-                            symbol=sym,
-                            metrics_5m=m5m,
-                            imbalance=state.bid_ask_imbalance,
-                            recent_events=recent_events
-                        )
+                        decision = self.current_decisions.get(sym_lower)
+                        bias_action = decision["action"]
                         
                         payload = {
                             "is_multi": False,
@@ -809,6 +868,7 @@ class OrderFlowEngine:
         with Live(self.dashboard.layout, refresh_per_second=1, screen=True) as live:
             while True:
                 try:
+                    self.scanner_cycle_id += 1
                     trade_ws_status = self.stream.get_status()
                     depth_ws_status = self.depth_stream.get_status()
                     
@@ -874,13 +934,20 @@ class OrderFlowEngine:
                             if a["symbol"].lower() == symbol.lower() and (now - a["timestamp"]) <= 300.0
                         ]
 
-                        # Calculate Flow Bias Next Action (V2.4.2 - Strict conflict suppression check)
-                        bias_action, suppression_reason = self.scorer.get_bias_action(
+                        # Pure state machine evaluation of Order Flow bias
+                        decision = self.scorer.evaluate_bias(
                             symbol=symbol,
                             metrics_5m=metrics_5m,
                             imbalance=state.bid_ask_imbalance,
-                            recent_events=recent_events
+                            recent_events=recent_events,
+                            now=now,
+                            cooldown_end=self.cooldown_ends.get(symbol.lower(), 0.0)
                         )
+
+                        # Commit canonical decision
+                        self._commit_scanner_decision(symbol, decision, now)
+                        bias_action = decision["action"]
+                        suppression_reason = decision["reason"]
 
                         # Run auto paper trade checks
                         self._run_auto_paper_trade(symbol, price, bias_action)
