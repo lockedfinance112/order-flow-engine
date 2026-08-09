@@ -154,7 +154,7 @@ def run_analysis():
     def get_excursions(sigs):
         mfes, maes = [], []
         for s in sigs:
-            if s.get("completion_status") == "CAPTURED":
+            if s.get("completion_status") == "CAPTURED" and s.get("excursion_coverage_status") == "COMPLETE":
                 f = float_val(s.get("max_favorable_pct"))
                 a = float_val(s.get("max_adverse_pct"))
                 if f is not None: mfes.append(f)

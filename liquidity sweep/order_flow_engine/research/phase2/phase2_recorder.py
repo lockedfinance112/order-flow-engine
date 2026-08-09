@@ -27,6 +27,7 @@ COLUMNS = [
     "return_1m_pct", "return_3m_pct", "return_5m_pct", "return_15m_pct",
     "max_favorable_pct", "max_adverse_pct",
     "completion_status", "horizon_1m_status", "horizon_3m_status", "horizon_5m_status", "horizon_15m_status",
+    "recovered_after_restart", "excursion_coverage_status",
     "research_schema_version", "strategy_version", "engine_commit_sha", "dataset_class",
     "completed_time"
 ]
@@ -56,6 +57,7 @@ class Phase2SignalRecorder:
         self.active_json = os.path.join(self.base_dir, active_json)
         
         self.active_tracks = []
+        self.registered_idempotency_keys = set()
         self.last_checkpoint_time = time.time()
         self.dirty = False
         
@@ -80,7 +82,13 @@ class Phase2SignalRecorder:
                     for t in loaded:
                         elapsed = now - t["entry_time"]
                         
-                        # Check each target horizon for recovery downtime marking
+                        t["recovered_after_restart"] = True
+                        t["excursion_coverage_status"] = "INTERRUPTED"
+                        
+                        # Populate idempotency key from loaded track
+                        ik = f"{t['symbol'].lower()}_{t['action'].lower()}_{t['scanner_cycle_id']}_{t['action_version']}"
+                        self.registered_idempotency_keys.add(ik)
+                        
                         horizons = [("1m", 60.0), ("3m", 180.0), ("5m", 300.0), ("15m", 900.0)]
                         for h, target in horizons:
                             if t.get(f"horizon_{h}_status") == "PENDING" and elapsed >= target:
@@ -88,9 +96,11 @@ class Phase2SignalRecorder:
                         
                         if elapsed >= 900.0:
                             t["completion_status"] = "INTERRUPTED"
-                            self._append_to_csv(t)
-                        else:
-                            self.active_tracks.append(t)
+                            # Attempt write; if it fails, keep in active tracks to retry later
+                            if self._append_to_csv(t):
+                                continue
+                        
+                        self.active_tracks.append(t)
                 self.dirty = True
                 self.flush_checkpoint(force=True)
             except Exception as e:
@@ -122,29 +132,38 @@ class Phase2SignalRecorder:
             if old_action == new_action:
                 return
 
-            now = time.time()
+            decision = copy.deepcopy(decision_snapshot)
+            scanner_cycle = decision.get("scanner_cycle_id", 0)
+            action_version = decision.get("action_version", 1)
+
+            # 1. Enforce Idempotency check using symbol + action + cycle + version
+            ik = f"{symbol.lower()}_{new_action.lower()}_{scanner_cycle}_{action_version}"
+            if ik in self.registered_idempotency_keys:
+                logger.info(f"[Research] Idempotent key {ik} already registered. Skipping.")
+                return
+            self.registered_idempotency_keys.add(ik)
+
+            # Anchor entry_time to the committed decision timestamp
+            entry_time = decision.get("timestamp", time.time())
             direction = "LONG" if "LONG" in new_action else "SHORT"
             signal_id = str(uuid.uuid4())
             commit_sha = _get_git_commit_sha()
 
-            decision = copy.deepcopy(decision_snapshot)
             gates = decision.get("gates", {})
             sweep = decision.get("active_sweep", {})
 
-            # Capture 1m gate correctly based on direction
             if direction == "LONG":
                 gate_1m_delta = gates.get("1m_delta_positive", "FAIL")
             else:
                 gate_1m_delta = gates.get("1m_delta_negative", "FAIL")
 
-            # Capture Binance context properties
             bc = copy.deepcopy(binance_context or {})
             bc_ts = bc.get("timestamp")
             bc_age = None
             if bc_ts:
                 try:
                     dt = datetime.fromisoformat(bc_ts.replace("Z", "+00:00"))
-                    bc_age = now - dt.timestamp()
+                    bc_age = entry_time - dt.timestamp()
                 except Exception:
                     pass
 
@@ -153,10 +172,10 @@ class Phase2SignalRecorder:
                 "symbol": symbol.upper(),
                 "direction": direction,
                 "action": new_action,
-                "entry_time": now,
+                "entry_time": entry_time,
                 "entry_price": price,
-                "scanner_cycle_id": decision.get("scanner_cycle_id", 0),
-                "action_version": decision.get("action_version", 1),
+                "scanner_cycle_id": scanner_cycle,
+                "action_version": action_version,
                 "decision_reason": decision.get("reason", ""),
                 
                 # Flow Metrics Snapshot
@@ -219,6 +238,10 @@ class Phase2SignalRecorder:
                 "horizon_5m_status": "PENDING",
                 "horizon_15m_status": "PENDING",
                 
+                # Excursion coverage flags
+                "recovered_after_restart": False,
+                "excursion_coverage_status": "COMPLETE",
+                
                 # Provenance
                 "research_schema_version": 2,
                 "strategy_version": "PHASE1_FROZEN",
@@ -251,10 +274,16 @@ class Phase2SignalRecorder:
                         fav = (entry_price - price) / entry_price
                         adv = (price - entry_price) / entry_price
                         
-                    # Excursions should only be updated if track is not completed/interrupted
-                    if track["completion_status"] == "PENDING":
-                        track["max_favorable_pct"] = max(track["max_favorable_pct"], max(0.0, fav))
-                        track["max_adverse_pct"] = max(track["max_adverse_pct"], max(0.0, adv))
+                    # Set dirty = True if excursions updated
+                    if track["completion_status"] == "PENDING" and track.get("excursion_coverage_status") == "COMPLETE":
+                        old_fav = track["max_favorable_pct"]
+                        old_adv = track["max_adverse_pct"]
+                        
+                        track["max_favorable_pct"] = max(old_fav, max(0.0, fav))
+                        track["max_adverse_pct"] = max(old_adv, max(0.0, adv))
+                        
+                        if track["max_favorable_pct"] != old_fav or track["max_adverse_pct"] != old_adv:
+                            self.dirty = True
                     
                     elapsed = now - track["entry_time"]
                     
@@ -290,11 +319,12 @@ class Phase2SignalRecorder:
             for track in self.active_tracks:
                 elapsed = now - track["entry_time"]
                 if elapsed >= 900.0:  # 15m
-                    # Check if 15m was missed
+                    
+                    # Determine completed/interrupted outcome statuses
                     if track["horizon_15m_status"] == "PENDING":
                         track["horizon_15m_status"] = "INTERRUPTED"
                         track["completion_status"] = "INTERRUPTED"
-                    elif any(track[f"horizon_{h}_status"] == "MISSED_DURING_DOWNTIME" for h in ["1m", "3m", "5m", "15m"]):
+                    elif any(track[f"horizon_{h}_status"] in ("MISSED_DURING_DOWNTIME", "INTERRUPTED") for h in ["1m", "3m", "5m", "15m"]):
                         track["completion_status"] = "INTERRUPTED"
                     else:
                         track["completion_status"] = "CAPTURED"
@@ -305,9 +335,10 @@ class Phase2SignalRecorder:
                     for h in ["1m", "3m", "5m", "15m"]:
                         if track[f"horizon_{h}_status"] == "PENDING":
                             track[f"horizon_{h}_status"] = "INTERRUPTED"
-                            
-                    self._append_to_csv(track)
-                    to_remove.append(track)
+                    
+                    # Safe CSV append: do not delete track from active list if write fails!
+                    if self._append_to_csv(track):
+                        to_remove.append(track)
                     
             if to_remove:
                 for track in to_remove:
@@ -317,15 +348,17 @@ class Phase2SignalRecorder:
         except Exception as e:
             logger.error(f"Error finalising Phase 2 signals: {e}", exc_info=True)
 
-    def _append_to_csv(self, track: dict):
+    def _append_to_csv(self, track: dict) -> bool:
         try:
             row = [track.get(col, "") for col in COLUMNS]
             with open(self.signals_csv, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(row)
             logger.info(f"[Research] Logged signal outcome: {track['symbol']} | {track['direction']} | {track['completion_status']}")
+            return True
         except Exception as e:
             logger.error(f"Failed to append to CSV: {e}")
+            return False
 
     def shutdown(self):
         try:
