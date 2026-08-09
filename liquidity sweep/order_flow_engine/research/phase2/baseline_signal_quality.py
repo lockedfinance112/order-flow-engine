@@ -84,7 +84,7 @@ def calculate_stats(returns, mfes=None, maes=None):
 def run_analysis():
     base_dir = os.path.dirname(__file__)
     phase2_file = os.path.join(base_dir, "signal_outcomes_v2.csv")
-    transitions_file = os.path.join(os.path.dirname(base_dir), "bias_transitions.csv")
+    transitions_file = os.path.join(os.path.dirname(os.path.dirname(base_dir)), "bias_transitions.csv")
     output_md = os.path.join(base_dir, "baseline_report.md")
     output_json = os.path.join(base_dir, "baseline_report.json")
 

@@ -990,10 +990,11 @@ class OrderFlowEngine:
                                     metrics_1m=metrics_1m,
                                     metrics_5m=metrics_5m,
                                     metrics_15m=metrics_15m,
-                                    best_bid=state.best_bid,
-                                    best_ask=state.best_ask,
+                                    imbalance=state.bid_ask_imbalance,
+                                    session_cvd_usdt=state.session_cvd_usdt,
                                     spread_bps=state.spread_bps,
                                     latest_event=state.latest_event,
+                                    recent_events=recent_events,
                                     binance_context=self.binance_context.get_context().get("symbols", {}).get(symbol.upper(), {})
                                 )
                             except Exception:

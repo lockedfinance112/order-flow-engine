@@ -79,11 +79,15 @@ class Phase2SignalRecorder:
                     now = time.time()
                     for t in loaded:
                         elapsed = now - t["entry_time"]
+                        
+                        # Check each target horizon for recovery downtime marking
+                        horizons = [("1m", 60.0), ("3m", 180.0), ("5m", 300.0), ("15m", 900.0)]
+                        for h, target in horizons:
+                            if t.get(f"horizon_{h}_status") == "PENDING" and elapsed >= target:
+                                t[f"horizon_{h}_status"] = "MISSED_DURING_DOWNTIME"
+                        
                         if elapsed >= 900.0:
                             t["completion_status"] = "INTERRUPTED"
-                            for h in ["1m", "3m", "5m", "15m"]:
-                                if t.get(f"horizon_{h}_status") == "PENDING":
-                                    t[f"horizon_{h}_status"] = "INTERRUPTED"
                             self._append_to_csv(t)
                         else:
                             self.active_tracks.append(t)
@@ -110,8 +114,8 @@ class Phase2SignalRecorder:
 
     def register_signal_change(self, symbol: str, old_action: str, new_action: str, price: float,
                                 decision_snapshot: dict, metrics_1m: dict, metrics_5m: dict, metrics_15m: dict,
-                                best_bid: float, best_ask: float, spread_bps: float, latest_event: str | None,
-                                binance_context: dict):
+                                imbalance: float, session_cvd_usdt: float, spread_bps: float, latest_event: str | None,
+                                recent_events: list, binance_context: dict):
         try:
             if new_action not in ("CONFIRMED_LONG", "CONFIRMED_SHORT"):
                 return
@@ -126,6 +130,12 @@ class Phase2SignalRecorder:
             decision = copy.deepcopy(decision_snapshot)
             gates = decision.get("gates", {})
             sweep = decision.get("active_sweep", {})
+
+            # Capture 1m gate correctly based on direction
+            if direction == "LONG":
+                gate_1m_delta = gates.get("1m_delta_positive", "FAIL")
+            else:
+                gate_1m_delta = gates.get("1m_delta_negative", "FAIL")
 
             # Capture Binance context properties
             bc = copy.deepcopy(binance_context or {})
@@ -153,14 +163,14 @@ class Phase2SignalRecorder:
                 "delta_1m_usdt": metrics_1m.get("delta_usdt", 0.0),
                 "delta_5m_usdt": metrics_5m.get("delta_usdt", 0.0),
                 "delta_15m_usdt": metrics_15m.get("delta_usdt", 0.0),
-                "session_cvd_usdt": metrics_15m.get("running_cvd_usdt", 0.0) or metrics_5m.get("running_cvd_usdt", 0.0) or 0.0,
+                "session_cvd_usdt": session_cvd_usdt,
                 "buy_ratio_1m": metrics_1m.get("buy_ratio", 0.5),
                 "buy_ratio_5m": metrics_5m.get("buy_ratio", 0.5),
-                "imbalance": imbalance_value(best_bid, best_ask),
+                "imbalance": imbalance,
                 "spread_bps": spread_bps,
                 
                 # Gates Snapshot
-                "gate_1m_delta": gates.get("1m_delta_positive", "FAIL"),
+                "gate_1m_delta": gate_1m_delta,
                 "gate_5m_delta_bias": gates.get("5m_delta_bias", "FAIL"),
                 "gate_aggression": gates.get("buy_aggression", "FAIL") if direction == "LONG" else gates.get("sell_aggression", "FAIL"),
                 "gate_imbalance": gates.get("imbalance_bullish", "FAIL") if direction == "LONG" else gates.get("imbalance_bearish", "FAIL"),
@@ -175,7 +185,7 @@ class Phase2SignalRecorder:
                 
                 # Events Context
                 "latest_event": latest_event or "",
-                "recent_events": "",  # Filled later if needed
+                "recent_events": json.dumps(list(recent_events or [])),
                 
                 # Binance Context
                 "funding_rate_pct": bc.get("funding_rate_pct"),
@@ -241,8 +251,10 @@ class Phase2SignalRecorder:
                         fav = (entry_price - price) / entry_price
                         adv = (price - entry_price) / entry_price
                         
-                    track["max_favorable_pct"] = max(track["max_favorable_pct"], max(0.0, fav))
-                    track["max_adverse_pct"] = max(track["max_adverse_pct"], max(0.0, adv))
+                    # Excursions should only be updated if track is not completed/interrupted
+                    if track["completion_status"] == "PENDING":
+                        track["max_favorable_pct"] = max(track["max_favorable_pct"], max(0.0, fav))
+                        track["max_adverse_pct"] = max(track["max_adverse_pct"], max(0.0, adv))
                     
                     elapsed = now - track["entry_time"]
                     
@@ -278,7 +290,15 @@ class Phase2SignalRecorder:
             for track in self.active_tracks:
                 elapsed = now - track["entry_time"]
                 if elapsed >= 900.0:  # 15m
-                    track["completion_status"] = "CAPTURED"
+                    # Check if 15m was missed
+                    if track["horizon_15m_status"] == "PENDING":
+                        track["horizon_15m_status"] = "INTERRUPTED"
+                        track["completion_status"] = "INTERRUPTED"
+                    elif any(track[f"horizon_{h}_status"] == "MISSED_DURING_DOWNTIME" for h in ["1m", "3m", "5m", "15m"]):
+                        track["completion_status"] = "INTERRUPTED"
+                    else:
+                        track["completion_status"] = "CAPTURED"
+                        
                     track["completed_time"] = datetime.now(timezone.utc).isoformat()
                     
                     # Mark any remaining pending horizons as interrupted
@@ -313,9 +333,3 @@ class Phase2SignalRecorder:
             self.flush_checkpoint(force=True)
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
-
-def imbalance_value(best_bid: float, best_ask: float) -> float:
-    denom = best_bid + best_ask
-    if denom <= 0:
-        return 0.0
-    return (best_bid - best_ask) / denom
