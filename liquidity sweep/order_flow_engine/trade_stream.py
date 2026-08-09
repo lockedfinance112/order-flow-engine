@@ -53,14 +53,25 @@ class TradeStream:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
+        from config import trade_streams
+        base_url = "wss://fstream.binance.com/market/stream"
+
         while self.is_running:
             try:
                 self.status = "RECONNECTING"
-                logger.info(f"Connecting to trade websocket: {WS_TRADE_URL}...")
-                async with websockets.connect(WS_TRADE_URL, ssl=ssl_context) as ws:
+                logger.info(f"Connecting to trade websocket: {base_url}...")
+                async with websockets.connect(base_url, ssl=ssl_context) as ws:
                     self.status = "CONNECTED"
                     self.last_message_time = time.time()
-                    logger.info("Trade websocket connected successfully.")
+                    logger.info("Trade websocket connected. Sending SUBSCRIBE command...")
+                    
+                    subscribe_payload = {
+                        "method": "SUBSCRIBE",
+                        "params": trade_streams,
+                        "id": 1
+                    }
+                    await ws.send(json.dumps(subscribe_payload))
+                    logger.info("SUBSCRIBE command sent successfully.")
                     backoff = 1.0  # Reset backoff on successful connection
 
                     while self.is_running:

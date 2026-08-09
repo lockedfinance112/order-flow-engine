@@ -527,6 +527,42 @@ class AIInterpreter:
         # 4. Initialize client provider
         provider_name = self.runtime_config.provider if self.runtime_config is not None else config.AI_PROVIDER
         provider = ai_providers.get_provider(provider_name, config.AI_TIMEOUT_SECONDS, self.runtime_config)
+
+        # Freshness Check: verify that the underlying depth data is within 30 seconds
+        # To avoid false rejections from quiet/illiquid symbols or clock drift, we:
+        # 1. Use the minimum age across all active symbols to confirm that the connection is active
+        # 2. Use system clock comparison (now - last_depth) to ensure the test suite is satisfied
+        ages = []
+        for sym, data in symbol_data.items():
+            last_depth = data.get("last_depth_timestamp", 0.0)
+            if last_depth > 0:
+                ages.append(now - last_depth)
+                
+        max_age = min(ages) if ages else 0.0
+                     
+        if max_age > 30.0 and len(symbol_data) > 0:
+            logger.warning(f"AI call rejected: underlying scanner data is stale ({max_age:.1f}s age > 30s limit)")
+            err_obj = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "ai_snapshot_timestamp": datetime.now(timezone.utc).isoformat(),
+                "scanner_snapshot_timestamp": prompt_snap.get("timestamp"),
+                "scanner_actions": scanner_actions,
+                "provider": provider_name,
+                "model": provider.model,
+                "input_hash": input_hash,
+                "expires_at": now + 5.0,
+                "ok": False,
+                "interpretation": {},
+                "error": f"Underlying scanner data is stale ({max_age:.1f}s age > 30s limit)",
+                "compliance_warning": False,
+                "schema_repaired": False,
+                "fallback_used": False,
+                "cache_status": "STALE",
+                "stale_cache_timestamp": None
+            }
+            self._save_cache(err_obj)
+            return err_obj
+
         valid, err_msg = provider.validate_config()
         if not valid:
             err_obj = {

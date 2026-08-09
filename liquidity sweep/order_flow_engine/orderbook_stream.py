@@ -53,14 +53,25 @@ class OrderBookStream:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
+        from config import depth_streams
+        base_url = "wss://fstream.binance.com/public/stream"
+
         while self.is_running:
             try:
                 self.status = "RECONNECTING"
-                logger.info(f"Connecting to order book depth websocket: {WS_DEPTH_URL}...")
-                async with websockets.connect(WS_DEPTH_URL, ssl=ssl_context) as ws:
+                logger.info(f"Connecting to order book depth websocket: {base_url}...")
+                async with websockets.connect(base_url, ssl=ssl_context) as ws:
                     self.status = "CONNECTED"
                     self.last_message_time = time.time()
-                    logger.info("Order book websocket connected successfully.")
+                    logger.info("Order book websocket connected. Sending SUBSCRIBE command...")
+                    
+                    subscribe_payload = {
+                        "method": "SUBSCRIBE",
+                        "params": depth_streams,
+                        "id": 1
+                    }
+                    await ws.send(json.dumps(subscribe_payload))
+                    logger.info("SUBSCRIBE command sent successfully.")
                     backoff = 1.0  # Reset backoff on successful connection
 
                     while self.is_running:
@@ -94,17 +105,6 @@ class OrderBookStream:
                 backoff = min(backoff * 2.0, max_backoff)
 
     async def _handle_message(self, symbol: str, data: dict):
-        try:
-            bids = [[float(item[0]), float(item[1])] for item in data["b"]]
-            asks = [[float(item[0]), float(item[1])] for item in data["a"]]
-            
-            parsed_depth = {
-                "timestamp": float(data["T"]) / 1000.0,
-                "symbol": symbol,
-                "bids": bids,
-                "asks": asks
-            }
-            
-            await self.callback(symbol, parsed_depth)
-        except (KeyError, ValueError, TypeError) as e:
-            logger.error(f"Failed to parse depth message: {e}. Data: {data}")
+        if data.get("e") != "depthUpdate":
+            return
+        await self.callback(symbol, data)

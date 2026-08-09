@@ -52,7 +52,7 @@ SYMBOLS = [
 
 # Build Trade and Depth Streams lists
 trade_streams = [f"{symbol.lower()}@aggTrade" for symbol in SYMBOLS]
-depth_streams = [f"{symbol.lower()}@depth5@100ms" for symbol in SYMBOLS]
+depth_streams = [f"{symbol.lower()}@depth@100ms" for symbol in SYMBOLS]
 
 # Default WebSocket URLs using routed 2026 Binance segmentation paths
 default_trade_url = "wss://fstream.binance.com/market/stream?streams=" + "/".join(trade_streams)
@@ -94,7 +94,7 @@ MAX_DISPLAY_SYMBOLS = 20
 EXECUTION_DISABLED = True
 
 # AI Interpretation Configurations (V2.5)
-AI_ENABLED = os.getenv("AI_ENABLED", "false").lower() == "true"
+AI_ENABLED = os.getenv("AI_ENABLED", "true").lower() == "true"
 AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()
 AI_INTERVAL_SECONDS = int(os.getenv("AI_INTERVAL_SECONDS", "120"))
 AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "20"))
@@ -116,3 +116,6 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+
+# Event Recorder Configuration (v2.9)
+RECORDING_ENABLED = os.getenv("RECORDING_ENABLED", "false").lower() == "true"

@@ -26,6 +26,7 @@ from ai_interpreter import AIInterpreter
 from ai_runtime_config import RuntimeAIConfig
 import ai_providers
 from binance_context import BinanceContextManager
+from data.paper_trader import PaperTrader
 
 # Configure file logging to avoid messing up the rich console output
 log_file = os.path.join(os.path.dirname(__file__), "order_flow.log")
@@ -53,6 +54,13 @@ class OrderFlowEngine:
         )
         self.binance_context = BinanceContextManager(SYMBOLS)
         
+        # Event Recorders per symbol (v2.9)
+        from data.recorder import StreamRecorder
+        self.recorders: Dict[str, StreamRecorder] = {}
+        if config.RECORDING_ENABLED:
+            for sym in SYMBOLS:
+                self.recorders[sym.lower()] = StreamRecorder(sym)
+        
         # Segregated trade queue and streams
         self.trade_queue = asyncio.Queue()
         self.stream = TradeStream(self._queue_trade)
@@ -73,6 +81,7 @@ class OrderFlowEngine:
         # Track previous signal action state per symbol to detect transitions
         self.prev_actions: Dict[str, str] = {}
         self.last_ai_manual_time = 0.0
+        self.paper_trader = PaperTrader(10000.0)
 
     def _json_response(self, payload: dict, status: str = "200 OK") -> str:
         body = json.dumps(payload)
@@ -148,14 +157,24 @@ class OrderFlowEngine:
             "error": ai_providers.redact_sensitive(err_msg) if err_msg else None,
         }
 
-
     async def _queue_trade(self, symbol: str, trade: dict):
         """Websocket callback to put parsed symbol trade into the queue."""
+        now = time.time()
+        trade["received_time"] = now
         await self.trade_queue.put((symbol.lower(), trade))
+        if config.RECORDING_ENABLED:
+            rec = self.recorders.get(symbol.lower())
+            if rec:
+                await rec.record(f"{symbol.lower()}@aggTrade", trade, now)
 
     async def _handle_depth(self, symbol: str, depth_data: dict):
         """Websocket callback to update order book pressure metrics directly."""
-        self.metrics.update_depth(symbol.lower(), depth_data)
+        now = time.time()
+        self.metrics.update_depth(symbol.lower(), depth_data, now)
+        if config.RECORDING_ENABLED:
+            rec = self.recorders.get(symbol.lower())
+            if rec:
+                await rec.record(f"{symbol.lower()}@depth", depth_data, now)
 
     async def _handle_sweep(self, sweep: dict):
         """Triggered when SweepsMonitor detects a new liquidity sweep event."""
@@ -300,6 +319,41 @@ class OrderFlowEngine:
                         response = self._json_response(payload, "400 Bad Request")
                 elif path == "/api/ai/test":
                     response = self._json_response(self._test_ai_provider_config())
+                elif path == "/api/paper/order":
+                    try:
+                        body = self._parse_json_body(request)
+                        symbol = body.get("symbol", "").lower()
+                        side = body.get("side", "").upper()
+                        qty = float(body.get("quantity", 0.0))
+                        
+                        price = self.metrics.get_metrics_for_window(symbol, "1m").get("latest_price", 0.0)
+                        if price <= 0:
+                            state = self.metrics.get_state(symbol)
+                            price = (state.best_bid + state.best_ask) / 2.0 if (state.best_bid + state.best_ask) > 0 else 0.0
+                            
+                        if price <= 0:
+                            response = self._json_response({"ok": False, "error": f"No mark price available for {symbol.upper()}"}, "400 Bad Request")
+                        else:
+                            success = self.paper_trader.execute_order(symbol, side, qty, price)
+                            if success:
+                                current_prices = {s: self.metrics.get_metrics_for_window(s, "1m").get("latest_price", 0.0) for s in SYMBOLS}
+                                response = self._json_response({"ok": True, "portfolio": self.paper_trader.get_portfolio_state(current_prices)})
+                            else:
+                                response = self._json_response({"ok": False, "error": "Order execution failed (insufficient margin/funds or invalid parameters)"}, "400 Bad Request")
+                    except Exception as e:
+                        response = self._json_response({"ok": False, "error": str(e)}, "400 Bad Request")
+                elif path == "/api/paper/reset":
+                    self.paper_trader.reset()
+                    current_prices = {s: self.metrics.get_metrics_for_window(s, "1m").get("latest_price", 0.0) for s in SYMBOLS}
+                    response = self._json_response({"ok": True, "portfolio": self.paper_trader.get_portfolio_state(current_prices)})
+                elif path == "/api/paper/toggle_auto":
+                    try:
+                        body = self._parse_json_body(request)
+                        self.paper_trader.auto_trade_enabled = bool(body.get("enabled", False))
+                        current_prices = {s: self.metrics.get_metrics_for_window(s, "1m").get("latest_price", 0.0) for s in SYMBOLS}
+                        response = self._json_response({"ok": True, "portfolio": self.paper_trader.get_portfolio_state(current_prices)})
+                    except Exception as e:
+                        response = self._json_response({"ok": False, "error": str(e)}, "400 Bad Request")
                 else:
                     response = self._plain_response("404 Not Found", "404 Not Found")
 
@@ -318,6 +372,56 @@ class OrderFlowEngine:
                         "configured": settings["configured"],
                         "cache_ttl_seconds": config.AI_CACHE_TTL_SECONDS,
                         "interval_seconds": config.AI_INTERVAL_SECONDS
+                    }
+                    response = self._json_response(payload)
+                elif path.startswith("/api/symbol"):
+                    sym_name = "btcusdt"
+                    if "?" in path:
+                        parts = path.split("?")
+                        if len(parts) >= 2:
+                            for q in parts[1].split("&"):
+                                if q.startswith("sym="):
+                                    sym_name = q.split("=")[1].lower()
+                    
+                    state = self.metrics.get_state(sym_name)
+                    hist_snapshots = []
+                    for ts, bids, asks in list(state.stacking_pulling.history)[-300:]:
+                        hist_snapshots.append({
+                            "timestamp": ts,
+                            "bids": bids,
+                            "asks": asks
+                        })
+                        
+                    recent_trades = []
+                    for t in list(state.trades)[-200:]:
+                        recent_trades.append({
+                            "timestamp": t.exchange_time_ms / 1000.0,
+                            "price": t.price,
+                            "quantity": t.quantity,
+                            "side": t.aggressor_side,
+                            "notional": t.notional
+                        })
+                        
+                    payload = {
+                        "symbol": sym_name,
+                        "price": state.best_bid if state.best_bid > 0 else 0.0,
+                        "best_bid": state.best_bid,
+                        "best_ask": state.best_ask,
+                        "spread": state.spread,
+                        "spread_bps": state.spread_bps,
+                        "microprice": state.microprice,
+                        "microprice_dev": state.microprice_dev,
+                        "imbalance_0_5_bps": state.imbalance_0_5_bps,
+                        "imbalance_5_15_bps": state.imbalance_5_15_bps,
+                        "imbalance_15_30_bps": state.imbalance_15_30_bps,
+                        "imbalance_total": state.imbalance_total,
+                        "depth_weighted_imbalance": state.depth_weighted_imbalance,
+                        "book_history": hist_snapshots,
+                        "trades": recent_trades,
+                        "active_walls": state.wall_tracker.get_active_walls(
+                            (state.best_bid + state.best_ask)/2.0 if (state.best_bid + state.best_ask) > 0 else 1.0, 
+                            state.bid_depth_top5_usdt if state.bid_depth_top5_usdt > 0 else 1.0
+                        )
                     }
                     response = self._json_response(payload)
                 elif path == "/api/binance/context":
@@ -351,22 +455,42 @@ class OrderFlowEngine:
                                 recent_events=recent_events
                             )
                             
+                            self.metrics.check_duplication(sym, m5m, m15m)
+                            mid_price = (state.best_bid + state.best_ask) / 2.0
+                            
                             symbols_payload[sym] = {
                                 "price": m1m.get("latest_price", 0.0),
                                 "session_cvd_usdt": state.session_cvd_usdt,
+                                "running_cvd_usdt": state.running_cvd_usdt,
                                 "metrics_1m": m1m,
                                 "metrics_5m": m5m,
                                 "metrics_15m": m15m,
                                 "imbalance": state.bid_ask_imbalance,
+                                "imbalance_0_5_bps": state.imbalance_0_5_bps,
+                                "imbalance_5_15_bps": state.imbalance_5_15_bps,
+                                "imbalance_15_30_bps": state.imbalance_15_30_bps,
+                                "imbalance_total": state.imbalance_total,
+                                "depth_weighted_imbalance": state.depth_weighted_imbalance,
                                 "spread": state.spread,
+                                "spread_bps": state.spread_bps,
+                                "microprice_dev": state.microprice_dev,
                                 "next_action": bias_action,
                                 "last_large_trade_time": state.last_large_trade_time,
                                 "last_event_time": state.last_event_time,
                                 "latest_event": state.latest_event,
                                 "last_depth_timestamp": state.last_depth_timestamp,
-                                "binance_context": self.binance_context.get_context().get("symbols", {}).get(sym.upper(), {})
+                                "binance_context": self.binance_context.get_context().get("symbols", {}).get(sym.upper(), {}),
+                                "duplication_suspected": state.duplication_suspected,
+                                "book_coverage": "STANDARD L2",
+                                "rpi_included": "NO",
+                                "book_state": state.local_book.state,
+                                "stream_health_status": state.health_tracker.get_status(state.local_book.is_valid),
+                                "stream_health_metrics": state.health_tracker.get_metrics(),
+                                "check_gates": self.scorer.symbol_gates.get(sym.lower(), {}),
+                                "active_walls": state.wall_tracker.get_active_walls(mid_price, state.bid_depth_top5_usdt)
                             }
                         
+                        current_prices = {s: self.metrics.get_metrics_for_window(s, "1m").get("latest_price", 0.0) for s in SYMBOLS}
                         payload = {
                             "is_multi": True,
                             "trade_ws_status": trade_status,
@@ -374,7 +498,8 @@ class OrderFlowEngine:
                             "symbols": symbols_payload,
                             "recent_events": list(self.dashboard.recent_events),
                             "recent_large_trades": list(self.dashboard.recent_large_trades),
-                            "binance_context_status": self.binance_context.get_status()
+                            "binance_context_status": self.binance_context.get_status(),
+                            "paper_portfolio": self.paper_trader.get_portfolio_state(current_prices)
                         }
                     else:
                         sym = SYMBOLS[0]
@@ -435,7 +560,6 @@ class OrderFlowEngine:
         finally:
             try:
                 writer.close()
-                await writer.wait_closed()
             except Exception:
                 pass
 
@@ -453,6 +577,10 @@ class OrderFlowEngine:
         print(f"WEB DASHBOARD ACTIVE: http://localhost:{port}")
         print(f"=======================================================\n")
 
+        if config.RECORDING_ENABLED:
+            for rec in self.recorders.values():
+                rec.start()
+
         await self.stream.start()
         await self.depth_stream.start()
         await self.sweeps_monitor.start()
@@ -469,6 +597,10 @@ class OrderFlowEngine:
         except asyncio.CancelledError:
             logger.info("Order Flow Engine stopped.")
         finally:
+            if config.RECORDING_ENABLED:
+                for rec in self.recorders.values():
+                    await rec.stop()
+
             await self.stream.stop()
             await self.depth_stream.stop()
             await self.sweeps_monitor.stop()
@@ -584,6 +716,91 @@ class OrderFlowEngine:
         )
         self.dashboard.add_event(symbol, event_type, window, metrics_copy.get("latest_price", 0.0), notes)
 
+    def _run_auto_paper_trade(self, symbol: str, price: float, action: str):
+        if not self.paper_trader.auto_trade_enabled:
+            return
+            
+        symbol = symbol.lower()
+        pos = self.paper_trader.positions.get(symbol)
+        
+        # Determine if we should exit current position
+        if pos:
+            should_close = False
+            # Check 1% Take Profit target (Futures contracts PnL)
+            if pos["side"] == "BUY":
+                profit_pct = (price - pos["entry_price"]) / pos["entry_price"]
+            else:
+                profit_pct = (pos["entry_price"] - price) / pos["entry_price"]
+                
+            if profit_pct >= 0.01:
+                should_close = True
+                logger.info(f"[AUTO PAPER TRADE] 1% Profit Target hit for {symbol.upper()}! Closing position at {price} (Entry: {pos['entry_price']})")
+            elif profit_pct <= -0.10:
+                should_close = True
+                logger.info(f"[AUTO PAPER TRADE] 10% Stop Loss hit for {symbol.upper()}! Closing position at {price} (Entry: {pos['entry_price']})")
+            elif pos["side"] == "BUY" and action in ("CONFIRMED_SHORT", "SHORT (SWEEP)", "SHORT_BIAS", "WATCH_SHORT"):
+                should_close = True
+            elif pos["side"] == "SELL" and action in ("CONFIRMED_LONG", "LONG (SWEEP)", "LONG_BIAS", "WATCH_LONG"):
+                should_close = True
+                
+            if should_close:
+                close_side = "SELL" if pos["side"] == "BUY" else "BUY"
+                self.paper_trader.execute_order(symbol, close_side, pos["qty"], price)
+                logger.info(f"[AUTO PAPER TRADE] Closed position for {symbol.upper()} at {price} due to exit condition.")
+                
+        # Determine if we should open a new position
+        pos = self.paper_trader.positions.get(symbol)
+        if not pos:
+            symbol_state = self.metrics.get_state(symbol)
+            if action in ("CONFIRMED_LONG", "LONG (SWEEP)", "LONG_BIAS", "CONFIRMED_SHORT", "SHORT (SWEEP)", "SHORT_BIAS"):
+                logger.info(f"[AUTO DEBUG] {symbol.upper()}: action={action}, book_valid={symbol_state.local_book.is_valid}, book_state={symbol_state.local_book.state}, spread_bps={symbol_state.spread_bps:.2f}")
+            # 1. Order book synchronization check
+            if not symbol_state.local_book.is_valid or symbol_state.local_book.state != "HEALTHY":
+                return
+            # 2. Tight bid-ask spread check (must be < 15.0 basis points)
+            if symbol_state.spread_bps >= 15.0:
+                return
+            # 3. Data integrity validation
+            if symbol_state.duplication_suspected:
+                return
+                
+            # Highest Probability Entry Filters (Confluence Alignment):
+            metrics_5m = self.metrics.get_metrics_for_window(symbol, "5m")
+            buy_ratio_5m = metrics_5m.get("buy_ratio", 0.5)
+            imbalance = symbol_state.bid_ask_imbalance
+            cvd = symbol_state.session_cvd_usdt
+            
+            is_high_prob_long = (
+                action in ("CONFIRMED_LONG", "LONG (SWEEP)", "LONG_BIAS")
+                and buy_ratio_5m >= 0.58
+                and imbalance >= 0.20
+                and cvd > 0
+            )
+            
+            is_high_prob_short = (
+                action in ("CONFIRMED_SHORT", "SHORT (SWEEP)", "SHORT_BIAS")
+                and buy_ratio_5m <= 0.42
+                and imbalance <= -0.20
+                and cvd < 0
+            )
+            
+            current_prices = {s: self.metrics.get_metrics_for_window(s, "1m").get("latest_price", 0.0) for s in SYMBOLS}
+            current_prices[symbol] = price
+            
+            state = self.paper_trader.get_portfolio_state(current_prices)
+            equity = state["equity"]
+            
+            # Simple trade sizing: 10% of equity, with 5x leverage
+            trade_size_usdt = equity * 0.10 * 5.0
+            qty = trade_size_usdt / price
+            
+            if is_high_prob_long:
+                self.paper_trader.execute_order(symbol, "BUY", qty, price)
+                logger.info(f"[AUTO PAPER TRADE] Opened HIGH PROBABILITY LONG for {symbol.upper()} at {price} (Qty: {qty:.4f})")
+            elif is_high_prob_short:
+                self.paper_trader.execute_order(symbol, "SELL", qty, price)
+                logger.info(f"[AUTO PAPER TRADE] Opened HIGH PROBABILITY SHORT for {symbol.upper()} at {price} (Qty: {qty:.4f})")
+
     async def _dashboard_loop(self):
         """Periodically refreshes the dashboard UI and runs slower event checks per symbol."""
         # Wait a moment for trades to start flowing
@@ -665,6 +882,9 @@ class OrderFlowEngine:
                             recent_events=recent_events
                         )
 
+                        # Run auto paper trade checks
+                        self._run_auto_paper_trade(symbol, price, bias_action)
+
                         # Detect signal state changes and register them with SignalTracker
                         prev_action = self.prev_actions.get(symbol, "WAITING")
                         if bias_action != prev_action:
@@ -685,6 +905,7 @@ class OrderFlowEngine:
                         symbol_data[symbol] = {
                             "price": price,
                             "session_cvd_usdt": state.session_cvd_usdt,
+                            "running_cvd_usdt": state.running_cvd_usdt,
                             "delta_1m_usdt": metrics_1m.get("delta_usdt", 0.0),
                             "delta_5m_usdt": metrics_5m.get("delta_usdt", 0.0),
                             "delta_15m_usdt": metrics_15m.get("delta_usdt", 0.0),
@@ -697,7 +918,12 @@ class OrderFlowEngine:
                             "last_large_trade_time": state.last_large_trade_time,
                             "last_event_time": state.last_event_time,
                             "latest_event": state.latest_event,
-                            "last_depth_timestamp": state.last_depth_timestamp
+                            "last_depth_timestamp": state.last_depth_timestamp,
+                            "metrics_1m": metrics_1m,
+                            "metrics_5m": metrics_5m,
+                            "metrics_15m": metrics_15m,
+                            "duplication_suspected": state.duplication_suspected,
+                            "book_state": state.local_book.state
                         }
 
                     # Periodic finalization checks for outcome tracking

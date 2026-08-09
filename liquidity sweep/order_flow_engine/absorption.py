@@ -27,23 +27,23 @@ class AbsorptionDetector:
         if len(trades) < 10:
             return None, ""
 
-        current_time = trades[-1]["timestamp"]
+        current_time = trades[-1].exchange_time_ms / 1000.0
         cutoff = current_time - window_seconds
 
         # Extract trades in window
-        window_trades = [t for t in trades if t["timestamp"] >= cutoff]
+        window_trades = [t for t in trades if (t.exchange_time_ms / 1000.0) >= cutoff]
         if len(window_trades) < 10:
             return None, ""
 
         # Calculate price metrics
-        open_price = window_trades[0]["price"]
-        close_price = window_trades[-1]["price"]
-        high_price = max(t["price"] for t in window_trades)
-        low_price = min(t["price"] for t in window_trades)
+        open_price = window_trades[0].price
+        close_price = window_trades[-1].price
+        high_price = max(t.price for t in window_trades)
+        low_price = min(t.price for t in window_trades)
 
         # Calculate notional volumes (USDT)
-        buy_vol_usdt = sum(t.get("notional_usdt", t["price"] * t["quantity"]) for t in window_trades if t["side"] == "BUY")
-        sell_vol_usdt = sum(t.get("notional_usdt", t["price"] * t["quantity"]) for t in window_trades if t["side"] == "SELL")
+        buy_vol_usdt = sum(t.notional for t in window_trades if t.aggressor_side == "BUY")
+        sell_vol_usdt = sum(t.notional for t in window_trades if t.aggressor_side == "SELL")
         delta_usdt = buy_vol_usdt - sell_vol_usdt
         total_vol_usdt = buy_vol_usdt + sell_vol_usdt
         
@@ -90,10 +90,10 @@ class AbsorptionDetector:
         if len(trades) < 20:
             return None, ""
 
-        current_time = trades[-1]["timestamp"]
+        current_time = trades[-1].exchange_time_ms / 1000.0
         cutoff = current_time - window_seconds
 
-        window_trades = [t for t in trades if t["timestamp"] >= cutoff]
+        window_trades = [t for t in trades if (t.exchange_time_ms / 1000.0) >= cutoff]
         if len(window_trades) < 20:
             return None, ""
 
@@ -103,17 +103,17 @@ class AbsorptionDetector:
         second_half = window_trades[midpoint:]
 
         # Price values
-        avg_price_1 = sum(t["price"] for t in first_half) / len(first_half)
-        avg_price_2 = sum(t["price"] for t in second_half) / len(second_half)
+        avg_price_1 = sum(t.price for t in first_half) / len(first_half)
+        avg_price_2 = sum(t.price for t in second_half) / len(second_half)
         price_trend = "UP" if avg_price_2 > avg_price_1 else "DOWN"
 
         # Calculate delta trend in USDT notional
-        first_half_buy = sum(t.get("notional_usdt", t["price"] * t["quantity"]) for t in first_half if t["side"] == "BUY")
-        first_half_sell = sum(t.get("notional_usdt", t["price"] * t["quantity"]) for t in first_half if t["side"] == "SELL")
+        first_half_buy = sum(t.notional for t in first_half if t.aggressor_side == "BUY")
+        first_half_sell = sum(t.notional for t in first_half if t.aggressor_side == "SELL")
         first_half_delta_usdt = first_half_buy - first_half_sell
 
-        second_half_buy = sum(t.get("notional_usdt", t["price"] * t["quantity"]) for t in second_half if t["side"] == "BUY")
-        second_half_sell = sum(t.get("notional_usdt", t["price"] * t["quantity"]) for t in second_half if t["side"] == "SELL")
+        second_half_buy = sum(t.notional for t in second_half if t.aggressor_side == "BUY")
+        second_half_sell = sum(t.notional for t in second_half if t.aggressor_side == "SELL")
         second_half_delta_usdt = second_half_buy - second_half_sell
 
         # CVD divergence:
