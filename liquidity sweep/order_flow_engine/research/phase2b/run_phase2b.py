@@ -14,6 +14,15 @@ def pct(val):
         return "N/A"
     return f"{val * 100:.4f}%"
 
+def cohort_matches(signal, cohort):
+    if cohort == "overall":
+        return True
+    if cohort == "long":
+        return signal.get("direction") == "LONG"
+    if cohort == "short":
+        return signal.get("direction") == "SHORT"
+    return False
+
 def get_direction_classification(overall, long, short):
     if overall["candidate"]["count"] < 10 or long["candidate"]["count"] < 5 or short["candidate"]["count"] < 5:
         return "INSUFFICIENT_DATA"
@@ -57,13 +66,62 @@ def get_validation_classification(dev_res, val_res):
     return "MIXED_VALIDATION"
 
 def compute_buckets(dev_pool):
-    if len(dev_pool) < 20:
-        return "INSUFFICIENT DATA"
-    # Placeholder bucket structures calculated DEV-only
-    return {
-        "imbalance": {"bounds_derived_on_dev": True, "buckets": ["0.15-0.20", "0.20-0.25", "0.25-0.30", "0.30-0.40", ">0.40"]},
-        "CVD": {"bounds_derived_on_dev": True, "quantiles": [0.2, 0.4, 0.6, 0.8]}
+    features = {
+        "imbalance": {"adjust": True},
+        "delta_5m_usdt": {"adjust": True},
+        "delta_15m_usdt": {"adjust": True},
+        "session_cvd_usdt": {"adjust": True},
+        "open_interest_change_pct": {"adjust": False},
+        "sweep_score": {"adjust": False},
+        "book_drift": {"adjust": False}
     }
+    
+    out = {}
+    for feat, conf in features.items():
+        vals = []
+        for s in dev_pool:
+            v = float_val(s.get(feat))
+            if v is not None:
+                if conf["adjust"] and s.get("direction") == "SHORT":
+                    v = -v
+                vals.append((v, s))
+                
+        if len(vals) < 20:
+            out[feat] = "INSUFFICIENT_DATA"
+            continue
+            
+        numeric_vals = [item[0] for item in vals]
+        # Calculate DEV-only quantiles
+        bounds = np.percentile(numeric_vals, [20, 40, 60, 80])
+        
+        buckets = []
+        # Construct 5 buckets
+        ranges = [
+            (float('-inf'), bounds[0]),
+            (bounds[0], bounds[1]),
+            (bounds[1], bounds[2]),
+            (bounds[2], bounds[3]),
+            (bounds[3], float('inf'))
+        ]
+        
+        for idx, (low, high) in enumerate(ranges):
+            bucket_sigs = [item[1] for item in vals if low <= item[0] < high]
+            rets = [float_val(s.get("return_15m_pct")) for s in bucket_sigs if s.get("horizon_15m_status") == "CAPTURED" and float_val(s.get("return_15m_pct")) is not None]
+            stats = calculate_stats(rets)
+            buckets.append({
+                "bucket_index": idx,
+                "low": low,
+                "high": high,
+                "count": len(bucket_sigs),
+                "win_rate": stats["win_rate"],
+                "expectancy": stats["expectancy"]
+            })
+            
+        out[feat] = {
+            "boundaries": list(bounds),
+            "buckets": buckets
+        }
+    return out
 
 def run_research():
     base_dir = os.path.dirname(__file__)
@@ -147,19 +205,27 @@ def run_research():
             dev_res["direction_classification"] = get_direction_classification(overall_15m, long_15m, short_15m)
             dev_res["symbol_classification"] = get_symbol_classification(dev_res["by_symbol"])
             
-            # Wire Bootstrap CI
+            # Wire Bootstrap CI for both eligible and candidate cohorts separately
             for cohort_name, cohort_data in [("overall", dev_res["overall"]), ("long", dev_res["long"]), ("short", dev_res["short"])]:
                 for hor in ["1m", "3m", "5m", "15m"]:
+                    eligible_rets = []
                     cand_rets = []
-                    # Get eligible candidate returns for this horizon
+                    
                     for s in dev_pool:
-                        res = filter_func(s)
-                        if res is True and s.get("direction", "").lower() in (cohort_name, "long", "short"):
-                            if s.get(f"horizon_{hor}_status") == "CAPTURED":
-                                val = float_val(s.get(f"return_{hor}_pct"))
-                                if val is not None:
-                                    cand_rets.append(val)
-                    cohort_data[hor]["bootstrap"] = bootstrap_ci(cand_rets, iterations=5000, seed=42)
+                        if cohort_matches(s, cohort_name):
+                            res = filter_func(s)
+                            if res is not None:
+                                if s.get(f"horizon_{hor}_status") == "CAPTURED":
+                                    val = float_val(s.get(f"return_{hor}_pct"))
+                                    if val is not None:
+                                        eligible_rets.append(val)
+                                        if res is True:
+                                            cand_rets.append(val)
+                                            
+                    cohort_data[hor]["bootstrap"] = {
+                        "eligible_baseline": bootstrap_ci(eligible_rets, iterations=5000, seed=42),
+                        "candidate": bootstrap_ci(cand_rets, iterations=5000, seed=42)
+                    }
             
             # Independent VAL evaluation
             val_res = None
@@ -344,13 +410,16 @@ NO PRODUCTION STRATEGY CHANGES HAVE BEEN APPLIED.
             writer = csv.writer(f)
             writer.writerow(headers)
 
-    # Dynamic status printing
+    # Dynamic status printing conforming strictly to specifications
     print("\nPHASE 2B FRAMEWORK READY")
     print(f"CURRENT SAMPLE: N={total_n}")
     print(f"STATUS: {status}")
     
     if total_n < 50:
         print("HYPOTHESIS SELECTION: DISABLED")
+        print("VALIDATION: DISABLED")
+    elif total_n < 100:
+        print("HYPOTHESIS SELECTION: ENABLED")
         print("VALIDATION: DISABLED")
     else:
         print("HYPOTHESIS SELECTION: ENABLED")

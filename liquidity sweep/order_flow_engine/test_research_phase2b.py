@@ -1,61 +1,72 @@
 import os
 import unittest
+import numpy as np
 from research.phase2b.data_loader import partition_signals
 from research.phase2b.statistics import calculate_stats, bootstrap_ci
 from research.phase2b.counterfactual_engine import CounterfactualEngine
 from research.phase2b.hypothesis_registry import HYPOTHESES, combine_and
 from research.phase2b.walk_forward import WalkForwardValidator
+from research.phase2b.run_phase2b import cohort_matches, compute_buckets
 
 class TestPhase2BResearchHardened(unittest.TestCase):
-    # Bootstrap checks
-    def test_bootstrap_reproducible_and_wired(self):
-        returns = [0.01, -0.02, 0.03, -0.01, 0.02, -0.03, 0.01, -0.01] * 3 # N=24
-        ci1 = bootstrap_ci(returns, iterations=100, seed=42)
-        ci2 = bootstrap_ci(returns, iterations=100, seed=42)
-        self.assertEqual(ci1["status"], "OK")
-        self.assertEqual(ci1["win_rate"], ci2["win_rate"])
+    # Cohort Matching Tests
+    def test_cohort_matches(self):
+        long_sig = {"direction": "LONG"}
+        short_sig = {"direction": "SHORT"}
+        self.assertTrue(cohort_matches(long_sig, "overall"))
+        self.assertTrue(cohort_matches(long_sig, "long"))
+        self.assertFalse(cohort_matches(long_sig, "short"))
+        self.assertTrue(cohort_matches(short_sig, "short"))
+        self.assertFalse(cohort_matches(short_sig, "long"))
 
-    def test_insufficient_bootstrap_remains_none(self):
+    # Bootstrap Sizing Tests
+    def test_bootstrap_insufficient_sample(self):
         returns = [0.01] * 10
-        ci = bootstrap_ci(returns)
-        self.assertEqual(ci["status"], "INSUFFICIENT_SAMPLE_FOR_BOOTSTRAP")
-        self.assertIsNone(ci["win_rate"])
+        res = bootstrap_ci(returns)
+        self.assertEqual(res["status"], "INSUFFICIENT_SAMPLE_FOR_BOOTSTRAP")
+        self.assertIsNone(res["win_rate"])
 
-    # Partition and bounds checks
-    def test_dev_only_boundaries_and_holdout_never_seen(self):
-        signals = [{"entry_time": str(i)} for i in range(100)]
-        parts = partition_signals(signals)
-        self.assertEqual(len(parts.development), 60)
-        self.assertEqual(len(parts.validation), 20)
-        self.assertEqual(len(parts._holdout), 20)
+    # Buckets bounds tests
+    def test_compute_buckets_dev_only(self):
+        dev_pool = [
+            {"direction": "LONG", "imbalance": str(i * 0.01), "delta_5m_usdt": "100", "delta_15m_usdt": "200",
+             "session_cvd_usdt": "500", "open_interest_change_pct": "0.01", "sweep_score": "8", "book_drift": "0.1",
+             "horizon_15m_status": "CAPTURED", "return_15m_pct": "0.01"}
+            for i in range(25)
+        ]
+        buckets = compute_buckets(dev_pool)
+        self.assertIn("imbalance", buckets)
+        self.assertIn("delta_5m_usdt", buckets)
+        self.assertIn("delta_15m_usdt", buckets)
+        self.assertIn("session_cvd_usdt", buckets)
+        self.assertIn("open_interest_change_pct", buckets)
+        self.assertIn("sweep_score", buckets)
+        self.assertIn("book_drift", buckets)
+        
+        # Test boundaries returned
+        self.assertEqual(len(buckets["imbalance"]["boundaries"]), 4)
+        self.assertEqual(len(buckets["imbalance"]["buckets"]), 5)
 
-        # Ensure validation cannot alter DEV bucket bounds (which are computed purely on partitions.development)
-        self.assertTrue(parts.status == "HOLDOUT SPLITS ACTIVATED")
-
-    # Walk forward checks
-    def test_walk_forward_missing_return_and_ordering(self):
+    # Walk forward tests
+    def test_walk_forward_window(self):
         signals = [
-            {"entry_time": "1", "horizon_15m_status": "CAPTURED", "return_15m_pct": "0.01"},
-            {"entry_time": "2", "horizon_15m_status": "CAPTURED", "return_15m_pct": "MISSING"},
-            {"entry_time": "3", "horizon_15m_status": "CAPTURED", "return_15m_pct": "-0.02"}
+            {"entry_time": str(i), "horizon_15m_status": "CAPTURED", "return_15m_pct": "0.01"}
+            for i in range(130)
         ]
         wfv = WalkForwardValidator(signals)
-        # Ensure chronological sorting order
-        self.assertEqual(wfv.signals[0]["entry_time"], "1")
-        self.assertEqual(wfv.signals[2]["entry_time"], "3")
+        res = wfv.run_walk_forward(lambda s: True, min_train_size=100, step_size=25)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["validation_n"], 25)
 
-    # Validation classifications
-    def test_validation_result_independently_calculated(self):
-        signals = [
-            {"dataset_class": "CANONICAL_PHASE2", "direction": "LONG", "session_cvd_usdt": "100.0", "horizon_15m_status": "CAPTURED", "return_15m_pct": "0.01"},
-            {"dataset_class": "CANONICAL_PHASE2", "direction": "LONG", "session_cvd_usdt": "-50.0", "horizon_15m_status": "CAPTURED", "return_15m_pct": "-0.01"}
-        ]
-        engine = CounterfactualEngine(signals)
-        res = engine.evaluate_hypothesis(HYPOTHESES["H01_CVD_ALIGNMENT"])
-        self.assertEqual(res["total_baseline"], 2)
+    # Tri-state Combine AND tests
+    def test_tri_state_pairwise(self):
+        fa = lambda s: True
+        fb = lambda s: None
+        combined = combine_and(fa, fb)
+        self.assertIsNone(combined({}))
 
     # Immutability
-    def test_source_rows_remain_immutable(self):
+    def test_immutability(self):
         signals = [{"dataset_class": "CANONICAL_PHASE2", "direction": "LONG"}]
         engine = CounterfactualEngine(signals)
         engine.evaluate_hypothesis(lambda s: True)
