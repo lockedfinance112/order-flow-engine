@@ -1,0 +1,3 @@
+# PHASE 2 BASELINE SIGNAL QUALITY REPORT
+
+**INSUFFICIENT DATA** - No Phase 2 canonical signals found.

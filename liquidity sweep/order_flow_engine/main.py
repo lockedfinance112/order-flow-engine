@@ -22,6 +22,7 @@ from dashboard import OrderFlowDashboard
 from sweeps_monitor import SweepsMonitor
 from scoring import OrderFlowScorer
 from signal_tracker import SignalTracker
+from research.phase2.phase2_recorder import Phase2SignalRecorder
 from ai_interpreter import AIInterpreter
 from ai_runtime_config import RuntimeAIConfig
 import ai_providers
@@ -46,6 +47,7 @@ class OrderFlowEngine:
         self.storage = EventStorage()
         self.dashboard = OrderFlowDashboard(SYMBOLS)
         self.signal_tracker = SignalTracker()
+        self.phase2_recorder = Phase2SignalRecorder()
         self.ai_interpretation_lock = asyncio.Lock()
         self.ai_runtime_config = RuntimeAIConfig()
         self.ai_interpreter = AIInterpreter(
@@ -663,6 +665,10 @@ class OrderFlowEngine:
             await self.stream.stop()
             await self.depth_stream.stop()
             await self.sweeps_monitor.stop()
+            try:
+                self.phase2_recorder.shutdown()
+            except Exception:
+                logger.exception("Phase2 recorder shutdown checkpoint failed")
             http_server.close()
             await http_server.wait_closed()
 
@@ -679,6 +685,10 @@ class OrderFlowEngine:
                 trade_price = float(trade.get("p", 0.0) or trade.get("price", 0.0) or 0.0)
                 if trade_price > 0:
                     self.signal_tracker.update_price(symbol, trade_price)
+                    try:
+                        self.phase2_recorder.update_price(symbol, trade_price)
+                    except Exception:
+                        logger.exception("Phase2 research recorder price update failure")
 
                 # Handle large trade alerts
                 for alert in alerts:
@@ -934,6 +944,10 @@ class OrderFlowEngine:
                             if a["symbol"].lower() == symbol.lower() and (now - a["timestamp"]) <= 300.0
                         ]
 
+                        # Get previous canonical decision before evaluation
+                        previous_decision = self.current_decisions.get(symbol.lower())
+                        previous_action = previous_decision["action"] if previous_decision else "WAITING"
+
                         # Pure state machine evaluation of Order Flow bias
                         decision = self.scorer.evaluate_bias(
                             symbol=symbol,
@@ -946,18 +960,18 @@ class OrderFlowEngine:
 
                         # Commit canonical decision
                         self._commit_scanner_decision(symbol, decision, now)
-                        bias_action = decision["action"]
-                        suppression_reason = decision["reason"]
+                        committed_decision = copy.deepcopy(self.current_decisions[symbol.lower()])
+                        bias_action = committed_decision["action"]
+                        suppression_reason = committed_decision["reason"]
 
                         # Run auto paper trade checks
                         self._run_auto_paper_trade(symbol, price, bias_action)
 
-                        # Detect signal state changes and register them with SignalTracker
-                        prev_action = self.prev_actions.get(symbol, "WAITING")
-                        if bias_action != prev_action:
+                        # Detect signal state changes and register them with SignalTracker / Phase2SignalRecorder
+                        if bias_action != previous_action:
                             self.signal_tracker.register_signal_change(
                                 symbol=symbol,
-                                old_action=prev_action,
+                                old_action=previous_action,
                                 new_action=bias_action,
                                 price=price,
                                 metrics_5m=metrics_5m,
@@ -966,6 +980,24 @@ class OrderFlowEngine:
                                 cvd=state.session_cvd_usdt,
                                 suppression_reason=suppression_reason
                             )
+                            try:
+                                self.phase2_recorder.register_signal_change(
+                                    symbol=symbol,
+                                    old_action=previous_action,
+                                    new_action=bias_action,
+                                    price=price,
+                                    decision_snapshot=committed_decision,
+                                    metrics_1m=metrics_1m,
+                                    metrics_5m=metrics_5m,
+                                    metrics_15m=metrics_15m,
+                                    best_bid=state.best_bid,
+                                    best_ask=state.best_ask,
+                                    spread_bps=state.spread_bps,
+                                    latest_event=state.latest_event,
+                                    binance_context=self.binance_context.get_context().get("symbols", {}).get(symbol.upper(), {})
+                                )
+                            except Exception:
+                                logger.exception("Phase2 research recorder register_signal_change failure")
                             self.prev_actions[symbol] = bias_action
 
                         # Compile render details per symbol
@@ -995,6 +1027,12 @@ class OrderFlowEngine:
 
                     # Periodic finalization checks for outcome tracking
                     self.signal_tracker.finalize_expired_signals()
+                    try:
+                        self.phase2_recorder.finalize_expired_signals()
+                        if self.phase2_recorder.checkpoint_due(now):
+                            self.phase2_recorder.flush_checkpoint()
+                    except Exception:
+                        logger.exception("Phase2 research recorder finalisation/checkpoint failure")
 
                     # Render UI based on configuration
                     if self.dashboard.is_multi:
