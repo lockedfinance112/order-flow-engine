@@ -91,11 +91,18 @@ class HistoricalRegimeReplayRunner:
             
         return timeline
 
-    def save_timeline_csv(self, timeline: List[Dict[str, Any]], filepath: str, protocol_hash: str):
-        """Saves evaluation timeline to a CSV artifact."""
+    def save_timeline_csv(self, timeline: List[Dict[str, Any]], filepath: str, protocol_hash: str, config_hash: str = ""):
+        """Saves evaluation timeline to a CSV artifact.
+
+        Args:
+            timeline:      Evaluation rows produced by run_replay().
+            filepath:      Destination CSV path.
+            protocol_hash: SHA256 of the locked validation protocol.
+            config_hash:   SHA256 of the frozen classifier config (must NOT be "default").
+        """
         if not timeline:
             return
-            
+
         headers = [
             "evaluation_close_ms", "evaluation_time_utc", "symbol",
             "primary_regime", "structure", "direction", "confidence", "transition_risk",
@@ -111,7 +118,7 @@ class HistoricalRegimeReplayRunner:
             for t in timeline:
                 row = {
                     "evaluation_close_ms": t.get("latest_1m_close_time", 0),
-                    "evaluation_time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t.get("latest_1m_close_time", 0)/1000.0)),
+                    "evaluation_time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t.get("latest_1m_close_time", 0) / 1000.0)),
                     "symbol": t.get("symbol", "").upper(),
                     "primary_regime": t.get("primary_regime", "UNKNOWN"),
                     "structure": t.get("structure", "UNKNOWN"),
@@ -119,7 +126,7 @@ class HistoricalRegimeReplayRunner:
                     "confidence": t.get("confidence", 0.0),
                     "transition_risk": t.get("transition_risk", 0.0),
                     "volatility": t.get("volatility", "UNKNOWN"),
-                    "liquidity": self.liquidity_source, # UNKNOWN/NOT_AVAILABLE
+                    "liquidity": self.liquidity_source,  # NOT_AVAILABLE in kline-only replay
                     "quality": t.get("quality", "UNKNOWN"),
                     "tradable": str(t.get("tradable", False)),
                     "trend_up_score": t.get("scores", {}).get("trend_up", 0.0),
@@ -132,9 +139,9 @@ class HistoricalRegimeReplayRunner:
                     "candidate_count": t.get("candidate_count", 0),
                     "model_version": t.get("model_version", ""),
                     "feature_version": t.get("feature_version", ""),
-                    "config_hash": "default",
+                    "config_hash": config_hash,   # Real hash — caller is responsible for passing cfg_hash
                     "protocol_hash": protocol_hash,
                     "source_mode": "HISTORICAL_KLINE_REGIME",
-                    "split": t.get("split", "UNKNOWN")
+                    "split": t.get("split", "UNKNOWN"),
                 }
                 writer.writerow(row)
