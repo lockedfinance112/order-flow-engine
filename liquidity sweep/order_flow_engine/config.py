@@ -119,3 +119,13 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 
 # Event Recorder Configuration (v2.9)
 RECORDING_ENABLED = os.getenv("RECORDING_ENABLED", "false").lower() == "true"
+
+# TICS Stream Health & Data Integrity Guardian thresholds
+TRADE_HEALTHY_MAX_SILENCE_MS = 1000.0
+TRADE_STALE_AFTER_MS = 2500.0
+
+DEPTH_HEALTHY_MAX_SILENCE_MS = 1000.0
+DEPTH_STALE_AFTER_MS = 2500.0
+
+LOCAL_BOOK_MAX_BUFFER = 5000
+

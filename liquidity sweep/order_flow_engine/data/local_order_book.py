@@ -3,11 +3,18 @@ import logging
 import time
 import urllib.request
 import json
+from enum import Enum
 from typing import Dict, List, Tuple, Optional, Any
 from data.sequence_validator import SequenceValidator
 from data.stream_health import StreamHealthTracker
 
 logger = logging.getLogger("OrderFlow.LocalOrderBook")
+
+class SyncOutcome(Enum):
+    SYNCED = "SYNCED"
+    WAITING_FOR_BUFFER = "WAITING_FOR_BUFFER"
+    RETRY_SNAPSHOT = "RETRY_SNAPSHOT"
+    INVALID_SEQUENCE = "INVALID_SEQUENCE"
 
 class LocalOrderBook:
     """
@@ -32,6 +39,11 @@ class LocalOrderBook:
         self.last_received_time = 0.0
         
         self.sync_task: Optional[asyncio.Task] = None
+
+    def set_state(self, new_state: str, details: str = ""):
+        if self.state != new_state:
+            logger.info(f"DATA_GUARDIAN {self.symbol.upper()} BOOK {self.state} -> {new_state} {details}".strip())
+            self.state = new_state
 
     def handle_ws_update(self, msg: dict, received_time: float):
         """
@@ -58,7 +70,7 @@ class LocalOrderBook:
 
         if self.state in ("INITIALISING", "SYNCING", "RESYNCING"):
             if self.state == "INITIALISING":
-                self.state = "SYNCING"
+                self.set_state("SYNCING")
                 # Trigger background sync
                 self.trigger_sync()
             
@@ -68,9 +80,18 @@ class LocalOrderBook:
             if self.state == "SYNCING" and self.validator.last_u is not None and self.validator.last_u > 0:
                 self._try_sync_from_buffer()
                 
-            # Limit buffer size to prevent memory leaks
-            if len(self.buffer) > 2000:
-                self.buffer.pop(0)
+            # Limit buffer size to prevent memory leaks and handle overflow
+            import config
+            max_buf = getattr(config, "LOCAL_BOOK_MAX_BUFFER", 5000)
+            if len(self.buffer) > max_buf:
+                logger.error(f"[{self.symbol.upper()}] Depth buffer overflow ({len(self.buffer)} > {max_buf}). Invalidate current synchronization attempt.")
+                self.buffer.clear()
+                self.is_valid = False
+                self.validator.reset()
+                self.bids.clear()
+                self.asks.clear()
+                self.set_state("RESYNCING")
+                self.trigger_sync(force=True)
             return
 
         if self.state == "HEALTHY":
@@ -87,19 +108,21 @@ class LocalOrderBook:
             elif res == "GAP":
                 logger.warning(f"[{self.symbol.upper()}] Sequence gap detected: pu={pu}, last_u={self.validator.last_u}. Resynchronising.")
                 self.health_tracker.record_sequence_gap()
-                self.state = "SEQUENCE_GAP"
+                self.set_state("SEQUENCE_GAP")
                 self.is_valid = False
                 self.bids.clear()
                 self.asks.clear()
                 self.validator.reset()
                 self.buffer.clear()
-                self.state = "RESYNCING"
-                self.trigger_sync()
+                self.set_state("RESYNCING")
+                self.trigger_sync(force=True)
 
-    def trigger_sync(self):
+    def trigger_sync(self, force: bool = False):
         """Triggers the async REST depth snapshot fetcher."""
-        if self.sync_task and not self.sync_task.done():
+        if not force and self.sync_task and not self.sync_task.done():
             return
+        if force and self.sync_task and not self.sync_task.done():
+            self.sync_task.cancel()
         try:
             self.sync_task = asyncio.create_task(self._fetch_and_apply_snapshot())
         except RuntimeError:
@@ -109,7 +132,7 @@ class LocalOrderBook:
     async def _fetch_and_apply_snapshot(self):
         self.health_tracker.record_resync()
         backoff = 1.0
-        while True:
+        while self.state in ("RESYNCING", "SYNCING", "INITIALISING"):
             try:
                 url = f"https://fapi.binance.com/fapi/v1/depth?symbol={self.symbol.upper()}&limit=1000"
                 def _fetch():
@@ -118,14 +141,33 @@ class LocalOrderBook:
                         return json.loads(response.read().decode())
                 
                 snapshot = await asyncio.to_thread(_fetch)
-                self._apply_snapshot(snapshot)
-                break
+                outcome = self._apply_snapshot(snapshot)
+                
+                if outcome == SyncOutcome.SYNCED:
+                    return
+                elif outcome == SyncOutcome.WAITING_FOR_BUFFER:
+                    while self.state == "SYNCING":
+                        await asyncio.sleep(0.1)
+                        outcome = self._try_sync_from_buffer()
+                        if outcome == SyncOutcome.SYNCED:
+                            return
+                        elif outcome in (SyncOutcome.RETRY_SNAPSHOT, SyncOutcome.INVALID_SEQUENCE):
+                            break
+                    if self.state == "HEALTHY":
+                        return
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    continue
+                elif outcome == SyncOutcome.RETRY_SNAPSHOT:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    continue
             except Exception as e:
                 logger.error(f"[{self.symbol.upper()}] Failed to fetch order book snapshot: {e}. Retrying in {backoff}s...")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
-    def _apply_snapshot(self, snapshot: dict):
+    def _apply_snapshot(self, snapshot: dict) -> SyncOutcome:
         """Applies the REST snapshot and attempts to play forward the buffer."""
         last_update_id = int(snapshot["lastUpdateId"])
         self.bids = {float(price): float(qty) for price, qty in snapshot["bids"]}
@@ -133,14 +175,17 @@ class LocalOrderBook:
         
         self.validator.reset()
         self.validator.last_u = last_update_id
-        self.state = "SYNCING"
-        self._try_sync_from_buffer()
+        self.set_state("SYNCING")
+        return self._try_sync_from_buffer()
 
-    def _try_sync_from_buffer(self):
+    def _try_sync_from_buffer(self) -> SyncOutcome:
         last_update_id = self.validator.last_u
+        if last_update_id is None or last_update_id == 0:
+            return SyncOutcome.RETRY_SNAPSHOT
+
         valid_updates = [msg for msg in self.buffer if int(msg["u"]) > last_update_id]
         if not valid_updates:
-            return
+            return SyncOutcome.WAITING_FOR_BUFFER
 
         # Check if the oldest valid update is already past the snapshot's range (gap)
         oldest_msg = valid_updates[0]
@@ -148,8 +193,7 @@ class LocalOrderBook:
             logger.warning(f"[{self.symbol.upper()}] Gap detected: oldest buffered U {oldest_msg['U']} > lastUpdateId + 1 ({last_update_id + 1}). Retrying sync.")
             self.buffer.clear()
             self.validator.last_u = 0
-            self.trigger_sync()
-            return
+            return SyncOutcome.RETRY_SNAPSHOT
 
         # Find the first update that overlaps with the snapshot: U <= lastUpdateId + 1 and u >= lastUpdateId + 1
         first_idx = -1
@@ -161,7 +205,7 @@ class LocalOrderBook:
                 break
                 
         if first_idx == -1:
-            return
+            return SyncOutcome.WAITING_FOR_BUFFER
 
         self.validator.reset()
         
@@ -185,13 +229,12 @@ class LocalOrderBook:
                     logger.warning(f"[{self.symbol.upper()}] Sync validation failed: {res} for u={u}, pu={pu}. Resetting sync.")
                     self.buffer.clear()
                     self.validator.last_u = 0
-                    self.trigger_sync()
-                    return
+                    return SyncOutcome.INVALID_SEQUENCE
 
         self.buffer.clear()
         self.is_valid = True
-        self.state = "HEALTHY"
-        logger.info(f"[{self.symbol.upper()}] Local order book successfully synchronized at update ID {self.last_update_id}.")
+        self.set_state("HEALTHY", f"update_id={self.last_update_id}")
+        return SyncOutcome.SYNCED
 
     def _apply_diff_update(self, msg: dict):
         """Applies a single diff depth update payload to local bids/asks dicts."""

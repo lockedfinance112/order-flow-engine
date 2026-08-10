@@ -33,9 +33,10 @@ class SymbolFlowState:
         self.trades: deque = deque()
         self.start_time = time.time()
         
-        # Instantiate health tracker and local order book
-        self.health_tracker = StreamHealthTracker(self.symbol)
-        self.local_book = LocalOrderBook(self.symbol, self.health_tracker)
+        # Instantiate health trackers
+        self.trade_health_tracker = StreamHealthTracker(self.symbol, stream_name="trade")
+        self.depth_health_tracker = StreamHealthTracker(self.symbol, stream_name="depth")
+        self.local_book = LocalOrderBook(self.symbol, self.depth_health_tracker)
 
         # Instantiate liquidity intelligence engines
         from liquidity.wall_tracker import WallTracker
@@ -80,6 +81,11 @@ class SymbolFlowState:
         self.latest_event = ""
         self.duplication_suspected = False
 
+    @property
+    def health_tracker(self):
+        # Deprecated: use depth_health_tracker or trade_health_tracker explicitly
+        return self.depth_health_tracker
+
 class FlowMetrics:
     """
     Manages SymbolFlowState collections and exposes symbol-aware methods
@@ -115,7 +121,7 @@ class FlowMetrics:
 
         # Record event in trade stream health tracker
         # (We use agg_id for the update_id metric parameter)
-        state.local_book.health_tracker.record_event(
+        state.trade_health_tracker.record_event(
             event_time_ms=trade_time,
             tx_time_ms=trade_time,
             received_time_ms=received_time_ms / 1000.0,
@@ -422,3 +428,47 @@ class FlowMetrics:
             "latest_price": 0.0,
             "symbol": ""
         }
+
+    def get_market_data_safety(self, symbol: str, now: Optional[float] = None) -> Dict[str, Any]:
+        state = self.get_state(symbol)
+        now_val = now if now is not None else time.time()
+        
+        book_valid = state.local_book.is_valid
+        book_state = state.local_book.state
+        
+        trade_status = state.trade_health_tracker.get_status(now=now_val)
+        depth_status = state.depth_health_tracker.get_status(is_book_valid=book_valid, now=now_val)
+        
+        depth_silence = state.depth_health_tracker.get_silence_age_ms(now=now_val)
+        trade_silence = state.trade_health_tracker.get_silence_age_ms(now=now_val)
+        
+        safe = True
+        status = "HEALTHY"
+        reason = None
+        
+        if not book_valid:
+            safe = False
+            status = "DATA_INVALID"
+            reason = f"Local order book invalid or resynchronising (state: {book_state})"
+        elif depth_status == "STALE":
+            safe = False
+            status = "DATA_STALE"
+            reason = f"Depth stream stale: {depth_silence:.0f}ms silence"
+        elif depth_status == "INVALID":
+            safe = False
+            status = "DATA_INVALID"
+            reason = "Depth stream status INVALID"
+            
+        return {
+            "safe": safe,
+            "status": status,
+            "reason": reason,
+            "book_valid": book_valid,
+            "book_state": book_state,
+            "trade_status": trade_status,
+            "depth_status": depth_status,
+            "depth_age_ms": depth_silence if depth_silence is not None else 9999.0,
+            "trade_silence_ms": trade_silence if trade_silence is not None else 9999.0,
+            "depth_silence_ms": depth_silence if depth_silence is not None else 9999.0
+        }
+

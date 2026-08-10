@@ -188,23 +188,13 @@ class OrderFlowScorer:
         symbol_lower = symbol.lower()
         state = self.metrics.get_state(symbol_lower)
 
-        # Gate 1: Check data validity
-        if not state.local_book.is_valid:
+        # Gate 1 & 2: Check Guardian Data Safety
+        safety = self.metrics.get_market_data_safety(symbol_lower, now)
+        if not safety["safe"]:
             return {
-                "action": "DATA_INVALID",
-                "reason": "Book sync invalid or sequence gap active",
-                "gates": {"book_synced": "FAIL"},
-                "confirmation_candidate": False,
-                "active_sweep": {"active": False, "direction": "", "score": 0, "age_seconds": 999.0}
-            }
-
-        # Gate 2: Check freshness (3000ms stale limit)
-        depth_age_ms = (now - state.last_depth_timestamp) * 1000.0 if state.last_depth_timestamp > 0 else 9999.0
-        if depth_age_ms > 3000.0:
-            return {
-                "action": "DATA_STALE",
-                "reason": f"Depth stale (age: {depth_age_ms:.0f}ms)",
-                "gates": {"freshness": "FAIL"},
+                "action": safety["status"],
+                "reason": safety["reason"],
+                "gates": {"data_integrity_guardian": "FAIL"},
                 "confirmation_candidate": False,
                 "active_sweep": {"active": False, "direction": "", "score": 0, "age_seconds": 999.0}
             }

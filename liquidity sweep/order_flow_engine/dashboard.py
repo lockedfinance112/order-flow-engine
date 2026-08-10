@@ -2321,8 +2321,8 @@ class OrderFlowDashboard:
                 const binanceCtx = item.data.binance_context || {};
                 const contextLabel = binanceCtx.context_confirm || 'INSUFFICIENT';
                 
-                const tradesHealth = item.data.stream_health_status || 'STALE';
-                const depthHealth = item.data.stream_health_status || 'STALE';
+                const tradesHealth = item.data.trade_health_status || 'STALE';
+                const depthHealth = item.data.depth_health_status || 'STALE';
                 const bookSync = item.data.book_state || 'INITIALISING';
                 const windowHealth = d15mWarming ? 'WARMING' : 'VALID';
                 

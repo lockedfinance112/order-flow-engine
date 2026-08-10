@@ -505,9 +505,50 @@ class OrderFlowEngine:
                     response = self._json_response(self.binance_context.get_context())
                 elif path == "/api/binance/status":
                     response = self._json_response(self.binance_context.get_status())
+                elif path == "/api/status":
+                    now_time = time.time()
+                    guardian_status = "HEALTHY"
+                    unsafe_symbols = []
+                    degraded_symbols = []
+                    symbols_details = {}
+                    for sym in SYMBOLS:
+                        safety_obj = self.metrics.get_market_data_safety(sym, now_time)
+                        if not safety_obj["safe"]:
+                            unsafe_symbols.append(sym.upper())
+                        elif safety_obj["trade_status"] == "DEGRADED" or safety_obj["depth_status"] == "DEGRADED":
+                            degraded_symbols.append(sym.upper())
+                        symbols_details[sym.upper()] = safety_obj
+                    if unsafe_symbols:
+                        guardian_status = "UNSAFE"
+                    elif degraded_symbols:
+                        guardian_status = "DEGRADED"
+                    payload = {
+                        "guardian_status": guardian_status,
+                        "unsafe_symbols": unsafe_symbols,
+                        "degraded_symbols": degraded_symbols,
+                        "symbols": symbols_details
+                    }
+                    response = self._json_response(payload)
                 elif path == "/api":
                     trade_status = self.stream.get_status()
                     depth_status = self.depth_stream.get_status()
+                    
+                    now_time = time.time()
+                    guardian_status = "HEALTHY"
+                    unsafe_symbols = []
+                    degraded_symbols = []
+                    
+                    for sym in SYMBOLS:
+                        safety_obj = self.metrics.get_market_data_safety(sym, now_time)
+                        if not safety_obj["safe"]:
+                            unsafe_symbols.append(sym.upper())
+                        elif safety_obj["trade_status"] == "DEGRADED" or safety_obj["depth_status"] == "DEGRADED":
+                            degraded_symbols.append(sym.upper())
+                            
+                    if unsafe_symbols:
+                        guardian_status = "UNSAFE"
+                    elif degraded_symbols:
+                        guardian_status = "DEGRADED"
                     
                     if self.dashboard.is_multi:
                         symbols_payload = {}
@@ -524,6 +565,7 @@ class OrderFlowEngine:
                             
                             self.metrics.check_duplication(sym, m5m, m15m)
                             mid_price = (state.best_bid + state.best_ask) / 2.0
+                            safety_obj = self.metrics.get_market_data_safety(sym, now_time)
                             
                             symbols_payload[sym] = {
                                 "price": m1m.get("latest_price", 0.0),
@@ -552,8 +594,18 @@ class OrderFlowEngine:
                                 "book_coverage": "STANDARD L2",
                                 "rpi_included": "NO",
                                 "book_state": state.local_book.state,
-                                "stream_health_status": state.health_tracker.get_status(state.local_book.is_valid),
-                                "stream_health_metrics": state.health_tracker.get_metrics(),
+                                "book_valid": state.local_book.is_valid,
+                                "trade_health_status": state.trade_health_tracker.get_status(now=now_time),
+                                "trade_health_metrics": state.trade_health_tracker.get_metrics(now=now_time),
+                                "depth_health_status": state.depth_health_tracker.get_status(state.local_book.is_valid, now=now_time),
+                                "depth_health_metrics": state.depth_health_tracker.get_metrics(now=now_time),
+                                "depth_age_ms": safety_obj["depth_age_ms"],
+                                "depth_silence_ms": safety_obj["depth_silence_ms"],
+                                "market_data_safe": safety_obj["safe"],
+                                "market_data_status": safety_obj["status"],
+                                "market_data_reason": safety_obj["reason"],
+                                "stream_health_status": state.depth_health_tracker.get_status(state.local_book.is_valid, now=now_time),
+                                "stream_health_metrics": state.depth_health_tracker.get_metrics(now=now_time),
                                 "check_gates": decision["gates"],
                                 "active_walls": state.wall_tracker.get_active_walls(mid_price, state.bid_depth_top5_usdt)
                             }
@@ -563,6 +615,9 @@ class OrderFlowEngine:
                             "is_multi": True,
                             "trade_ws_status": trade_status,
                             "depth_ws_status": depth_status,
+                            "guardian_status": guardian_status,
+                            "unsafe_symbols": unsafe_symbols,
+                            "degraded_symbols": degraded_symbols,
                             "symbols": symbols_payload,
                             "recent_events": list(self.dashboard.recent_events),
                             "recent_large_trades": list(self.dashboard.recent_large_trades),

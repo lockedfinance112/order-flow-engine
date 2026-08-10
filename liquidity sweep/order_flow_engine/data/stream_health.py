@@ -1,20 +1,28 @@
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 class StreamHealthTracker:
     """
     Tracks real-time health measurements for a WebSocket stream per symbol.
-    Provides statuses: HEALTHY, DEGRADED, STALE, INVALID.
+    Provides statuses: INITIALISING, HEALTHY, DEGRADED, STALE, INVALID.
     """
-    def __init__(self, symbol: str, healthy_threshold_ms: float = 1000.0, degraded_threshold_ms: float = 2500.0):
+    def __init__(self, symbol: str, stream_name: str = "depth", healthy_threshold_ms: Optional[float] = None, degraded_threshold_ms: Optional[float] = None):
+        import config
         self.symbol = symbol.lower()
+        self.stream_name = stream_name
+
+        if healthy_threshold_ms is None:
+            healthy_threshold_ms = getattr(config, f"{stream_name.upper()}_HEALTHY_MAX_SILENCE_MS", 1000.0)
+        if degraded_threshold_ms is None:
+            degraded_threshold_ms = getattr(config, f"{stream_name.upper()}_STALE_AFTER_MS", 2500.0)
+
         self.healthy_threshold_ms = healthy_threshold_ms
         self.degraded_threshold_ms = degraded_threshold_ms
 
-        # Metrics
-        self.last_event_age_ms = 0.0
-        self.exchange_to_receive_latency_ms = 0.0
-        self.receive_to_process_latency_ms = 0.0
+        # Metrics (initialized as None if not yet observed)
+        self.last_event_age_ms = None
+        self.exchange_to_receive_latency_ms = None
+        self.receive_to_process_latency_ms = None
         self.previous_update_id = None
         self.current_update_id = None
         
@@ -25,12 +33,18 @@ class StreamHealthTracker:
         self.resync_count = 0
         self.queue_depth = 0
         
+        self.last_received_wall_time = None
+        self.last_processed_wall_time = None
+
         # Event throughput
         self.event_timestamps = []
         
     def record_event(self, event_time_ms: float, tx_time_ms: float, received_time_ms: float, processed_time_ms: float, update_id: int):
         self.previous_update_id = self.current_update_id
         self.current_update_id = update_id
+
+        self.last_received_wall_time = received_time_ms
+        self.last_processed_wall_time = processed_time_ms
 
         # Calculate ages and latencies
         self.last_event_age_ms = max(0.0, (processed_time_ms - event_time_ms) * 1000.0)
@@ -67,21 +81,27 @@ class StreamHealthTracker:
     def update_queue_depth(self, depth: int):
         self.queue_depth = depth
 
-    def get_status(self, is_book_valid: bool = True) -> str:
-        """
-        HEALTHY: age <= 1000 ms
-        DEGRADED: age 1000 - 2500 ms
-        STALE: age > 2500 ms
-        INVALID: sequence gap or unsynchronised book
-        """
-        if not is_book_valid:
+    def get_silence_age_ms(self, now: Optional[float] = None) -> Optional[float]:
+        if self.last_received_wall_time is None:
+            return None
+        current = now
+        if current is None:
+            current = getattr(self, "_clock", None)
+            if current is None:
+                current = time.time()
+        return (current - self.last_received_wall_time) * 1000.0
+
+    def get_status(self, is_book_valid: bool = True, now: Optional[float] = None) -> str:
+        if self.stream_name == "depth" and not is_book_valid:
             return "INVALID"
         
-        # Check staleness if no events received for too long
-        if not self.event_timestamps:
-            return "STALE"
+        silence = self.get_silence_age_ms(now)
+        if silence is None:
+            return "INITIALISING"
             
-        age = self.last_event_age_ms
+        event_age = self.last_event_age_ms if self.last_event_age_ms is not None else 0.0
+        age = max(event_age, silence)
+            
         if age <= self.healthy_threshold_ms:
             return "HEALTHY"
         elif age <= self.degraded_threshold_ms:
@@ -89,9 +109,11 @@ class StreamHealthTracker:
         else:
             return "STALE"
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self, now: Optional[float] = None) -> Dict[str, Any]:
         return {
+            "stream_name": self.stream_name,
             "last_event_age_ms": self.last_event_age_ms,
+            "silence_age_ms": self.get_silence_age_ms(now),
             "exchange_to_receive_latency_ms": self.exchange_to_receive_latency_ms,
             "receive_to_process_latency_ms": self.receive_to_process_latency_ms,
             "previous_update_id": self.previous_update_id,
