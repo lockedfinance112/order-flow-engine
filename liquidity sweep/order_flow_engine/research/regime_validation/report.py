@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from typing import Dict, Any, List
 
 class ReportGenerator:
@@ -12,14 +13,11 @@ class ReportGenerator:
         output_filepath: str
     ):
         """Generates self-contained HTML report with premium HSL styling and embedded SVG plots."""
-        # Simple SVG rendering for top symbol price timeline with regime bands
         svg_content = ""
         for symbol, timeline in timelines.items():
             if not timeline:
                 continue
                 
-            prices = [t.get("scores", {}).get("trend_up", 100.0) * 1000 for t in timeline[-500:]] # mock trend/price visualization
-            # If we don't have actual price in timeline scores, we can draw a mock SVG or a simple step chart of regimes
             width = 800
             height = 200
             n = len(timeline[-500:])

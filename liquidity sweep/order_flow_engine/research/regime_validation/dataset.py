@@ -5,16 +5,25 @@ import urllib.request
 import time
 import hashlib
 from typing import Dict, Any, List, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from regime.models import MarketBar
 
-def fetch_binance_klines(symbol: str, timeframe: str, start_ms: int, end_ms: int) -> List[dict]:
-    """Downloads 1m closed klines from Binance API."""
+def fetch_binance_klines_with_retry(symbol: str, timeframe: str, start_ms: int, end_ms: int, max_retries: int = 5) -> List[dict]:
+    """Downloads 1m closed klines from Binance API with bounded retry and backoff."""
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol.upper()}&interval={timeframe}&startTime={start_ms}&endTime={end_ms}&limit=1500"
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode())
+    
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            backoff = 2 ** attempt
+            time.sleep(backoff)
+    return []
 
 class DatasetManager:
     """Manages downloading, caching, splitting, and quality validation of 1m OHLCV datasets."""
@@ -24,8 +33,8 @@ class DatasetManager:
 
     def prepare_dataset(self, symbols: List[str], start_str: str, end_str: str, warmup_days: int) -> Dict[str, Any]:
         """Downloads historical 1m klines, caches them, and builds a manifest."""
-        start_date = datetime.strptime(start_str, "%Y-%m-%d")
-        end_date = datetime.strptime(end_str, "%Y-%m-%d")
+        start_date = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_date = datetime.strptime(end_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         
         warmup_start_date = start_date - timedelta(days=warmup_days)
         warmup_start_ms = int(warmup_start_date.timestamp() * 1000)
@@ -33,9 +42,9 @@ class DatasetManager:
 
         manifest = {
             "dataset_id": f"ds_{start_str}_{end_str}",
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
             "source": "Binance USD-M Futures REST",
-            "symbols": symbols,
+            "symbols": sorted(symbols),
             "requested_start": start_str,
             "requested_end": end_str,
             "warmup_start": warmup_start_date.strftime("%Y-%m-%d"),
@@ -49,17 +58,12 @@ class DatasetManager:
             curr_ms = warmup_start_ms
             all_klines = []
             while curr_ms < end_ms:
-                try:
-                    klines = fetch_binance_klines(symbol, "1m", curr_ms, end_ms)
-                    if not klines:
-                        break
-                    all_klines.extend(klines)
-                    # Next request starts after the last returned close time
-                    curr_ms = klines[-1][6] + 1
-                    time.sleep(0.2)
-                except Exception as e:
-                    print(f"Error fetching klines: {e}")
-                    time.sleep(1.0)
+                klines = fetch_binance_klines_with_retry(symbol, "1m", curr_ms, end_ms)
+                if not klines:
+                    break
+                all_klines.extend(klines)
+                curr_ms = klines[-1][6] + 1
+                time.sleep(0.2)
                     
             # Deduplicate by open time
             dedup = {}
@@ -72,28 +76,14 @@ class DatasetManager:
                 for k in sorted_klines:
                     f.write(json.dumps(k) + "\n")
 
-            # SHA256 of file
-            sha = hashlib.sha256()
-            with gzip.open(filepath, "rb") as f_bin:
-                sha.update(f_bin.read())
-                
-            manifest["files"][symbol.lower()] = {
-                "path": filepath,
-                "sha256": sha.hexdigest(),
-                "records": len(sorted_klines)
-            }
-
-        # Compute content hash of manifest file mappings
-        manifest_hash = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
-        manifest["dataset_content_hash"] = manifest_hash
-
+        # Save manifest
         manifest_path = os.path.join(self.dataset_dir, "dataset_manifest.json")
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=4)
             
         return manifest
 
-    def validate_dataset(self, symbol: str) -> Dict[str, Any]:
+    def validate_dataset(self, symbol: str, allow_gaps: bool = False) -> Dict[str, Any]:
         """Runs strict quality checks on the 1m dataset."""
         filepath = os.path.join(self.dataset_dir, f"{symbol.lower()}_1m.jsonl.gz")
         
@@ -106,18 +96,27 @@ class DatasetManager:
             "bad_price_count": 0,
             "open_candle_count": 0,
             "non_monotonic_count": 0,
-            "gaps": []
+            "gaps": [],
+            "actual_start_ms": 0,
+            "actual_end_ms": 0,
+            "actual_start_utc": "",
+            "actual_end_utc": "",
+            "invalid_ohlc_count": 0,
+            "content_sha256": ""
         }
 
         if not os.path.exists(filepath):
             quality["valid"] = False
             return quality
 
+        # Compute SHA256 of decompressed data
+        sha = hashlib.sha256()
         last_open_time = -1
         bars = []
         
         with gzip.open(filepath, "rt", encoding="utf-8") as f:
             for line in f:
+                sha.update(line.encode("utf-8"))
                 k = json.loads(line)
                 open_time = int(k[0])
                 close_time = int(k[6])
@@ -125,15 +124,21 @@ class DatasetManager:
                 high_val = float(k[2])
                 low_val = float(k[3])
                 close_val = float(k[4])
-                volume = float(k[5])
                 
                 quality["bar_count"] += 1
+                if quality["bar_count"] == 1:
+                    quality["actual_start_ms"] = open_time
+                    quality["actual_start_utc"] = datetime.fromtimestamp(open_time/1000.0, tz=timezone.utc).isoformat()
+                quality["actual_end_ms"] = open_time
+                quality["actual_end_utc"] = datetime.fromtimestamp(open_time/1000.0, tz=timezone.utc).isoformat()
 
-                # Check UTC alignment (divisible by 60000)
                 if open_time % 60000 != 0:
                     quality["valid"] = False
                     
-                # Monotonic sequence
+                if close_time != open_time + 59999:
+                    quality["open_candle_count"] += 1
+                    quality["valid"] = False
+
                 if last_open_time != -1:
                     if open_time < last_open_time:
                         quality["non_monotonic_count"] += 1
@@ -142,22 +147,25 @@ class DatasetManager:
                         quality["duplicate_bar_count"] += 1
                         quality["valid"] = False
                     elif open_time > last_open_time + 60000:
-                        # Gap detected
                         gap_start = last_open_time + 60000
                         gap_end = open_time - 60000
                         quality["gaps"].append((gap_start, gap_end))
                         quality["missing_bar_count"] += int((open_time - last_open_time) / 60000) - 1
+                        if not allow_gaps:
+                            quality["valid"] = False
 
-                # Bad price check
                 if open_val <= 0 or high_val <= 0 or low_val <= 0 or close_val <= 0:
                     quality["bad_price_count"] += 1
+                    quality["invalid_ohlc_count"] += 1
                     quality["valid"] = False
                 if high_val < max(open_val, close_val) or low_val > min(open_val, close_val) or low_val > high_val:
                     quality["bad_price_count"] += 1
+                    quality["invalid_ohlc_count"] += 1
                     quality["valid"] = False
 
                 last_open_time = open_time
 
+        quality["content_sha256"] = sha.hexdigest()
         quality_path = os.path.join(self.dataset_dir, f"{symbol.lower()}_quality.json")
         with open(quality_path, "w") as f:
             json.dump(quality, f, indent=4)
@@ -199,12 +207,10 @@ class DatasetManager:
         warmup_bars = [b for b in bars if b.open_time_ms < warmup_end_ms]
         eval_bars = [b for b in bars if b.open_time_ms >= warmup_end_ms]
         
-        # Split remaining eval_bars aligned to complete UTC days
         total_eval_duration = eval_bars[-1].open_time_ms - eval_bars[0].open_time_ms
         dev_end_ms = eval_bars[0].open_time_ms + int(total_eval_duration * dev_pct)
         val_end_ms = dev_end_ms + int(total_eval_duration * val_pct)
         
-        # Round to complete UTC day boundaries
         def round_to_day(ts_ms):
             return (ts_ms // 86400000) * 86400000
 

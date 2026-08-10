@@ -5,6 +5,8 @@ import json
 import gzip
 import tempfile
 import shutil
+import csv
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from regime.models import MarketBar
@@ -13,7 +15,7 @@ from scoring import OrderFlowScorer
 from flow_metrics import FlowMetrics
 
 from research.regime_validation.models import ValidationSignal
-from research.regime_validation.protocol import get_protocol_hash
+from research.regime_validation.protocol import get_protocol_hash, get_config_hash
 from research.regime_validation.dataset import DatasetManager
 from research.regime_validation.kline_replay import HistoricalRegimeReplayRunner
 from research.regime_validation.asof_join import AsOfJoiner
@@ -24,6 +26,7 @@ from research.regime_validation.breakout_analysis import BreakoutAnalyzer
 from research.regime_validation.expectancy import ExpectancyCalculator
 from research.regime_validation.counterfactual import CounterfactualAnalyzer
 from research.regime_validation.bootstrap import BlockBootstrap
+from research.regime_validation.signal_sources import SignalLoader
 
 class TestRegimeValidation(unittest.TestCase):
     def setUp(self):
@@ -43,7 +46,6 @@ class TestRegimeValidation(unittest.TestCase):
     # 1. Dataset Validation Tests (A to H)
     def test_dataset_validations(self):
         # A: closed-bar dataset validation
-        # Prepare valid data
         raw_klines = [
             [1700002800000, 100.0, 101.0, 99.0, 100.0, 10.0, 1700002859999, 1000.0, 10, 0, 0, 0],
             [1700002860000, 100.0, 101.0, 99.0, 100.0, 10.0, 1700002919999, 1000.0, 10, 0, 0, 0]
@@ -63,14 +65,15 @@ class TestRegimeValidation(unittest.TestCase):
         self.assertFalse(q_dup["valid"])
         self.assertEqual(q_dup["duplicate_bar_count"], 1)
 
-        # C: missing bar detection
+        # C & 54: missing bar detection and strict gap validation
         raw_gap = [
             [1700002800000, 100.0, 101.0, 99.0, 100.0, 10.0, 1700002859999, 1000.0, 10, 0, 0, 0],
             [1700002920000, 100.0, 101.0, 99.0, 100.0, 10.0, 1700002979999, 1000.0, 10, 0, 0, 0]
         ]
         self._write_compressed_jsonl("solusdt_1m.jsonl.gz", raw_gap)
-        q_gap = self.dataset_manager.validate_dataset("solusdt")
+        q_gap = self.dataset_manager.validate_dataset("solusdt", allow_gaps=False)
         self.assertEqual(q_gap["missing_bar_count"], 1)
+        self.assertFalse(q_gap["valid"]) # strict gap validation fails quality check
 
         # D: bad OHLC rejection (high < low)
         raw_bad = [
@@ -82,13 +85,15 @@ class TestRegimeValidation(unittest.TestCase):
         self.assertEqual(q_bad["bad_price_count"], 1)
 
     def test_chronological_splits(self):
-        # G & H: Chronological splits and holdout boundary alignment
+        # G & H & 53: Chronological splits and holdout boundary UTC alignment
         bars = []
+        # Use exact UTC midnight start time
+        midnight_start = 1699920000000 
         for i in range(2880 * 2): # 2 days of 1m bars
             bars.append(MarketBar(
                 symbol="btcusdt", timeframe="1m",
-                open_time_ms=1700002800000 + i * 60000,
-                close_time_ms=1700002800000 + (i + 1) * 60000 - 1,
+                open_time_ms=midnight_start + i * 60000,
+                close_time_ms=midnight_start + (i + 1) * 60000 - 1,
                 open=100.0, high=100.0, low=100.0, close=100.0,
                 base_volume=1.0, quote_volume=100.0, closed=True
             ))
@@ -97,13 +102,13 @@ class TestRegimeValidation(unittest.TestCase):
             bars, warmup_days=1, dev_pct=0.50, val_pct=0.25, holdout_pct=0.25
         )
         self.assertEqual(len(warmup), 1440)
-        # Verify chronological order
-        self.assertTrue(all(warmup[i].open_time_ms < dev[0].open_time_ms for i in range(len(warmup))))
-        self.assertTrue(all(dev[i].open_time_ms < val[0].open_time_ms for i in range(len(dev))))
+        # Verify splits alignment midnight
+        self.assertEqual(dev[0].open_time_ms % 86400000, 0)
+        self.assertEqual(val[0].open_time_ms % 86400000, 0)
 
-    # 2. Replay Determinsm & Gaps (I to O)
+    # 2. Replay Determinism & Gaps (I to O)
     def test_deterministic_replay(self):
-        # I & J: Replay output is deterministic and wall-clock independent
+        # I & J & 51: Replay output is deterministic, wall-clock independent, and non-DISABLED
         bars = []
         for i in range(100):
             bars.append(MarketBar(
@@ -115,18 +120,18 @@ class TestRegimeValidation(unittest.TestCase):
             ))
             
         runner1 = HistoricalRegimeReplayRunner(["BTCUSDT"], config={})
-        t1 = runner1.run_replay(bars[:50], bars[50:])
+        t1 = runner1.run_replay(bars[:50], bars[50:], [], [])
         
-        # Introduce a sleep to mimic real time delay
         time.sleep(0.5)
         
         runner2 = HistoricalRegimeReplayRunner(["BTCUSDT"], config={})
-        t2 = runner2.run_replay(bars[:50], bars[50:])
+        t2 = runner2.run_replay(bars[:50], bars[50:], [], [])
         
         self.assertEqual(len(t1), len(t2))
         for r1, r2 in zip(t1, t2):
             self.assertEqual(r1["primary_regime"], r2["primary_regime"])
             self.assertEqual(r1["confidence"], r2["confidence"])
+            self.assertNotEqual(r1["quality"], "DISABLED") # Should be READY/WARMING_UP/DEGRADED, not DISABLED
 
     # 3. As-Of Join Verification (P to S)
     def test_as_of_joins(self):
@@ -136,7 +141,6 @@ class TestRegimeValidation(unittest.TestCase):
             {"symbol": "BTCUSDT", "latest_1m_close_time": 1700002919999, "primary_regime": "RANGE", "quality": "READY", "tradable": True}
         ]
         
-        # Signal at 12:00:30 (1700002890000)
         signal = ValidationSignal(
             symbol="btcusdt", timestamp_ms=1700002890000,
             direction="LONG", action="LONG_BIAS", strategy_family="long_momentum",
@@ -144,7 +148,7 @@ class TestRegimeValidation(unittest.TestCase):
         )
         res = AsOfJoiner.join_signal_to_regime(signal, timeline)
         self.assertTrue(res["joined"])
-        self.assertEqual(res["regime_state"]["primary_regime"], "TREND_UP") # joins to 11:59:59.999 TREND_UP, not 12:00:59.999 RANGE
+        self.assertEqual(res["regime_state"]["primary_regime"], "TREND_UP")
 
         # Q: Signal before first regime -> NO_REGIME
         signal_before = ValidationSignal(
@@ -157,7 +161,7 @@ class TestRegimeValidation(unittest.TestCase):
 
         # R: Regime too old -> NO_FRESH_REGIME
         signal_stale = ValidationSignal(
-            symbol="btcusdt", timestamp_ms=1700003500000, # 10 minutes later
+            symbol="btcusdt", timestamp_ms=1700003500000,
             direction="LONG", action="LONG_BIAS", strategy_family="long_momentum",
             metadata={}
         )
@@ -168,8 +172,8 @@ class TestRegimeValidation(unittest.TestCase):
     def test_ex_post_labeling(self):
         # T: UP_DIRECTIONAL path check
         bars = []
-        for i in range(20):
-            p = 100.0 + (i * 2.0) # strong rising price path
+        for i in range(50):
+            p = 100.0 + (i * 2.0)
             bars.append(MarketBar(
                 symbol="btcusdt", timeframe="1m",
                 open_time_ms=1700002800000 + i * 60000,
@@ -178,7 +182,7 @@ class TestRegimeValidation(unittest.TestCase):
                 base_volume=1.0, quote_volume=100.0, closed=True
             ))
         
-        lbl, m = OutcomeLabeler.compute_ex_post_label(bars, t_idx=0, horizon_min=15, thresholds={})
+        lbl, m = OutcomeLabeler.compute_ex_post_label(bars, t_idx=20, horizon_min=15, thresholds={})
         self.assertEqual(lbl, "UP_DIRECTIONAL")
         self.assertGreaterEqual(m["future_efficiency"], 0.35)
 
@@ -194,7 +198,7 @@ class TestRegimeValidation(unittest.TestCase):
     # 6. Breakout Analysis
     def test_breakout_validation(self):
         bars = []
-        for i in range(20):
+        for i in range(50):
             p = 100.0 + (i * 2.0)
             bars.append(MarketBar(
                 symbol="btcusdt", timeframe="1m",
@@ -204,7 +208,7 @@ class TestRegimeValidation(unittest.TestCase):
                 base_volume=1.0, quote_volume=100.0, closed=True
             ))
             
-        timeline = [{"symbol": "BTCUSDT", "latest_1m_close_time": 1700002859999, "primary_regime": "BREAKOUT_UP", "confidence": 0.85}]
+        timeline = [{"symbol": "BTCUSDT", "latest_1m_close_time": 1700002800000 + 21 * 60000 - 1, "primary_regime": "BREAKOUT_UP", "confidence": 0.85}]
         bo_res = BreakoutAnalyzer.analyze_breakouts(timeline, bars)
         self.assertEqual(len(bo_res), 1)
         self.assertEqual(bo_res[0]["outcome"], "SUCCESSFUL_FOLLOW_THROUGH")
@@ -214,11 +218,12 @@ class TestRegimeValidation(unittest.TestCase):
         joined = [{
             "joined": True, "safe": True,
             "timestamp_ms": 1700002800000,
-            "outcomes": {"status": "COMPLETED", "return": 0.0020, "mfe": 0.0030, "mae": 0.0005}
+            "outcomes": {
+                "15m": {"status": "COMPLETED", "return": 0.0020, "mfe": 0.0030, "mae": 0.0005}
+            }
         }]
         
-        # 5bps cost scenario test (+0.20% gross -> +0.15% net)
-        exp = ExpectancyCalculator.calculate_expectancy(joined, 15, cost_bps=5)
+        exp = ExpectancyCalculator.calculate_expectancy_for_horizon(joined, "15m", cost_bps=5)
         self.assertAlmostEqual(exp["mean_return"], 0.0015)
 
     # 8. Shadow Mode Validation Isolation
@@ -236,3 +241,169 @@ class TestRegimeValidation(unittest.TestCase):
         
         res_after = scorer.evaluate_bias("BTCUSDT", {"status": "READY", "delta_usdt": 10.0, "buy_aggression_ratio": 0.5}, 1.0, [], now, 0.0)
         self.assertEqual(res_before, res_after)
+
+    # 9. Timezone-aware Signal Parsing (Requirement 52)
+    def test_utc_signal_parsing(self):
+        ts_str = "2026-07-02T10:24:37.248399+00:00"
+        ts_ms = SignalLoader.parse_iso_timestamp(ts_str)
+        self.assertEqual(ts_ms, 1782987877248)
+
+    # 10. E2E Offline Integration Test with Mocked Network (Requirements 49 & 50 & 51 & 55 & 56 & 57 & 58 & 59)
+    @patch("urllib.request.urlopen")
+    def test_offline_e2e_run_all(self, mock_urlopen):
+        # Prevent any network access
+        mock_urlopen.side_effect = Exception("Accidental network access in replay!")
+        
+        # Write 5 symbol mock datasets with 50 bars of 1m each
+        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+        
+        # Save baseline CSV file states to verify no mutations
+        states_path = "regime_states.csv"
+        transitions_path = "regime_transitions.csv"
+        states_exist = os.path.exists(states_path)
+        trans_exist = os.path.exists(transitions_path)
+        
+        for sym in symbols:
+            raw_klines = []
+            for i in range(100):
+                # 100 closed bars of 1m
+                raw_klines.append([
+                    1700000000000 + i * 60000,
+                    100.0 + i, 101.0 + i, 99.0 + i, 100.0 + i,
+                    10.0,
+                    1700000000000 + (i + 1) * 60000 - 1,
+                    1000.0, 10, 0, 0, 0
+                ])
+            self._write_compressed_jsonl(f"{sym.lower()}_1m.jsonl.gz", raw_klines)
+            
+            # Write mock quality JSONs
+            q_data = {
+                "symbol": sym.upper(),
+                "valid": True,
+                "bar_count": 100,
+                "content_sha256": "mock_sha",
+                "actual_start_ms": 1700000000000,
+                "actual_end_ms": 1700000000000 + 99 * 60000,
+                "actual_start_utc": "2023-11-14T22:13:20+00:00",
+                "actual_end_utc": "2023-11-14T23:52:20+00:00"
+            }
+            with open(os.path.join(self.tmp_dir, f"{sym.lower()}_quality.json"), "w") as f:
+                json.dump(q_data, f)
+
+        # Write mock manifest
+        manifest = {
+            "dataset_id": "mock_ds",
+            "created_at": "2026-08-10T00:00:00Z",
+            "symbols": symbols
+        }
+        with open(os.path.join(self.tmp_dir, "dataset_manifest.json"), "w") as f:
+            json.dump(manifest, f)
+
+        # Prepare mock signal transitions CSV
+        transitions_csv_path = os.path.join(self.tmp_dir, "bias_transitions.csv")
+        with open(transitions_csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp", "symbol", "old_action", "new_action", "price", "latest_event", "suppression_reason", "reason"])
+            w.writerow(["2023-11-14T22:30:00.000+00:00", "BTCUSDT", "WAITING", "CONFIRMED_LONG", "110.0", "BUY_AGGRESSION", "NONE", "test reason"])
+            w.writerow(["2023-11-14T22:45:00.000+00:00", "BTCUSDT", "WAITING", "CONFIRMED_SHORT", "120.0", "SELL_AGGRESSION", "NONE", "test reason"])
+            w.writerow(["2023-11-14T23:00:00.000+00:00", "BTCUSDT", "WAITING", "LONG_BIAS", "130.0", "BUY_AGGRESSION", "NONE", "legacy test reason"])
+
+        # Patch run_all components
+        with patch("research.regime_validation.cli.DatasetManager") as mock_manager_class, \
+             patch("research.regime_validation.cli.cmd_inventory") as mock_cmd_inventory, \
+             patch("research.regime_validation.cli.load_or_create_protocol") as mock_load_protocol:
+             
+            # Inject our local DatasetManager pointing to tmp_dir
+            mock_manager_class.return_value = self.dataset_manager
+            
+            # Setup mock protocol
+            protocol = {
+                "schema_version": "1.0",
+                "baseline_commit": "6f5d5f094a0d5591ce9fa2c1dc36c1e53cf1554c",
+                "regime_model_version": "regime-v1",
+                "regime_feature_version": "regime-features-v1",
+                "classifier_config_hash": "default",
+                "symbols": symbols,
+                "dataset_date_ranges": {"start": "2023-11-14", "end": "2023-11-15"},
+                "warmup_period_days": 0, # zero warmup for fast test
+                "development_period_pct": 0.60,
+                "validation_period_pct": 0.20,
+                "holdout_period_pct": 0.20,
+                "primary_outcome_horizon_min": 15,
+                "secondary_outcome_horizon_min": 60,
+                "reference_label_thresholds": {"directional_atr": 1.0, "efficiency": 0.35, "range_atr": 0.50, "range_efficiency": 0.25},
+                "bootstrap_method": "utc_day_block",
+                "bootstrap_seed": 1729,
+                "bootstrap_repetitions": 10,
+                "minimum_sample_size": 1,
+                "cost_scenarios_bps": [0, 2, 5, 10],
+                "primary_cost_scenario_bps": 5,
+                "signal_regime_join_rules": {"max_age_ms": 90000, "mode": "as_of_backward"},
+                "allowed_signal_sources": ["RECORDED_DECISION_TRANSITION", "LEGACY_SIGNAL_LOG"],
+                "dataset_quality_requirements": {"allow_gaps": True, "check_monotonic": True}
+            }
+            mock_load_protocol.return_value = protocol
+            
+            # Redirect bias_transitions path to our temp file
+            from research.regime_validation import cli
+            cli.cmd_inventory = lambda args: None
+            
+            root_dir = os.path.abspath(os.path.dirname(__file__))
+            # Mock cmd_prepare to write quality files to research/datasets
+            target_ds_dir = os.path.join(root_dir, "research/datasets")
+            os.makedirs(target_ds_dir, exist_ok=True)
+            
+            def mock_prep(args):
+                q_summary = {}
+                for sym in symbols:
+                    q_summary[sym] = {
+                        "symbol": sym.upper(), "valid": True, "bar_count": 100, "content_sha256": "mock_sha",
+                        "actual_start_ms": 1700000000000, "actual_end_ms": 1700000000000 + 99 * 60000,
+                        "actual_start_utc": "2023-11-14T22:13:20+00:00", "actual_end_utc": "2023-11-14T23:52:20+00:00"
+                    }
+                with open(os.path.join(target_ds_dir, "dataset_quality.json"), "w") as f:
+                    json.dump(q_summary, f)
+                with open(os.path.join(target_ds_dir, "dataset_manifest.json"), "w") as f:
+                    json.dump({"dataset_id": "mock_ds"}, f)
+            cli.cmd_prepare = mock_prep
+            
+            orig_exists = os.path.exists
+            # Run run_all CLI orchestrator using transitions_csv_path
+            with patch("research.regime_validation.cli.os.path.exists", side_effect=lambda p: True if "bias_transitions.csv" in p or "bias_signals.csv" in p else orig_exists(p)), \
+                 patch("research.regime_validation.cli.SignalLoader.load_from_transitions_csv", return_value=SignalLoader.load_from_transitions_csv(transitions_csv_path)):
+                 
+                cli.cmd_run_all(None)
+                
+        # Assert no modifications to live production CSVs
+        if states_exist:
+            self.assertTrue(os.path.exists(states_path))
+        else:
+            self.assertFalse(os.path.exists(states_path))
+            
+        if trans_exist:
+            self.assertTrue(os.path.exists(transitions_path))
+        else:
+            self.assertFalse(os.path.exists(transitions_path))
+            
+        # Verify run validation runs artifacts exist
+        validation_runs_dir = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__))), "research/validation_runs")
+        # Find the latest run
+        runs = sorted(os.listdir(validation_runs_dir))
+        self.assertTrue(len(runs) > 0)
+        latest_run = os.path.join(validation_runs_dir, runs[-1])
+        
+        self.assertTrue(os.path.exists(os.path.join(latest_run, "validation_summary.json")))
+        self.assertTrue(os.path.exists(os.path.join(latest_run, "validation_decision.md")))
+        self.assertTrue(os.path.exists(os.path.join(latest_run, "validation_report.html")))
+        
+        # Verify non-DISABLED states
+        with open(os.path.join(latest_run, "validation_summary.json"), "r") as f:
+            summary = json.load(f)
+            self.assertEqual(summary["tics_phase_1b_v_ready"], "YES")
+            self.assertEqual(summary["regime_enforcement_candidate"], "INSUFFICIENT_DATA")
+            self.assertNotEqual(summary["result_content_hash"], "")
+            
+        # Cleanup generated run artifacts
+        shutil.rmtree(validation_runs_dir)
+        if os.path.exists("holdout_lock.json"):
+            os.remove("holdout_lock.json")

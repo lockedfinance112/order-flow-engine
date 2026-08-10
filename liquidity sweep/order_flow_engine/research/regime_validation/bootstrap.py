@@ -6,6 +6,7 @@ class BlockBootstrap:
     @staticmethod
     def bootstrap_metrics(
         joined_signals: List[Dict[str, Any]],
+        horizon: str = "15m",
         reps: int = 1000,
         seed: int = 1729,
         cost_bps: int = 5
@@ -14,14 +15,12 @@ class BlockBootstrap:
         valid_signals = [
             s for s in joined_signals
             if s.get("joined") and s.get("safe") and
-            s.get("outcomes", {}).get("status") == "COMPLETED"
+            s.get("outcomes", {}).get(horizon, {}).get("status") == "COMPLETED"
         ]
         
         if not valid_signals:
             return {"status": "NO_DATA"}
             
-        # Group signals by UTC day block
-        # Deriving day key: open_time_ms divided by 86400000
         days = {}
         for s in valid_signals:
             day_ts = (s["timestamp_ms"] // 86400000) * 86400000
@@ -30,7 +29,6 @@ class BlockBootstrap:
         day_keys = list(days.keys())
         num_days = len(day_keys)
         
-        # Check for minimum blocks requirement
         if num_days < 5:
             return {"status": "INSUFFICIENT_BLOCKS"}
             
@@ -40,7 +38,6 @@ class BlockBootstrap:
         bootstrap_wins = []
         
         for _ in range(reps):
-            # Resample day keys with replacement
             resampled_keys = rng.choice(day_keys, size=num_days, replace=True)
             resampled_signals = []
             for k in resampled_keys:
@@ -52,7 +49,7 @@ class BlockBootstrap:
             rets = []
             wins = 0
             for s in resampled_signals:
-                net_ret = s["outcomes"]["return"] - (cost_bps / 10000.0)
+                net_ret = s["outcomes"][horizon]["return"] - (cost_bps / 10000.0)
                 rets.append(net_ret)
                 if net_ret > 0:
                     wins += 1
@@ -60,7 +57,6 @@ class BlockBootstrap:
             bootstrap_means.append(np.mean(rets))
             bootstrap_wins.append(wins / len(resampled_signals))
             
-        # 95% Confidence Intervals
         mean_low = float(np.percentile(bootstrap_means, 2.5))
         mean_high = float(np.percentile(bootstrap_means, 97.5))
         win_low = float(np.percentile(bootstrap_wins, 2.5))
@@ -77,6 +73,7 @@ class BlockBootstrap:
     def bootstrap_allow_minus_block(
         allow_signals: List[Dict[str, Any]],
         block_signals: List[Dict[str, Any]],
+        horizon: str = "15m",
         reps: int = 1000,
         seed: int = 1729,
         cost_bps: int = 5
@@ -85,18 +82,17 @@ class BlockBootstrap:
         valid_allow = [
             s for s in allow_signals
             if s.get("joined") and s.get("safe") and
-            s.get("outcomes", {}).get("status") == "COMPLETED"
+            s.get("outcomes", {}).get(horizon, {}).get("status") == "COMPLETED"
         ]
         valid_block = [
             s for s in block_signals
             if s.get("joined") and s.get("safe") and
-            s.get("outcomes", {}).get("status") == "COMPLETED"
+            s.get("outcomes", {}).get(horizon, {}).get("status") == "COMPLETED"
         ]
         
         if not valid_allow or not valid_block:
             return {"status": "NO_DATA"}
             
-        # Group by day
         days_allow = {}
         for s in valid_allow:
             day_ts = (s["timestamp_ms"] // 86400000) * 86400000
@@ -127,8 +123,8 @@ class BlockBootstrap:
             if not res_allow_signals or not res_block_signals:
                 continue
                 
-            allow_rets = [s["outcomes"]["return"] - (cost_bps / 10000.0) for s in res_allow_signals]
-            block_rets = [s["outcomes"]["return"] - (cost_bps / 10000.0) for s in res_block_signals]
+            allow_rets = [s["outcomes"][horizon]["return"] - (cost_bps / 10000.0) for s in res_allow_signals]
+            block_rets = [s["outcomes"][horizon]["return"] - (cost_bps / 10000.0) for s in res_block_signals]
             
             diff_means.append(np.mean(allow_rets) - np.mean(block_rets))
             

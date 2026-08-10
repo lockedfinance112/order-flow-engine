@@ -2,10 +2,10 @@ import math
 from typing import List, Dict, Any, Optional, Tuple
 from regime.models import MarketBar
 
-def calculate_atr14_at_t(bars_1m: List[MarketBar], t_idx: int) -> float:
+def calculate_atr14_at_t(bars_1m: List[MarketBar], t_idx: int) -> Optional[float]:
     """Calculates point-in-time ATR14 using 1m bars up to t_idx (inclusive)."""
     if t_idx < 14:
-        return 1.0 # fallback default if insufficient history
+        return None
         
     true_ranges = []
     for i in range(t_idx - 13, t_idx + 1):
@@ -30,19 +30,18 @@ class OutcomeLabeler:
         thresholds: Dict[str, float]
     ) -> Tuple[str, Dict[str, Any]]:
         
+        atr = calculate_atr14_at_t(bars_1m, t_idx)
+        if atr is None or atr <= 0.0:
+            return "UNLABELLED", {"reason": "INSUFFICIENT_ATR_HISTORY"}
+            
         if t_idx + horizon_min >= len(bars_1m):
-            return "UNLABELLED", {}
+            return "UNLABELLED", {"reason": "INCOMPLETE_FUTURE_DATA"}
             
         anchor = bars_1m[t_idx]
-        atr = calculate_atr14_at_t(bars_1m, t_idx)
-        if atr <= 0.0:
-            atr = 1.0
-
         exit_bar = bars_1m[t_idx + horizon_min]
         net_move = exit_bar.close - anchor.close
         net_move_atr = net_move / atr
         
-        # Path length calculation
         path_len = 0.0
         prev_close = anchor.close
         for i in range(t_idx + 1, t_idx + horizon_min + 1):
@@ -52,7 +51,6 @@ class OutcomeLabeler:
             
         efficiency = abs(net_move) / path_len if path_len > 0 else 0.0
         
-        # Label classification
         up_th = thresholds.get("directional_atr", 1.0)
         eff_th = thresholds.get("efficiency", 0.35)
         r_th = thresholds.get("range_atr", 0.50)
@@ -84,7 +82,6 @@ class OutcomeLabeler:
         entry_price: float
     ) -> Dict[str, Any]:
         """Calculates final return, MFE, MAE for a signal."""
-        # Find entry index in 1m bars
         entry_idx = -1
         for i, b in enumerate(bars_1m):
             if b.open_time_ms <= signal_time_ms <= b.close_time_ms:
@@ -102,7 +99,6 @@ class OutcomeLabeler:
         future_segment = bars_1m[entry_idx + 1 : entry_idx + horizon_min + 1]
         exit_price = future_segment[-1].close
         
-        # Calculate returns based on direction
         if direction.upper() == "LONG":
             ret = (exit_price - entry_price) / entry_price
             high_prices = [b.high for b in future_segment]

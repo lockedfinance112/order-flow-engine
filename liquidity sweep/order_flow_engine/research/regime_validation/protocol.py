@@ -1,6 +1,6 @@
 import json
 import hashlib
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 DEFAULT_PROTOCOL = {
     "schema_version": "1.0",
@@ -35,7 +35,7 @@ DEFAULT_PROTOCOL = {
         "max_age_ms": 90000,
         "mode": "as_of_backward"
     },
-    "allowed_signal_sources": ["RECORDED_DECISION_TRANSITION"],
+    "allowed_signal_sources": ["RECORDED_DECISION_TRANSITION", "LEGACY_SIGNAL_LOG"],
     "dataset_quality_requirements": {
         "allow_gaps": False,
         "check_monotonic": True
@@ -47,6 +47,11 @@ def get_protocol_hash(protocol: Dict[str, Any]) -> str:
     serialized = json.dumps(protocol, sort_keys=True)
     return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
 
+def get_config_hash(config: Dict[str, Any]) -> str:
+    """Computes SHA256 of sorted canonical json config."""
+    serialized = json.dumps(config, sort_keys=True)
+    return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+
 def load_or_create_protocol(filepath: str) -> Dict[str, Any]:
     try:
         with open(filepath, 'r') as f:
@@ -55,3 +60,8 @@ def load_or_create_protocol(filepath: str) -> Dict[str, Any]:
         with open(filepath, 'w') as f:
             json.dump(DEFAULT_PROTOCOL, f, indent=4)
         return DEFAULT_PROTOCOL
+
+def verify_protocol_hash(protocol_data: Dict[str, Any], expected_hash: str) -> bool:
+    """Verifies that the protocol data has not been mutated."""
+    actual_hash = get_protocol_hash(protocol_data)
+    return actual_hash == expected_hash

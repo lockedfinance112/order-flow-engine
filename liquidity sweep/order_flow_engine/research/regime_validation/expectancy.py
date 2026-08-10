@@ -8,21 +8,20 @@ class ExpectancyCalculator:
         gross_return: float,
         cost_bps: int
     ) -> float:
-        # Cost is subtracted symmetrically from already direction-normalized return
         return gross_return - (cost_bps / 10000.0)
 
     @classmethod
-    def calculate_expectancy(
+    def calculate_expectancy_for_horizon(
         cls,
         joined_signals: List[Dict[str, Any]],
-        horizon_min: int,
+        horizon: str, # "1m", "5m", "15m", "60m"
         cost_bps: int = 5
     ) -> Dict[str, Any]:
         
         valid_signals = [
             s for s in joined_signals
             if s.get("joined") and s.get("safe") and
-            s.get("outcomes", {}).get("status") == "COMPLETED"
+            s.get("outcomes", {}).get(horizon, {}).get("status") == "COMPLETED"
         ]
         
         if not valid_signals:
@@ -50,7 +49,7 @@ class ExpectancyCalculator:
         wins = 0
         
         for s in valid_signals:
-            outcomes = s["outcomes"]
+            outcomes = s["outcomes"][horizon]
             gross_ret = outcomes["return"]
             net_ret = cls.calculate_net_returns(gross_ret, cost_bps)
             returns.append(net_ret)

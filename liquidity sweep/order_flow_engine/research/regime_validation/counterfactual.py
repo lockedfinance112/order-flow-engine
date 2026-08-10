@@ -7,6 +7,7 @@ class CounterfactualAnalyzer:
     @staticmethod
     def compare_allow_only(
         joined_signals: List[Dict[str, Any]],
+        horizon: str = "15m",
         cost_bps: int = 5,
         bootstrap_reps: int = 1000,
         bootstrap_seed: int = 1729
@@ -16,10 +17,9 @@ class CounterfactualAnalyzer:
         baseline_signals = [
             s for s in joined_signals
             if s.get("joined") and s.get("safe") and
-            s.get("outcomes", {}).get("status") == "COMPLETED"
+            s.get("outcomes", {}).get(horizon, {}).get("status") == "COMPLETED"
         ]
         
-        # ALLOW-only counterfactual
         allow_signals = [
             s for s in baseline_signals
             if s.get("advisory_permission") == "ALLOW"
@@ -30,12 +30,15 @@ class CounterfactualAnalyzer:
             if s.get("advisory_permission") == "BLOCK"
         ]
 
-        baseline_exp = ExpectancyCalculator.calculate_expectancy(baseline_signals, 15, cost_bps)
-        allow_exp = ExpectancyCalculator.calculate_expectancy(allow_signals, 15, cost_bps)
+        baseline_exp = ExpectancyCalculator.calculate_expectancy_for_horizon(baseline_signals, horizon, cost_bps)
+        allow_exp = ExpectancyCalculator.calculate_expectancy_for_horizon(allow_signals, horizon, cost_bps)
+        block_exp = ExpectancyCalculator.calculate_expectancy_for_horizon(block_signals, horizon, cost_bps)
         
         retained_pct = len(allow_signals) / len(baseline_signals) if baseline_signals else 0.0
         
-        # Bootstrap difference ALLOW vs BLOCK
+        # ALLOW - BLOCK point estimate
+        allow_minus_block_point = allow_exp.get("mean_return", 0.0) - block_exp.get("mean_return", 0.0)
+        
         allow_minus_block_ci = BlockBootstrap.bootstrap_allow_minus_block(
             allow_signals,
             block_signals,
@@ -44,7 +47,6 @@ class CounterfactualAnalyzer:
             cost_bps=cost_bps
         )
         
-        # Bootstrap ALLOW vs BASELINE (optional/informational)
         allow_ci = BlockBootstrap.bootstrap_metrics(
             allow_signals,
             reps=bootstrap_reps,
@@ -55,9 +57,12 @@ class CounterfactualAnalyzer:
         return {
             "baseline_count": len(baseline_signals),
             "allow_count": len(allow_signals),
+            "block_count": len(block_signals),
             "retention_pct": retained_pct,
             "baseline_metrics": baseline_exp,
             "allow_metrics": allow_exp,
+            "block_metrics": block_exp,
+            "allow_minus_block_point": allow_minus_block_point,
             "allow_minus_block_ci": allow_minus_block_ci.get("allow_minus_block_ci"),
             "allow_ci": allow_ci.get("mean_net_return_ci")
         }

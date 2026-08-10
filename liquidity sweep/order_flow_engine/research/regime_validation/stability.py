@@ -1,4 +1,5 @@
 import math
+import csv
 from typing import List, Dict, Any, Tuple
 
 class StabilityAnalyzer:
@@ -20,7 +21,7 @@ class StabilityAnalyzer:
         if not timeline:
             return {}
             
-        durations = {} # regime -> list of block sizes
+        durations = {}
         current_regime = None
         duration = 0
         
@@ -92,20 +93,17 @@ class StabilityAnalyzer:
         for i in range(total_eval):
             r_curr = timeline[i].get("primary_regime", "UNKNOWN")
             
-            # 3-bar flip: check if current matches state i+2 and i+1 is different
             if i + 2 < total_eval:
                 r_2 = timeline[i+2].get("primary_regime", "UNKNOWN")
                 r_1 = timeline[i+1].get("primary_regime", "UNKNOWN")
                 if r_curr == r_2 and r_curr != r_1:
                     flips_3 += 1
                     
-            # 5-bar flip: check if state i matches i+4 and any intermediate is different
             if i + 4 < total_eval:
                 r_4 = timeline[i+4].get("primary_regime", "UNKNOWN")
                 if r_curr == r_4 and any(timeline[i+j].get("primary_regime", "UNKNOWN") != r_curr for j in range(1, 4)):
                     flips_5 += 1
                     
-            # 10-bar flip: check if state i matches i+9 and any intermediate is different
             if i + 9 < total_eval:
                 r_9 = timeline[i+9].get("primary_regime", "UNKNOWN")
                 if r_curr == r_9 and any(timeline[i+j].get("primary_regime", "UNKNOWN") != r_curr for j in range(1, 9)):
@@ -116,3 +114,35 @@ class StabilityAnalyzer:
             "flip_5": flips_5 / max(total_eval - 4, 1),
             "flip_10": flips_10 / max(total_eval - 9, 1)
         }
+
+    @staticmethod
+    def analyze_candidates(timeline: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """Analyzes confirmation and reset rates of candidate regimes."""
+        # Trace candidate shifts
+        results = {}
+        for t in timeline:
+            cand = t.get("candidate_regime")
+            if not cand or cand == "UNKNOWN":
+                continue
+                
+            results.setdefault(cand, {
+                "observations": 0,
+                "confirmations": 0,
+                "resets": 0
+            })
+            results[cand]["observations"] += 1
+            
+            # Check confirmation count
+            cc = t.get("candidate_count", 0)
+            # If cc transitions from high back to 0 or count matches switch
+            if cc >= 3:
+                results[cand]["confirmations"] += 1
+            elif cc == 1:
+                results[cand]["resets"] += 1
+                
+        for cand, metrics in results.items():
+            obs = metrics["observations"]
+            metrics["confirmation_rate"] = metrics["confirmations"] / obs if obs > 0 else 0.0
+            metrics["reset_rate"] = metrics["resets"] / obs if obs > 0 else 0.0
+            
+        return results
