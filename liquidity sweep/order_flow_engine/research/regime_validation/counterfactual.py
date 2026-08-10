@@ -22,12 +22,12 @@ class CounterfactualAnalyzer:
         
         allow_signals = [
             s for s in baseline_signals
-            if s.get("advisory_permission") == "ALLOW"
+            if s.get("permission") == "ALLOW"
         ]
         
         block_signals = [
             s for s in baseline_signals
-            if s.get("advisory_permission") == "BLOCK"
+            if s.get("permission") == "BLOCK"
         ]
 
         baseline_exp = ExpectancyCalculator.calculate_expectancy_for_horizon(baseline_signals, horizon, cost_bps)

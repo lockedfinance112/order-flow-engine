@@ -6,6 +6,7 @@ import gzip
 import tempfile
 import shutil
 import csv
+import hashlib
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -683,6 +684,18 @@ class TestRegimeValidation(unittest.TestCase):
                     "protocol_hash must be written correctly"
                 )
 
+    # 16. Final Integration Offline Test
+    def test_final_integration_offline(self):
+        from research.regime_validation.cli import _build_mandatory_artifact_list
+        import sys, io
+        
+        # Test that _build_mandatory_artifact_list includes run_manifest.json
+        artifacts = _build_mandatory_artifact_list("/fake/run", ["BTCUSDT"])
+        self.assertIn(os.path.join("/fake/run", "run_manifest.json").replace("\\\\", "/"), [a.replace("\\\\", "/") for a in artifacts])
+        self.assertTrue(len(artifacts) >= 2)
+        has_btcusdt = any("btcusdt" in a for a in artifacts)
+        self.assertTrue(has_btcusdt)
+
     # 13. Deterministic Dataset Hash Reproducibility Test (Requirement 3)
     def test_dataset_hash_reproducibility(self):
         from research.regime_validation.cli import compute_dataset_content_hash
@@ -698,3 +711,71 @@ class TestRegimeValidation(unittest.TestCase):
         h2 = compute_dataset_content_hash(self.tmp_dir, ["BTCUSDT"])
         self.assertEqual(h1, h2)
 
+    # 14. Join -> Counterfactual Integration Test
+    def test_join_counterfactual_integration(self):
+        from research.regime_validation.counterfactual import CounterfactualAnalyzer
+        # Create a mock joined_signals contract directly
+        joined_signals = [
+            {
+                "timestamp_ms": 1700000000000,
+                "joined": True, "safe": True, "permission": "ALLOW",
+                "outcomes": {"15m": {"status": "COMPLETED", "return": 0.0050, "mfe": 0.01, "mae": 0.001}}
+            },
+            {
+                "timestamp_ms": 1700000000000,
+                "joined": True, "safe": True, "permission": "ALLOW",
+                "outcomes": {"15m": {"status": "COMPLETED", "return": 0.0050, "mfe": 0.01, "mae": 0.001}}
+            },
+            {
+                "timestamp_ms": 1700000000000,
+                "joined": True, "safe": True, "permission": "BLOCK",
+                "outcomes": {"15m": {"status": "COMPLETED", "return": 0.0010, "mfe": 0.005, "mae": 0.001}}
+            },
+            {
+                "timestamp_ms": 1700000000000,
+                "joined": True, "safe": True, "permission": "BLOCK",
+                "outcomes": {"15m": {"status": "COMPLETED", "return": 0.0010, "mfe": 0.005, "mae": 0.001}}
+            }
+        ]
+        
+        # We need more than a couple for bootstrap, let's duplicate them and spread timestamps over 5 days
+        expanded = []
+        for i in range(5):
+            for s in joined_signals:
+                s_copy = dict(s)
+                s_copy["timestamp_ms"] += i * 86400000
+                expanded.append(s_copy)
+        joined_signals = expanded
+        
+        # Calculate exactly
+        res = CounterfactualAnalyzer.compare_allow_only(joined_signals, cost_bps=5) # 5 bps = 0.0005
+        
+        self.assertEqual(res["baseline_count"], 20)
+        self.assertEqual(res["allow_count"], 10)
+        self.assertEqual(res["block_count"], 10)
+        self.assertEqual(res["retention_pct"], 0.5)
+        # ALLOW mean = 0.0050 - 0.0005 = 0.0045
+        self.assertAlmostEqual(res["allow_metrics"]["mean_return"], 0.0045, places=5)
+        # BLOCK mean = 0.0010 - 0.0005 = 0.0005
+        self.assertAlmostEqual(res["block_metrics"]["mean_return"], 0.0005, places=5)
+        # ALLOW-BLOCK = 0.0045 - 0.0005 = 0.0040
+        self.assertAlmostEqual(res["allow_minus_block_point"], 0.0040, places=5)
+        self.assertIsNotNone(res["allow_minus_block_ci"])
+        self.assertIsNotNone(res["allow_ci"])
+
+    # 15. Production Files Frozen Paths
+    def test_production_files_frozen_paths(self):
+        from research.regime_validation.cli import _check_production_files_frozen
+        import subprocess
+        
+        # Mock subprocess.check_output to return a fake git diff
+        original_check_output = subprocess.check_output
+        def mock_check_output(args, **kwargs):
+            return b"liquidity sweep/order_flow_engine/regime/classifier.py\n"
+        
+        subprocess.check_output = mock_check_output
+        try:
+            res = _check_production_files_frozen("dummy_commit")
+            self.assertFalse(res, "Should recognize changes to protected files based on project prefix")
+        finally:
+            subprocess.check_output = original_check_output

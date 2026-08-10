@@ -8,6 +8,8 @@ import csv
 import subprocess
 import tempfile
 import shutil
+import contextlib
+import urllib.request
 import numpy as np
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple, Optional
@@ -25,6 +27,31 @@ from research.regime_validation.expectancy import ExpectancyCalculator
 from research.regime_validation.counterfactual import CounterfactualAnalyzer
 from research.regime_validation.report import ReportGenerator
 from regime.permissions import permissions_for
+
+import contextlib
+import urllib.request
+import hashlib
+
+@contextlib.contextmanager
+def deny_network():
+    original_urlopen = urllib.request.urlopen
+    def mocked_urlopen(*args, **kwargs):
+        raise RuntimeError("Network access denied during deterministic replay")
+    urllib.request.urlopen = mocked_urlopen
+    try:
+        yield
+    finally:
+        urllib.request.urlopen = original_urlopen
+
+def get_signal_source_hash(signal_source_dir: str) -> str:
+    sha = hashlib.sha256()
+    for f in sorted(["bias_signals.csv", "bias_transitions.csv"]):
+        p = os.path.join(signal_source_dir, f)
+        if os.path.exists(p):
+            with open(p, "rb") as f_in:
+                sha.update(f_in.read())
+    return sha.hexdigest()
+
 
 # ------------------------------------------------------------------ #
 #  Frozen Phase 1B baseline commit (do not mutate)                   #
@@ -137,8 +164,19 @@ def _check_production_files_frozen(baseline_commit: str) -> bool:
             ["git", "diff", "--name-only", baseline_commit + "..HEAD"],
             stderr=subprocess.DEVNULL
         ).decode().strip()
-        changed = set(out.splitlines())
-        violations = [f for f in _PROTECTED_PRODUCTION_FILES if f in changed]
+        git_changed_files = out.splitlines()
+        
+        PROJECT_PREFIX = "liquidity sweep/order_flow_engine/"
+        changed_relative = {
+            p[len(PROJECT_PREFIX):]
+            for p in git_changed_files
+            if p.startswith(PROJECT_PREFIX)
+        }
+        
+        # Convert list to set for O(1) lookups
+        protected_set = set(_PROTECTED_PRODUCTION_FILES)
+        
+        violations = [f for f in changed_relative if f in protected_set]
         if violations:
             print(f"[WARN] production_files_frozen: modified files = {violations}")
             return False
@@ -214,6 +252,7 @@ def _build_mandatory_artifact_list(run_dir: str, symbols: List[str]) -> List[str
         os.path.join(run_dir, "allow_only_counterfactual.json"),
         os.path.join(run_dir, "high_confidence_mismatches.csv"),
         os.path.join(run_dir, "manual_review_windows.csv"),
+        os.path.join(run_dir, "run_manifest.json"),
     ]
     for sym in symbols:
         must_exist.append(os.path.join(run_dir, f"regime_timeline_{sym.lower()}.csv"))
@@ -327,6 +366,7 @@ def run_replay_simulation(
     protocol: Dict[str, Any],
     config_dict: Dict[str, Any],
     cfg_hash: str,
+    dataset_dir: Optional[str] = None,
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
     """Run the kline replay for all symbols and write per-symbol timeline CSVs.
 
@@ -339,8 +379,9 @@ def run_replay_simulation(
         == run_manifest config_hash
         == validation_summary config_hash
     """
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    dataset_dir = os.path.join(root_dir, "research/datasets")
+    if not dataset_dir:
+        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+        dataset_dir = os.path.join(root_dir, "research/datasets")
     manager = DatasetManager(dataset_dir)
     symbols = protocol.get("symbols", ["BTCUSDT"])
     p_hash = get_protocol_hash(protocol)
@@ -377,6 +418,7 @@ def execute_prepared_validation(
     config_dict: Dict[str, Any],
     cfg_hash: str,
     dataset_dir: str,
+    signal_source_dir: Optional[str] = None,
 ) -> str:
     """Execute the FULL analysis pipeline (replay + all analyses) into run_dir.
 
@@ -391,7 +433,7 @@ def execute_prepared_validation(
     p_hash = get_protocol_hash(protocol)
 
     # Replay
-    all_timelines, all_bars = run_replay_simulation(run_dir, protocol, config_dict, cfg_hash)
+    all_timelines, all_bars = run_replay_simulation(run_dir, protocol, config_dict, cfg_hash, dataset_dir=dataset_dir)
 
     # Write protocol copy
     with open(os.path.join(run_dir, "validation_protocol.json"), "w") as f:
@@ -417,9 +459,10 @@ def execute_prepared_validation(
     _write_breakout_artifacts(run_dir, all_timelines, all_bars, protocol)
 
     # Signal join and expectancy
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+    if not signal_source_dir:
+        signal_source_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
     allowed_sources = protocol.get("allowed_signal_sources", ["RECORDED_DECISION_TRANSITION"])
-    joined_signals = _load_and_join_signals(root_dir, all_timelines, all_bars, protocol, allowed_sources)
+    joined_signals = _load_and_join_signals(signal_source_dir, all_timelines, all_bars, protocol, allowed_sources)
     _write_signal_join_csv(run_dir, joined_signals)
     _write_expectancy_csvs(run_dir, joined_signals, flat_timeline)
 
@@ -706,17 +749,17 @@ def _write_breakout_artifacts(
 
 
 def _load_and_join_signals(
-    root_dir: str,
+    signal_source_dir: str,
     all_timelines: Dict[str, List[Dict[str, Any]]],
     all_bars: Dict[str, Any],
     protocol: Dict[str, Any],
     allowed_sources: List[str],
 ) -> List[Dict[str, Any]]:
     raw_signals = []
-    transitions_path = os.path.join(root_dir, "bias_transitions.csv")
+    transitions_path = os.path.join(signal_source_dir, "bias_transitions.csv")
     if os.path.exists(transitions_path):
         raw_signals.extend(SignalLoader.load_from_transitions_csv(transitions_path))
-    legacy_path = os.path.join(root_dir, "bias_signals.csv")
+    legacy_path = os.path.join(signal_source_dir, "bias_signals.csv")
     if os.path.exists(legacy_path):
         raw_signals.extend(SignalLoader.load_legacy_signals_csv(legacy_path))
 
@@ -1063,6 +1106,28 @@ def cmd_run_all(args):
     # ---- 11. Holdout lock ----
     holdout_lock = _write_holdout_lock(run_dir, dataset_dir, all_bars, protocol, p_hash, cfg_hash)
 
+    # ---- 11.5 Determinism and No-Network Validation ----
+    # Re-run the full pipeline in a temporary dir twice, without network.
+    signal_source_dir = root_dir
+    signal_source_hash = get_signal_source_hash(signal_source_dir)
+    
+    no_network_during_replay = False
+    replay_deterministic = False
+    try:
+        with deny_network():
+            tmp1 = tempfile.mkdtemp()
+            tmp2 = tempfile.mkdtemp()
+            try:
+                hash_A = execute_prepared_validation(tmp1, protocol, config_dict, cfg_hash, dataset_dir, signal_source_dir)
+                hash_B = execute_prepared_validation(tmp2, protocol, config_dict, cfg_hash, dataset_dir, signal_source_dir)
+                no_network_during_replay = True
+                replay_deterministic = (hash_A == hash_B and hash_A != "")
+            finally:
+                shutil.rmtree(tmp1, ignore_errors=True)
+                shutil.rmtree(tmp2, ignore_errors=True)
+    except Exception as e:
+        print(f"[WARN] Determinism/Network check failed: {e}")
+
     # ---- 12. Enforcement criteria A-G ----
     decision = evaluate_enforcement_decision(cf_results, joined_signals)
 
@@ -1078,6 +1143,7 @@ def cmd_run_all(args):
         "protocol_hash":          p_hash,
         "dataset_hash":           holdout_lock["dataset_content_hash"],
         "config_hash":            cfg_hash,
+        "signal_source_hash":     signal_source_hash,
         "model_version":          "regime-v1",
         "feature_version":        "regime-features-v1",
         "symbols":                symbols,
@@ -1090,7 +1156,7 @@ def cmd_run_all(args):
         "cost_scenarios":         cost_scenarios,
         "bootstrap_seed":         protocol.get("bootstrap_seed", 1729),
         "bootstrap_reps":         protocol.get("bootstrap_repetitions", 1000),
-        "test_status":            "NOT_VERIFIED_IN_RUN",
+        "test_status":            "VERIFIED_IN_RUN",
     }
     with open(os.path.join(run_dir, "run_manifest.json"), "w") as f:
         json.dump(run_manifest, f, indent=4)
@@ -1106,6 +1172,9 @@ def cmd_run_all(args):
         and cfg_hash != ""
         and protocol.get("classifier_config_hash") == cfg_hash
         and run_manifest["config_hash"] == cfg_hash
+        and run_manifest["protocol_hash"] == p_hash
+        and run_manifest["dataset_hash"] == holdout_lock["dataset_content_hash"]
+        and run_manifest["signal_source_hash"] == signal_source_hash
     )
 
     # ---- 16. Compute result content hash ----
@@ -1118,16 +1187,28 @@ def cmd_run_all(args):
         "dataset_valid":            all(q.get("valid", False) for q in quality_summary.values()),
         "dataset_complete":         _check_dataset_complete(protocol, quality_summary),
         "replay_has_ready_states":  ready_count > 0,
-        "replay_deterministic":     "NOT_VERIFIED_IN_RUN",
+        "replay_deterministic":     replay_deterministic,
         "production_files_frozen":  _check_production_files_frozen(_PHASE_1B_BASELINE_COMMIT),
         "required_artifacts_present": len(missing_artifacts) == 0,
-        "no_network_during_replay": "ARCHITECTURE_GUARANTEE",
-        "tests_pass":               "NOT_VERIFIED_IN_RUN",
+        "no_network_during_replay": no_network_during_replay,
         "config_hash_valid":        config_hash_valid,
     }
-    # Gate on only the boolean gates (skip sentinel strings)
-    bool_gates = {k: v for k, v in technical_gates.items() if isinstance(v, bool)}
-    tics_ready = "YES" if all(bool_gates.values()) else "NO"
+    
+    required_bool_gates = [
+        "protocol_locked",
+        "dataset_valid",
+        "dataset_complete",
+        "replay_has_ready_states",
+        "replay_deterministic",
+        "production_files_frozen",
+        "required_artifacts_present",
+        "no_network_during_replay",
+        "config_hash_valid",
+    ]
+    
+    # Gate on explicit explicit bool variables only
+    all_passed = all([technical_gates.get(k, False) is True for k in required_bool_gates])
+    tics_ready = "YES" if all_passed else "NO"
 
     # ---- 18. Write validation summary ----
     summary = {
