@@ -449,11 +449,23 @@ class FlowMetrics:
         if not book_valid:
             safe = False
             status = "DATA_INVALID"
-            reason = f"Local order book invalid or resynchronising (state: {book_state})"
+            reason = f"Local order book invalid (state: {book_state})"
+        elif depth_status == "INITIALISING":
+            safe = False
+            status = "DATA_INVALID"
+            reason = "Depth stream has not received valid data"
+        elif trade_status == "INITIALISING":
+            safe = False
+            status = "DATA_INVALID"
+            reason = "Trade stream has not received valid data"
         elif depth_status == "STALE":
             safe = False
             status = "DATA_STALE"
             reason = f"Depth stream stale: {depth_silence:.0f}ms silence"
+        elif trade_status == "STALE":
+            safe = False
+            status = "DATA_STALE"
+            reason = f"Trade stream stale: {trade_silence:.0f}ms silence"
         elif depth_status == "INVALID":
             safe = False
             status = "DATA_INVALID"

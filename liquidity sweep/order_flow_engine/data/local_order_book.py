@@ -117,6 +117,18 @@ class LocalOrderBook:
                 self.set_state("RESYNCING")
                 self.trigger_sync(force=True)
 
+    def _fetch_snapshot_sync(self) -> dict:
+        url = f"https://fapi.binance.com/fapi/v1/depth?symbol={self.symbol.upper()}&limit=1000"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            try:
+                return json.loads(response.read().decode())
+            except StopIteration as exc:
+                raise RuntimeError("Snapshot provider unexpectedly exhausted") from exc
+
+    async def _sleep(self, seconds: float):
+        await asyncio.sleep(seconds)
+
     def trigger_sync(self, force: bool = False):
         """Triggers the async REST depth snapshot fetcher."""
         if not force and self.sync_task and not self.sync_task.done():
@@ -134,20 +146,14 @@ class LocalOrderBook:
         backoff = 1.0
         while self.state in ("RESYNCING", "SYNCING", "INITIALISING"):
             try:
-                url = f"https://fapi.binance.com/fapi/v1/depth?symbol={self.symbol.upper()}&limit=1000"
-                def _fetch():
-                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                    with urllib.request.urlopen(req, timeout=10) as response:
-                        return json.loads(response.read().decode())
-                
-                snapshot = await asyncio.to_thread(_fetch)
+                snapshot = await asyncio.to_thread(self._fetch_snapshot_sync)
                 outcome = self._apply_snapshot(snapshot)
                 
                 if outcome == SyncOutcome.SYNCED:
                     return
                 elif outcome == SyncOutcome.WAITING_FOR_BUFFER:
                     while self.state == "SYNCING":
-                        await asyncio.sleep(0.1)
+                        await self._sleep(0.1)
                         outcome = self._try_sync_from_buffer()
                         if outcome == SyncOutcome.SYNCED:
                             return
@@ -155,16 +161,16 @@ class LocalOrderBook:
                             break
                     if self.state == "HEALTHY":
                         return
-                    await asyncio.sleep(backoff)
+                    await self._sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
                     continue
                 elif outcome == SyncOutcome.RETRY_SNAPSHOT:
-                    await asyncio.sleep(backoff)
+                    await self._sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
                     continue
             except Exception as e:
                 logger.error(f"[{self.symbol.upper()}] Failed to fetch order book snapshot: {e}. Retrying in {backoff}s...")
-                await asyncio.sleep(backoff)
+                await self._sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
     def _apply_snapshot(self, snapshot: dict) -> SyncOutcome:

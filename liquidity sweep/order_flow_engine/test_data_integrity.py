@@ -2,7 +2,7 @@ import unittest
 import time
 import asyncio
 from collections import deque
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from data.sequence_validator import SequenceValidator
 from data.stream_health import StreamHealthTracker
@@ -170,6 +170,7 @@ class TestOrderBookDataIntegrity(unittest.TestCase):
         
         # Mark book valid first so we test staleness
         self.book.is_valid = True
+        self.state.trade_health_tracker.last_received_wall_time = now
         
         # Setup stale depth state
         self.state.depth_health_tracker.last_received_wall_time = now - 10.0
@@ -183,6 +184,86 @@ class TestOrderBookDataIntegrity(unittest.TestCase):
         )
         self.assertEqual(decision["action"], "DATA_STALE")
         self.assertFalse(decision["confirmation_candidate"])
+
+    # Blocker 3 Test: Stale trade feed fails closed
+    def test_stale_trade_feed_fails_closed(self):
+        scorer = OrderFlowScorer(self.metrics)
+        now = time.time()
+
+        # Construct: book_valid=True, book_state=HEALTHY, depth_status=HEALTHY, trade_status=STALE
+        self.book.is_valid = True
+        self.book.state = "HEALTHY"
+        self.state.depth_health_tracker.last_received_wall_time = now
+        self.state.trade_health_tracker.last_received_wall_time = now - 10.0 # stale
+
+        safety = self.metrics.get_market_data_safety("btcusdt", now)
+        self.assertFalse(safety["safe"])
+        self.assertEqual(safety["status"], "DATA_STALE")
+
+        # Verify otherwise strongly bullish conditions block
+        decision = scorer.evaluate_bias(
+            symbol="btcusdt",
+            metrics_5m={"status": "VALID", "delta_usdt": 1000000.0, "buy_ratio": 0.9},
+            imbalance=0.8,
+            recent_events=["BUY_AGGRESSION"],
+            now=now,
+            cooldown_end=0.0
+        )
+        self.assertEqual(decision["action"], "DATA_STALE")
+        self.assertFalse(decision["confirmation_candidate"])
+
+    # Blocker 4 Test: API aggregate status logic
+    def test_api_aggregate_status(self):
+        now = time.time()
+        
+        # Setup BTCUSDT: trade STALE, depth HEALTHY, book HEALTHY
+        btc_state = self.metrics.get_state("btcusdt")
+        btc_state.local_book.is_valid = True
+        btc_state.local_book.state = "HEALTHY"
+        btc_state.depth_health_tracker.last_received_wall_time = now
+        btc_state.trade_health_tracker.last_received_wall_time = now - 10.0
+        
+        # Setup ETHUSDT: all HEALTHY
+        eth_state = self.metrics.get_state("ethusdt")
+        eth_state.local_book.is_valid = True
+        eth_state.local_book.state = "HEALTHY"
+        eth_state.depth_health_tracker.last_received_wall_time = now
+        eth_state.trade_health_tracker.last_received_wall_time = now
+        
+        # Evaluate aggregate status logic
+        guardian_status = "HEALTHY"
+        unsafe_symbols = []
+        for sym in ["btcusdt", "ethusdt"]:
+            safety = self.metrics.get_market_data_safety(sym, now)
+            if not safety["safe"]:
+                unsafe_symbols.append(sym.upper())
+        if unsafe_symbols:
+            guardian_status = "UNSAFE"
+            
+        self.assertEqual(guardian_status, "UNSAFE")
+        self.assertIn("BTCUSDT", unsafe_symbols)
+        self.assertNotIn("ETHUSDT", unsafe_symbols)
+
+    # Blocker 7 Test: Paper auto-entry safety
+    def test_paper_auto_entry_blocked_while_unsafe(self):
+        # Setup mock dependencies
+        scanner = MagicMock()
+        scanner.metrics = self.metrics
+        scanner.paper_trader = MagicMock()
+        scanner.paper_trader.auto_trade_enabled = True
+        scanner.paper_trader.positions = {}
+        
+        # Setup safety stale trade feed
+        self.book.is_valid = True
+        self.state.depth_health_tracker.last_received_wall_time = time.time()
+        self.state.trade_health_tracker.last_received_wall_time = time.time() - 10.0 # stale
+        
+        # Call the auto paper trade method
+        import main
+        main.OrderFlowEngine._run_auto_paper_trade(scanner, "btcusdt", 60000.0, "CONFIRMED_LONG")
+        
+        # Assert no entry orders were executed
+        scanner.paper_trader.execute_order.assert_not_called()
 
 class TestRollingWindowsAndCVD(unittest.TestCase):
     def setUp(self):
@@ -261,6 +342,81 @@ class TestStreamHealth(unittest.TestCase):
         # Advance clock to 5.0 seconds
         tracker._clock = 5.0
         self.assertEqual(tracker.get_status(), "STALE")
+
+class TestOrderBookAsync(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.metrics = FlowMetrics()
+        self.state = self.metrics.get_state("btcusdt")
+        self.book = self.state.local_book
+
+    # Blocker 5 Test: Second snapshot fetch on RETRY_SNAPSHOT
+    async def test_resync_retry_refetches(self):
+        bad_snapshot = {"lastUpdateId": 100, "bids": [], "asks": []}
+        good_snapshot = {"lastUpdateId": 200, "bids": [["60000.0", "1.0"]], "asks": [["60100.0", "1.0"]]}
+        
+        fetch_count = 0
+        def fake_fetch_snapshot():
+            nonlocal fetch_count
+            fetch_count += 1
+            if fetch_count == 1:
+                return bad_snapshot
+            if fetch_count == 2:
+                # Prepare connecting update in buffer before returning the second snapshot
+                self.book.buffer = [{"U": 199, "u": 201, "pu": 198, "b": [], "a": [], "E": 1000, "T": 999}]
+                return good_snapshot
+            raise AssertionError(f"Unexpected snapshot fetch #{fetch_count}")
+
+        # Overwrite on this specific book instance
+        self.book._fetch_snapshot_sync = fake_fetch_snapshot
+        
+        # Mock _sleep to be async no-op
+        async def fake_sleep(seconds):
+            return
+        self.book._sleep = fake_sleep
+        
+        # Set state and buffer to trigger retry on first snapshot
+        self.book.buffer = [{"U": 105, "u": 106, "pu": 103, "b": [], "a": [], "E": 1000, "T": 999}]
+        self.book.state = "RESYNCING"
+        
+        # Run with a strict timeout
+        await asyncio.wait_for(
+            self.book._fetch_and_apply_snapshot(),
+            timeout=2.0
+        )
+        
+        self.assertEqual(fetch_count, 2)
+        self.assertTrue(self.book.is_valid)
+        self.assertEqual(self.book.state, "HEALTHY")
+
+    # Blocker 6 Test: Single sync task ownership
+    async def test_single_sync_task_ownership(self):
+        self.book.state = "RESYNCING"
+        async def slow_sync():
+            try:
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                pass
+            
+        with patch.object(self.book, '_fetch_and_apply_snapshot', side_effect=slow_sync):
+            self.book.trigger_sync()
+            task1 = self.book.sync_task
+            self.assertIsNotNone(task1)
+            
+            # Repeat trigger: should reuse existing active task
+            self.book.trigger_sync()
+            task2 = self.book.sync_task
+            self.assertEqual(task1, task2)
+            
+            # Force trigger: cancels first and spawns replacement
+            self.book.trigger_sync(force=True)
+            task3 = self.book.sync_task
+            await asyncio.sleep(0.01)
+            self.assertNotEqual(task1, task3)
+            self.assertTrue(task1.cancelled() or task1.done())
+            
+            # Clean up tasks
+            task3.cancel()
+            await asyncio.gather(task1, task3, return_exceptions=True)
 
 if __name__ == '__main__':
     unittest.main()

@@ -865,6 +865,10 @@ class OrderFlowEngine:
         # Determine if we should open a new position
         pos = self.paper_trader.positions.get(symbol)
         if not pos:
+            # Check market data safety first (defense in depth)
+            safety = self.metrics.get_market_data_safety(symbol)
+            if not safety["safe"]:
+                return
             symbol_state = self.metrics.get_state(symbol)
             if action in ("CONFIRMED_LONG", "LONG (SWEEP)", "LONG_BIAS", "CONFIRMED_SHORT", "SHORT (SWEEP)", "SHORT_BIAS"):
                 logger.info(f"[AUTO DEBUG] {symbol.upper()}: action={action}, book_valid={symbol_state.local_book.is_valid}, book_state={symbol_state.local_book.state}, spread_bps={symbol_state.spread_bps:.2f}")

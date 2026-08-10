@@ -103,6 +103,9 @@ class TestScoringStateMachine(unittest.TestCase):
         self.state.local_book.is_valid = True
         self.state.local_book.state = "HEALTHY"
         self.state.last_depth_timestamp = time.time()
+        now = time.time()
+        self.state.trade_health_tracker.record_event(now, now, now, now, 1)
+        self.state.depth_health_tracker.record_event(now, now, now, now, 1)
         
         # Should be WARMING_UP because window start time is current time
         state_name, reason = self.scorer.get_bias_action(self.symbol, {"status": "WARMING_UP"}, 0.0, [])
@@ -145,6 +148,9 @@ class TestScannerPurityAndConsistency(unittest.TestCase):
         self.state.local_book.is_valid = True
         self.state.local_book.state = "HEALTHY"
         self.state.last_depth_timestamp = time.time()
+        now = time.time()
+        self.state.trade_health_tracker.record_event(now, now, now, now, 1)
+        self.state.depth_health_tracker.record_event(now, now, now, now, 1)
         self.state.best_bid = 3000.0
         self.state.best_ask = 3001.0
         self.state.spread_bps = 3.3
