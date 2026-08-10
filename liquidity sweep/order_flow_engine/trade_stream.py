@@ -111,7 +111,9 @@ class TradeStream:
         try:
             price = float(data["p"])
             quantity = float(data["q"])
-            trade_time = float(data["T"]) / 1000.0  # convert to seconds
+            trade_time_ms = int(data["T"])
+            event_time_ms = int(data["E"])
+            aggregate_trade_id = int(data["a"])
             is_buyer_maker = data["m"]
             
             # If buyer is maker, aggressive taker sold (SELL).
@@ -119,7 +121,10 @@ class TradeStream:
             side = "SELL" if is_buyer_maker else "BUY"
 
             parsed_trade = {
-                "timestamp": trade_time,
+                "timestamp": trade_time_ms / 1000.0,   # backwards compatibility
+                "trade_time_ms": trade_time_ms,
+                "event_time_ms": event_time_ms,
+                "aggregate_trade_id": aggregate_trade_id,
                 "price": price,
                 "quantity": quantity,
                 "side": side,

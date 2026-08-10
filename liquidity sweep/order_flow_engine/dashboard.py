@@ -1447,6 +1447,10 @@ class OrderFlowDashboard:
                                 <th>Book Imbalance</th>
                                 <th>Next Action</th>
                                 <th>Context</th>
+                                <th>Regime</th>
+                                <th>Conf</th>
+                                <th>Vol</th>
+                                <th>Liq</th>
                                 <th>Trades Health</th>
                                 <th>Depth Health</th>
                                 <th>Book Sync</th>
@@ -1456,7 +1460,7 @@ class OrderFlowDashboard:
                             </tr>
                         </thead>
                         <tbody id="multi-table-body">
-                            <tr><td colspan="17" style="text-align: center; color: var(--text-muted);">Waiting for metrics payload...</td></tr>
+                            <tr><td colspan="21" style="text-align: center; color: var(--text-muted);">Waiting for metrics payload...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -2179,9 +2183,9 @@ class OrderFlowDashboard:
 
         function healthClass(value) {
             const label = String(value || '').toLowerCase();
-            if (label === 'healthy' || label === 'valid' || label === 'synced' || label === 'ready' || label === 'ok') return 'health-healthy';
-            if (label === 'degraded' || label === 'warning' || label === 'warming' || label === 'warming_up' || label === 'syncing') return 'health-degraded';
-            return 'health-bad'; // stale, error, sequence_gap, invalid
+            if (label === 'healthy' || label === 'valid' || label === 'synced' || label === 'ready' || label === 'ok' || label === 'normal' || label === 'low') return 'health-healthy';
+            if (label === 'degraded' || label === 'warning' || label === 'warming' || label === 'warming_up' || label === 'syncing' || label === 'high' || label === 'thin') return 'health-degraded';
+            return 'health-bad'; // stale, error, sequence_gap, invalid, extreme, stressed
         }
 
         function updateUI(data) {
@@ -2329,6 +2333,12 @@ class OrderFlowDashboard:
                 const eventText = item.data.duplication_suspected ? 'WINDOW_DUPLICATION_SUSPECTED' : (item.data.latest_event || '-');
                 const eventStyle = item.data.duplication_suspected ? 'color: var(--red); font-weight: bold;' : 'color: var(--text-muted); font-weight: bold;';
                 
+                const regObj = item.data.regime || {};
+                const primaryRegime = regObj.primary_regime || 'UNKNOWN';
+                const confidence = regObj.confidence ? Math.round(regObj.confidence * 100) + '%' : '0%';
+                const volOverlay = regObj.volatility || 'UNKNOWN';
+                const liqOverlay = regObj.liquidity || 'UNKNOWN';
+                
                 const row = document.createElement('tr');
                 row.style.cursor = 'pointer';
                 row.onclick = () => selectSymbol(item.symbol);
@@ -2344,6 +2354,10 @@ class OrderFlowDashboard:
                     <td class="${imbClass}" style="font-weight: bold;">${imb >= 0 ? '+' : ''}${imb.toFixed(2)}</td>
                     <td class="${actionClass}">${action}</td>
                     <td><span class="context-pill ${contextClass(contextLabel)}">${contextLabel}</span></td>
+                    <td style="font-weight: bold; color: var(--primary);">${primaryRegime}</td>
+                    <td>${confidence}</td>
+                    <td><span class="context-pill ${healthClass(volOverlay)}">${volOverlay}</span></td>
+                    <td><span class="context-pill ${healthClass(liqOverlay)}">${liqOverlay}</span></td>
                     <td><span class="context-pill ${healthClass(tradesHealth)}">${tradesHealth}</span></td>
                     <td><span class="context-pill ${healthClass(depthHealth)}">${depthHealth}</span></td>
                     <td><span class="context-pill ${healthClass(bookSync)}">${bookSync}</span></td>

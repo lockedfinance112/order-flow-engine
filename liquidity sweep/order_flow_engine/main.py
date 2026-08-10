@@ -53,6 +53,25 @@ class OrderFlowEngine:
             runtime_config=self.ai_runtime_config
         )
         self.binance_context = BinanceContextManager(SYMBOLS)
+
+        # Instantiate RegimeEngine (TICS Phase 1B - Shadow Mode)
+        from regime.engine import RegimeEngine
+        
+        def get_liquidity_data(sym: str) -> dict:
+            state = self.metrics.get_state(sym)
+            return {
+                "spread_bps": state.spread_bps,
+                "bid_depth_top5_usdt": state.bid_depth_top5_usdt,
+                "ask_depth_top5_usdt": state.ask_depth_top5_usdt
+            }
+            
+        import config as cfg
+        self.regime_engine = RegimeEngine(
+            symbols=SYMBOLS,
+            market_data_safety_provider=self.metrics.get_market_data_safety,
+            liquidity_provider=get_liquidity_data,
+            config=vars(cfg)
+        )
         
         # Event Recorders per symbol (v2.9)
         from data.recorder import StreamRecorder
@@ -501,6 +520,15 @@ class OrderFlowEngine:
                         )
                     }
                     response = self._json_response(payload)
+                elif path == "/api/regime":
+                    symbols_details = {}
+                    for sym in SYMBOLS:
+                        symbols_details[sym.upper()] = self.regime_engine.get_regime_state(sym)
+                    payload = {
+                        "model_version": self.regime_engine.model_version,
+                        "symbols": symbols_details
+                    }
+                    response = self._json_response(payload)
                 elif path == "/api/binance/context":
                     response = self._json_response(self.binance_context.get_context())
                 elif path == "/api/binance/status":
@@ -607,7 +635,8 @@ class OrderFlowEngine:
                                 "stream_health_status": state.depth_health_tracker.get_status(state.local_book.is_valid, now=now_time),
                                 "stream_health_metrics": state.depth_health_tracker.get_metrics(now=now_time),
                                 "check_gates": decision["gates"],
-                                "active_walls": state.wall_tracker.get_active_walls(mid_price, state.bid_depth_top5_usdt)
+                                "active_walls": state.wall_tracker.get_active_walls(mid_price, state.bid_depth_top5_usdt),
+                                "regime": self.regime_engine.get_regime_state(sym)
                             }
                         
                         current_prices = {s: self.metrics.get_metrics_for_window(s, "1m").get("latest_price", 0.0) for s in SYMBOLS}
@@ -695,6 +724,9 @@ class OrderFlowEngine:
             for rec in self.recorders.values():
                 rec.start()
 
+        # Start TICS Regime Engine
+        self.regime_engine.start()
+
         await self.stream.start()
         await self.depth_stream.start()
         await self.sweeps_monitor.start()
@@ -711,6 +743,9 @@ class OrderFlowEngine:
         except asyncio.CancelledError:
             logger.info("Order Flow Engine stopped.")
         finally:
+            # Stop TICS Regime Engine
+            self.regime_engine.stop()
+
             if config.RECORDING_ENABLED:
                 for rec in self.recorders.values():
                     await rec.stop()
@@ -729,6 +764,9 @@ class OrderFlowEngine:
                 
                 # Add to sliding window metrics specifically for this symbol
                 alerts = self.metrics.add_trade(symbol, trade)
+                
+                # Feed trade to TICS Regime Engine
+                self.regime_engine.on_trade(symbol, trade)
                 
                 # Feed price to outcomes tracker
                 trade_price = float(trade.get("p", 0.0) or trade.get("price", 0.0) or 0.0)
