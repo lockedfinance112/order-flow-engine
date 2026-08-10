@@ -1,6 +1,5 @@
 import logging
-from collections import deque
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Set, Optional, Tuple
 from regime.models import MarketBar
 
 logger = logging.getLogger("OrderFlow.BarStore")
@@ -8,7 +7,7 @@ logger = logging.getLogger("OrderFlow.BarStore")
 class BarStore:
     """
     Stores and manages historical closed candles for a single symbol.
-    Provides boundaries alignment, gap detection, and uniqueness checks.
+    Maintains relative float tolerances, cumulative and current unresolved gap counts.
     """
     def __init__(self, symbol: str, max_bars: int = 2000):
         self.symbol = symbol.lower()
@@ -28,13 +27,13 @@ class BarStore:
         self.history_gap_count = 0
         self.queue_overflow_count = 0
         
-        # Track pending gap recovery requests: set of (open_time_ms)
-        self.pending_gap_recovery: Dict[str, List[int]] = {
-            "1m": [],
-            "5m": [],
-            "15m": [],
-            "1h": []
-        }
+        # Gap State management
+        self.unresolved_gaps: Set[Tuple[str, int]] = set() # (timeframe, open_time_ms)
+        self.recovery_requests: List[Dict[str, Any]] = []
+
+    @property
+    def unresolved_gap_count(self) -> int:
+        return len(self.unresolved_gaps)
 
     def get_bars(self, timeframe: str) -> List[MarketBar]:
         return self.bars.get(timeframe, [])
@@ -44,6 +43,9 @@ class BarStore:
         Appends a closed canonical bar to history. Enforces uniqueness and detects gaps.
         Returns True if appended, False if ignored/duplicate.
         """
+        # Remove from unresolved gaps if it was there
+        self.unresolved_gaps.discard((timeframe, bar.open_time_ms))
+        
         history = self.bars[timeframe]
         interval_ms = {
             "1m": 60000,
@@ -70,13 +72,13 @@ class BarStore:
                 not close_enough(bar.open, last_bar.open) or
                 not close_enough(bar.high, last_bar.high) or
                 not close_enough(bar.low, last_bar.low) or
-                not close_enough(bar.close, last_bar.close)
+                not close_enough(bar.close, last_bar.close) or
+                not close_enough(bar.base_volume, last_bar.base_volume)
             )
             if is_mismatch:
                 self.reconciliation_mismatch_count += 1
                 logger.warning(
-                    f"[{self.symbol.upper()}] {timeframe} bar discrepancy detected at {bar.open_time_ms}. "
-                    f"New: {bar.open}/{bar.high}/{bar.low}/{bar.close}, Existing: {last_bar.open}/{last_bar.high}/{last_bar.low}/{last_bar.close}"
+                    f"[{self.symbol.upper()}] {timeframe} bar mismatch at {bar.open_time_ms}."
                 )
             return False
 
@@ -97,16 +99,16 @@ class BarStore:
         expected_next = last_bar.open_time_ms + interval_ms
         if bar.open_time_ms > expected_next:
             self.history_gap_count += 1
-            missing_count = (bar.open_time_ms - expected_next) // interval_ms
-            logger.warning(
-                f"[{self.symbol.upper()}] {timeframe} gap detected. "
-                f"Last: {last_bar.open_time_ms}, New: {bar.open_time_ms}. Missing: {missing_count} bars."
-            )
-            # Schedule recovery
             curr = expected_next
             while curr < bar.open_time_ms:
-                if curr not in self.pending_gap_recovery[timeframe]:
-                    self.pending_gap_recovery[timeframe].append(curr)
+                self.unresolved_gaps.add((timeframe, curr))
+                # Add to recovery requests queue
+                self.recovery_requests.append({
+                    "symbol": self.symbol,
+                    "timeframe": timeframe,
+                    "missing_open_time_ms": curr,
+                    "reason": "STREAM_GAP"
+                })
                 curr += interval_ms
 
         # Append and maintain bounds

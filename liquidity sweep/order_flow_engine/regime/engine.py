@@ -17,8 +17,8 @@ logger = logging.getLogger("OrderFlow.RegimeEngine")
 class RegimeEngine:
     """
     TICS Market Regime Intelligence Engine. Decoupled and runs in Shadow Mode.
-    Processes live minute candles from trade flow, manages multi-timeframe aggregation,
-    computes pure point-in-time features, and runs the deterministic regime classifier.
+    Evaluates market regime using event-time watermark candle finalization,
+    async gap recovery, and pure feature calculations.
     """
     def __init__(
         self,
@@ -33,6 +33,7 @@ class RegimeEngine:
         self.config = config or {}
         
         # Load Configuration
+        self.enabled = self.config.get("REGIME_ENGINE_ENABLED", True)
         self.model_version = self.config.get("REGIME_MODEL_VERSION", "regime-v1")
         self.feature_version = self.config.get("REGIME_FEATURE_VERSION", "regime-features-v1")
         self.max_bars = self.config.get("REGIME_MAX_BARS_PER_TIMEFRAME", 2000)
@@ -44,12 +45,15 @@ class RegimeEngine:
         self.backfill_states: Dict[str, str] = {s: "NOT_STARTED" for s in self.symbols}
         self.current_regimes: Dict[str, Dict[str, Any]] = {}
         
-        # Live 1m Bar Builders (current open bar): symbol -> dict
-        self.live_bars: Dict[str, Dict[str, Any]] = {}
+        # Watermark and Bar Builders per symbol
+        self.current_bars: Dict[str, Optional[Dict[str, Any]]] = {s: None for s in self.symbols}
+        self.pending_previous_bars: Dict[str, Optional[Dict[str, Any]]] = {s: None for s in self.symbols}
+        self.max_seen_trade_times_ms: Dict[str, int] = {s: 0 for s in self.symbols}
         
         # Deduplication States: symbol -> (deque of IDs, set of IDs)
+        # Bounded O(1) set/deque management
         self.dedup_ids: Dict[str, Tuple[deque, set]] = {
-            s: (deque(maxlen=self.dedup_capacity), set()) for s in self.symbols
+            s: (deque(), set()) for s in self.symbols
         }
 
         # Liquidity Rolling Baselines: symbol -> { "spread_bps": List, "depth_usdt": List }
@@ -57,7 +61,7 @@ class RegimeEngine:
             s: {"spread": [], "depth": []} for s in self.symbols
         }
         
-        # Hysteresis memory: symbol -> { "candidate": str, "count": int, "last_evaluation_close_ms": int, "bars_since_regime_start": int, "regime_since_ms": int }
+        # Hysteresis memory: symbol -> Dict[str, Any]
         self.hysteresis_state: Dict[str, Dict[str, Any]] = {
             s: {
                 "candidate": None,
@@ -69,30 +73,57 @@ class RegimeEngine:
                 "previous_regime": "UNKNOWN"
             } for s in self.symbols
         }
+        self.last_good_evaluation_ms: Dict[str, int] = {s: 0 for s in self.symbols}
 
-        # Bounded Closed Bar Queue (for worker thread processing)
+        # Bounded Queue
         self.queue = asyncio.Queue(maxsize=1000)
         self.recorder = RegimeRecorder()
         
-        # Worker Task
+        # Task Trackers
         self.worker_task: Optional[asyncio.Task] = None
-        self.is_running = False
+        self.recovery_task: Optional[asyncio.Task] = None
+        self.backfill_tasks: List[asyncio.Task] = []
 
     def start(self):
-        self.is_running = True
+        if not self.enabled:
+            logger.info("RegimeEngine is disabled via configuration.")
+            return
+            
         self.worker_task = asyncio.create_task(self._worker_loop())
-        # Start background backfill
+        self.recovery_task = asyncio.create_task(self._recovery_loop())
         for symbol in self.symbols:
-            asyncio.create_task(self._backfill_symbol(symbol))
+            t = asyncio.create_task(self._backfill_symbol(symbol))
+            self.backfill_tasks.append(t)
 
-    def stop(self):
-        self.is_running = False
+    async def stop(self):
+        tasks = []
         if self.worker_task:
             self.worker_task.cancel()
+            tasks.append(self.worker_task)
+        if self.recovery_task:
+            self.recovery_task.cancel()
+            tasks.append(self.recovery_task)
+        for t in self.backfill_tasks:
+            t.cancel()
+            tasks.append(t)
+            
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.backfill_tasks.clear()
+        self.worker_task = None
+        self.recovery_task = None
 
     def get_regime_state(self, symbol: str) -> Dict[str, Any]:
-        """Reads cached canonical regime state for API/Dashboard usage."""
         symbol_lower = symbol.lower()
+        if not self.enabled:
+            return {
+                "symbol": symbol.upper(),
+                "quality": "DISABLED",
+                "primary_regime": "UNKNOWN",
+                "confidence": 0.0,
+                "model_version": self.model_version
+            }
+            
         if symbol_lower not in self.current_regimes:
             return {
                 "symbol": symbol.upper(),
@@ -110,10 +141,9 @@ class RegimeEngine:
         return self.current_regimes[symbol_lower]
 
     def on_trade(self, symbol: str, trade: dict):
-        """
-        Extremely cheap aggTrade callback.
-        Routes trade to deduplication, incremental bar construction, and enqueues closed bars.
-        """
+        if not self.enabled:
+            return
+            
         symbol_lower = symbol.lower()
         if symbol_lower not in self.symbols:
             return
@@ -125,19 +155,23 @@ class RegimeEngine:
 
         store = self.stores[symbol_lower]
 
-        # 1. Deduplication (O(1) set membership)
+        # 1. Deduplication Invariant: Set == Deque
         dq, s_set = self.dedup_ids[symbol_lower]
         if trade_id in s_set:
             store.duplicate_trade_count += 1
             return
             
-        dq.append(trade_id)
-        s_set.add(trade_id)
         if len(dq) >= self.dedup_capacity:
             oldest = dq.popleft()
             s_set.discard(oldest)
+        dq.append(trade_id)
+        s_set.add(trade_id)
 
-        # 2. Bucket Authority: T / trade_time_ms determines 1m candle alignment
+        # 2. Watermark update
+        max_seen = self.max_seen_trade_times_ms[symbol_lower]
+        self.max_seen_trade_times_ms[symbol_lower] = max(max_seen, trade_time_ms)
+        max_seen = self.max_seen_trade_times_ms[symbol_lower]
+
         bucket_open_ms = (trade_time_ms // 60000) * 60000
         bucket_close_ms = bucket_open_ms + 60000 - 1
 
@@ -145,11 +179,13 @@ class RegimeEngine:
         qty = trade["quantity"]
         quote_qty = price * qty
 
-        live = self.live_bars.get(symbol_lower)
+        # Access Symbol Builders
+        current = self.current_bars[symbol_lower]
+        pending = self.pending_previous_bars[symbol_lower]
 
-        # First trade initialization
-        if not live:
-            self.live_bars[symbol_lower] = {
+        # Initialize current bar if empty
+        if not current:
+            self.current_bars[symbol_lower] = {
                 "open_time_ms": bucket_open_ms,
                 "close_time_ms": bucket_close_ms,
                 "open": price,
@@ -164,34 +200,28 @@ class RegimeEngine:
             }
             return
 
-        # Handle bucket transition based on exchange trade-time progression
-        if bucket_open_ms > live["open_time_ms"]:
-            # Finalize previous live bar
-            finalized_bar = MarketBar(
-                symbol=symbol_lower,
-                timeframe="1m",
-                open_time_ms=live["open_time_ms"],
-                close_time_ms=live["close_time_ms"],
-                open=live["open"],
-                high=live["high"],
-                low=live["low"],
-                close=live["close"],
-                base_volume=live["base_volume"],
-                quote_volume=live["quote_volume"],
-                agg_trade_count=live["agg_trade_count"],
-                closed=True
-            )
-            
-            # Enqueue to background worker queue
-            try:
-                self.queue.put_nowait((symbol_lower, finalized_bar))
-            except asyncio.QueueFull:
-                store.queue_overflow_count += 1
-                store.history_gap_count += 1 # Queue dropped bar requires gap backfill
-                logger.error(f"[{symbol_lower.upper()}] Regime queue full! Dropped bar at {live['open_time_ms']}.")
+        if bucket_open_ms == current["open_time_ms"]:
+            # Same minute aggregation
+            if trade_time_ms < current["last_trade_time_ms"]:
+                store.out_of_order_trade_count += 1
+            if trade_time_ms < current["first_trade_time_ms"]:
+                current["open"] = price
+                current["first_trade_time_ms"] = trade_time_ms
+            if trade_time_ms > current["last_trade_time_ms"]:
+                current["close"] = price
+                current["last_trade_time_ms"] = trade_time_ms
+            current["high"] = max(current["high"], price)
+            current["low"] = min(current["low"], price)
+            current["base_volume"] += qty
+            current["quote_volume"] += quote_qty
+            current["agg_trade_count"] += 1
 
-            # Open next bucket
-            self.live_bars[symbol_lower] = {
+        elif bucket_open_ms > current["open_time_ms"]:
+            # Shift current to pending
+            if pending:
+                self._enqueue_bar(symbol_lower, pending)
+            self.pending_previous_bars[symbol_lower] = current
+            self.current_bars[symbol_lower] = {
                 "open_time_ms": bucket_open_ms,
                 "close_time_ms": bucket_close_ms,
                 "open": price,
@@ -205,49 +235,66 @@ class RegimeEngine:
                 "last_trade_time_ms": trade_time_ms
             }
 
-        elif bucket_open_ms < live["open_time_ms"]:
-            # Late trade check
-            lateness = live["first_trade_time_ms"] - trade_time_ms
-            if lateness > self.max_late_ms:
-                store.late_trade_count += 1
-                return # Reject stale rewrite
-            else:
-                # Integrate if it's within lateness allowance and belongs to a preceding open bar
-                store.out_of_order_trade_count += 1
-                # Incrementally aggregate without full sort
-                if trade_time_ms < live["first_trade_time_ms"]:
-                    live["open"] = price
-                    live["first_trade_time_ms"] = trade_time_ms
-                if trade_time_ms > live["last_trade_time_ms"]:
-                    live["close"] = price
-                    live["last_trade_time_ms"] = trade_time_ms
-                live["high"] = max(live["high"], price)
-                live["low"] = min(live["low"], price)
-                live["base_volume"] += qty
-                live["quote_volume"] += quote_qty
-                live["agg_trade_count"] += 1
         else:
-            # Same-minute normal/out-of-order aggregation
-            if trade_time_ms < live["last_trade_time_ms"]:
-                store.out_of_order_trade_count += 1
-                
-            if trade_time_ms < live["first_trade_time_ms"]:
-                live["open"] = price
-                live["first_trade_time_ms"] = trade_time_ms
-            if trade_time_ms > live["last_trade_time_ms"]:
-                live["close"] = price
-                live["last_trade_time_ms"] = trade_time_ms
-                
-            live["high"] = max(live["high"], price)
-            live["low"] = min(live["low"], price)
-            live["base_volume"] += qty
-            live["quote_volume"] += quote_qty
-            live["agg_trade_count"] += 1
+            # Late trade check: belongs to pending or older?
+            if pending and bucket_open_ms == pending["open_time_ms"]:
+                # Check lateness watermark limits
+                if max_seen <= pending["open_time_ms"] + 60000 + self.max_late_ms:
+                    store.out_of_order_trade_count += 1
+                    if trade_time_ms < pending["first_trade_time_ms"]:
+                        pending["open"] = price
+                        pending["first_trade_time_ms"] = trade_time_ms
+                    if trade_time_ms > pending["last_trade_time_ms"]:
+                        pending["close"] = price
+                        pending["last_trade_time_ms"] = trade_time_ms
+                    pending["high"] = max(pending["high"], price)
+                    pending["low"] = min(pending["low"], price)
+                    pending["base_volume"] += qty
+                    pending["quote_volume"] += quote_qty
+                    pending["agg_trade_count"] += 1
+                else:
+                    store.late_trade_count += 1
+            else:
+                store.late_trade_count += 1
+
+        # Check watermark to finalize pending bar
+        pending = self.pending_previous_bars[symbol_lower]
+        if pending and max_seen > pending["open_time_ms"] + 60000 + self.max_late_ms:
+            self._enqueue_bar(symbol_lower, pending)
+            self.pending_previous_bars[symbol_lower] = None
+
+    def _enqueue_bar(self, symbol: str, bar_dict: dict):
+        store = self.stores[symbol]
+        finalized_bar = MarketBar(
+            symbol=symbol,
+            timeframe="1m",
+            open_time_ms=bar_dict["open_time_ms"],
+            close_time_ms=bar_dict["close_time_ms"],
+            open=bar_dict["open"],
+            high=bar_dict["high"],
+            low=bar_dict["low"],
+            close=bar_dict["close"],
+            base_volume=bar_dict["base_volume"],
+            quote_volume=bar_dict["quote_volume"],
+            closed=True,
+            agg_trade_count=bar_dict["agg_trade_count"]
+        )
+        try:
+            self.queue.put_nowait((symbol, finalized_bar))
+        except asyncio.QueueFull:
+            store.queue_overflow_count += 1
+            # Exact dropped candle details preserved for recovery request
+            store.recovery_requests.append({
+                "symbol": symbol,
+                "timeframe": "1m",
+                "missing_open_time_ms": bar_dict["open_time_ms"],
+                "reason": "QUEUE_OVERFLOW"
+            })
+            store.unresolved_gaps.add(("1m", bar_dict["open_time_ms"]))
+            logger.error(f"[{symbol.upper()}] Queue full! Registered recovery request for {bar_dict['open_time_ms']}.")
 
     async def _backfill_symbol(self, symbol: str):
         self.backfill_states[symbol] = "LOADING"
-        logger.info(f"[{symbol.upper()}] Starting historical kline backfill...")
-        
         from regime.history_loader import fetch_klines_async
         timeframes = ["1m", "5m", "15m", "1h"]
         
@@ -259,44 +306,95 @@ class RegimeEngine:
                     store.append_bar(tf, bar)
                     
             self.backfill_states[symbol] = "READY"
-            logger.info(f"[{symbol.upper()}] Historical backfill completed successfully.")
-            # Trigger initial classification immediately
             self._process_symbol_regime(symbol, int(time.time() * 1000))
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             self.backfill_states[symbol] = "FAILED"
             logger.error(f"[{symbol.upper()}] Historical backfill failed: {e}")
 
     async def _worker_loop(self):
-        while self.is_running:
+        while True:
             try:
                 symbol, bar = await self.queue.get()
                 store = self.stores[symbol]
                 
-                # Append 1m bar to store
                 if store.append_bar("1m", bar):
-                    # Check and construct higher TF candles using component completeness
                     self._aggregate_higher_tfs(symbol, bar)
-                    # Evaluate regime
                     self._process_symbol_regime(symbol, bar.close_time_ms)
                     
                 self.queue.task_done()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in regime worker loop: {e}")
+                logger.error(f"Error in regime worker: {e}")
                 await asyncio.sleep(0.1)
 
+    async def _recovery_loop(self):
+        """Asynchronous background loop resolving gaps from Binance Futures API."""
+        from regime.history_loader import fetch_klines_async
+        interval_ms = {
+            "1m": 60000,
+            "5m": 300000,
+            "15m": 900000,
+            "1h": 3600000
+        }
+        while True:
+            try:
+                await asyncio.sleep(5.0)
+                for symbol in self.symbols:
+                    store = self.stores[symbol]
+                    if not store.recovery_requests:
+                        continue
+                        
+                    req = store.recovery_requests.pop(0)
+                    tf = req["timeframe"]
+                    open_ms = req["missing_open_time_ms"]
+                    
+                    try:
+                        bars = await fetch_klines_async(
+                            symbol=symbol,
+                            timeframe=tf,
+                            start_time_ms=open_ms,
+                            end_time_ms=open_ms + interval_ms[tf] - 1
+                        )
+                        for bar in bars:
+                            store.append_bar(tf, bar)
+                            
+                        # If a 1m bar was recovered, trigger re-evaluation of higher TFs
+                        if tf == "1m" and bars:
+                            self._aggregate_higher_tfs(symbol, bars[0])
+                    except Exception as err:
+                        logger.warning(f"[{symbol.upper()}] Gap recovery failed for {open_ms}: {err}")
+                        # Put request back
+                        store.recovery_requests.append(req)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in recovery loop: {e}")
+                await asyncio.sleep(5.0)
+
     def _aggregate_higher_tfs(self, symbol: str, new_1m_bar: MarketBar):
-        """Builds UTC-aligned closed 5m, 15m, and 1h bars from closed 1m bars."""
         store = self.stores[symbol]
         m1_bars = store.get_bars("1m")
         
         def aggregate_components(open_time_ms: int, count: int, tf: str) -> Optional[MarketBar]:
-            # Find the component bars in 1m history
             components = [b for b in m1_bars if open_time_ms <= b.open_time_ms < open_time_ms + (count * 60000)]
             if len(components) < count:
-                # Completeness check failed -> Degraded gap state
-                store.history_gap_count += 1
+                # Add component recovery request
+                expected_times = set(open_time_ms + i * 60000 for i in range(count))
+                existing_times = set(b.open_time_ms for b in components)
+                missing_times = expected_times - existing_times
+                
+                for t in missing_times:
+                    if not any(req["missing_open_time_ms"] == t and req["timeframe"] == "1m" for req in store.recovery_requests):
+                        store.recovery_requests.append({
+                            "symbol": symbol,
+                            "timeframe": "1m",
+                            "missing_open_time_ms": t,
+                            "reason": "HIGHER_TF_COMPONENT_MISSING"
+                        })
+                        store.unresolved_gaps.add(("1m", t))
                 return None
                 
             open_val = components[0].open
@@ -305,7 +403,6 @@ class RegimeEngine:
             close_val = components[-1].close
             base_vol = sum(b.base_volume for b in components)
             quote_vol = sum(b.quote_volume for b in components)
-            agg_cnt = sum(b.agg_trade_count for b in components)
             
             return MarketBar(
                 symbol=symbol,
@@ -318,12 +415,9 @@ class RegimeEngine:
                 close=close_val,
                 base_volume=base_vol,
                 quote_volume=quote_vol,
-                agg_trade_count=agg_cnt,
                 closed=True
             )
 
-        # Check 5m boundary: just closed 1m bar completed the 5m interval
-        # If new_1m_bar close time completes a 5m boundary (e.g. xx:04.999 closes 5m bar open at xx:00)
         close_time = new_1m_bar.open_time_ms + 60000
         if close_time % 300000 == 0:
             m5_open = close_time - 300000
@@ -331,14 +425,12 @@ class RegimeEngine:
             if m5_bar:
                 store.append_bar("5m", m5_bar)
 
-        # Check 15m boundary
         if close_time % 900000 == 0:
             m15_open = close_time - 900000
             m15_bar = aggregate_components(m15_open, 15, "15m")
             if m15_bar:
                 store.append_bar("15m", m15_bar)
 
-        # Check 1h boundary
         if close_time % 3600000 == 0:
             m1h_open = close_time - 3600000
             m1h_bar = aggregate_components(m1h_open, 60, "1h")
@@ -351,12 +443,13 @@ class RegimeEngine:
         
         # 1. Guardian integration
         if not safety["safe"]:
+            last_good = self.last_good_evaluation_ms.get(symbol, 0)
             self.current_regimes[symbol] = {
                 "symbol": symbol.upper(),
                 "quality": "STALE",
                 "tradable": False,
                 "primary_regime": self.hysteresis_state[symbol]["current_regime"],
-                "last_good_age_seconds": (event_time_ms - self.hysteresis_state[symbol]["regime_since_ms"]) / 1000.0 if self.hysteresis_state[symbol]["regime_since_ms"] > 0 else 999.0,
+                "last_good_age_seconds": (event_time_ms - last_good) / 1000.0 if last_good > 0 else 999.0,
                 "reason": safety["reason"] or "Data Guardian unsafe",
                 "model_version": self.model_version
             }
@@ -368,7 +461,6 @@ class RegimeEngine:
         bars_15m = store.get_bars("15m")
         bars_1h = store.get_bars("1h")
         
-        # Require minimum historical closed bars to calculate features
         if len(bars_1m) < 50 or len(bars_5m) < 21 or len(bars_15m) < 21 or len(bars_1h) < 21:
             self.current_regimes[symbol] = {
                 "symbol": symbol.upper(),
@@ -381,24 +473,28 @@ class RegimeEngine:
             }
             return
 
-        # Calculate features (Pure functions)
+        # Calculate features (Pure functions) - VOLATILITY prefix recalculation removed!
+        features_1m = compute_features(bars_1m, "1m", self.config)
+        features_5m = compute_features(bars_5m, "5m", self.config)
+        features_15m = compute_features(bars_15m, "15m", self.config)
+        features_1h = compute_features(bars_1h, "1h", self.config)
+        
         tf_feats = {
-            "1m": compute_features(bars_1m, "1m", self.config)[-1],
-            "5m": compute_features(bars_5m, "5m", self.config)[-1],
-            "15m": compute_features(bars_15m, "15m", self.config)[-1],
-            "1h": compute_features(bars_1h, "1h", self.config)[-1]
+            "1m": features_1m[-1],
+            "5m": features_5m[-1],
+            "15m": features_15m[-1],
+            "1h": features_1h[-1]
         }
 
         # Classify regime
         primary_cand, confidence, structure, direction, scores, reasons = classify_regime(tf_feats, self.config)
 
-        # 3. Volatility Overlay (rolling percentile-based)
-        # Track 15m realized volatility in rolling window
+        # 3. Volatility Overlay
         vol_window = self.config.get("REGIME_VOL_PERCENTILE_WINDOW", 200)
         min_vol_samples = self.config.get("REGIME_VOL_MIN_SAMPLES", 100)
         
-        vol_samples = [compute_features(bars_15m[:j+1], "15m", self.config)[-1].get("realized_vol20") for j in range(len(bars_15m))]
-        vol_samples = [v for v in vol_samples if v is not None][-vol_window:]
+        # Bounded O(N) extraction of vol percentile values
+        vol_samples = [f.get("realized_vol20") for f in features_15m if f.get("realized_vol20") is not None][-vol_window:]
         
         vol_regime = "UNKNOWN"
         curr_vol = tf_feats["15m"].get("realized_vol20")
@@ -419,7 +515,6 @@ class RegimeEngine:
         liq_window = self.config.get("REGIME_LIQUIDITY_WINDOW", 500)
         min_liq_samples = self.config.get("REGIME_LIQUIDITY_MIN_SAMPLES", 100)
         
-        # Sample current spread/depth if book is valid
         liq = self.liquidity_provider(symbol)
         spread_bps = liq.get("spread_bps")
         depth_usdt = liq.get("bid_depth_top5_usdt", 0.0) + liq.get("ask_depth_top5_usdt", 0.0)
@@ -436,32 +531,32 @@ class RegimeEngine:
         depth_history = self.liquidity_baselines[symbol]["depth"]
         
         if len(spread_history) >= min_liq_samples and spread_bps is not None:
-            # Median baseline calculations
             sorted_spreads = sorted(spread_history)
             sorted_depths = sorted(depth_history)
             med_spread = sorted_spreads[len(sorted_spreads) // 2]
             med_depth = sorted_depths[len(sorted_depths) // 2]
             
-            # Simple thresholding logic relative to median
-            if spread_bps > med_spread * 1.5 or depth_usdt < med_depth * 0.5:
-                liq_regime = "THIN"
-            elif spread_bps > med_spread * 3.0 or depth_usdt < med_depth * 0.2:
+            # Stressed first check order
+            if spread_bps > med_spread * 3.0 or depth_usdt < med_depth * 0.2:
                 liq_regime = "STRESSED"
+            elif spread_bps > med_spread * 1.5 or depth_usdt < med_depth * 0.5:
+                liq_regime = "THIN"
             else:
                 liq_regime = "NORMAL"
 
-        # 5. Hysteresis Block (Transitions apply confirm bars)
+        # 5. Hysteresis & Breakout Decay
         hyst = self.hysteresis_state[symbol]
-        last_eval_ms = bars_1m[-1].open_time_ms
+        last_eval_ms = bars_1m[-1].close_time_ms
         
-        # Prevent double evaluations of the same closed bar
         if hyst["last_evaluation_close_ms"] == last_eval_ms:
             return
             
         hyst["last_evaluation_close_ms"] = last_eval_ms
+        self.last_good_evaluation_ms[symbol] = last_eval_ms
         
         current_reg = hyst["current_regime"]
         max_breakout_bars = self.config.get("REGIME_BREAKOUT_MAX_BARS", 5)
+        
         if current_reg in ("BREAKOUT_UP", "BREAKOUT_DOWN") and hyst["bars_since_regime_start"] >= max_breakout_bars:
             if current_reg == "BREAKOUT_UP":
                 decayed_regime = "TREND_UP" if scores["trend_up"] >= 0.65 else "TRANSITION"
@@ -490,7 +585,6 @@ class RegimeEngine:
         confirm_bars = self.config.get("REGIME_SWITCH_CONFIRM_BARS", 3)
         min_conf = self.config.get("REGIME_MIN_CONFIDENCE", 0.65)
         
-        # Skip hysteresis if initial assignment from UNKNOWN and confidence >= min_conf
         if current_reg == "UNKNOWN" and primary_cand != "UNKNOWN" and confidence >= min_conf:
             hyst["previous_regime"] = "UNKNOWN"
             hyst["current_regime"] = primary_cand
@@ -499,7 +593,6 @@ class RegimeEngine:
             hyst["candidate"] = None
             hyst["count"] = 0
             
-            # Record transition
             self.recorder.record_transition({
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "symbol": symbol,
@@ -521,7 +614,6 @@ class RegimeEngine:
                 hyst["count"] = 0
                 hyst["bars_since_regime_start"] += 1
             else:
-                # Candidate tracking
                 if hyst["candidate"] == primary_cand:
                     hyst["count"] += 1
                 else:
@@ -529,7 +621,6 @@ class RegimeEngine:
                     hyst["count"] = 1
                     
                 if hyst["count"] >= confirm_bars and confidence >= min_conf:
-                    # Transition confirmed!
                     old_reg = current_reg
                     persistence_of_old = hyst["bars_since_regime_start"]
                     
@@ -540,7 +631,6 @@ class RegimeEngine:
                     hyst["candidate"] = None
                     hyst["count"] = 0
                     
-                    # Record transition
                     self.recorder.record_transition({
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "symbol": symbol,
@@ -552,15 +642,21 @@ class RegimeEngine:
                         "features": tf_feats["15m"]
                     }, last_eval_ms)
         else:
-            # Candidate interrupted/reset
             hyst["candidate"] = None
             hyst["count"] = 0
             hyst["bars_since_regime_start"] += 1
 
-        # Cache final state
         quality = "READY"
-        if store.history_gap_count > 0:
+        if store.unresolved_gap_count > 0:
             quality = "DEGRADED"
+
+        # Transition risk computation
+        margin = 0.0
+        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        if len(sorted_scores) > 1:
+            margin = sorted_scores[0][1] - sorted_scores[1][1]
+        transition_risk = 0.5 * (1.0 - margin) + (0.3 if hyst["candidate"] is not None else 0.0) + 0.2 * (1.0 if vol_regime in ("HIGH", "EXTREME") else 0.0)
+        transition_risk = min(max(transition_risk, 0.0), 1.0)
 
         self.current_regimes[symbol] = {
             "symbol": symbol.upper(),
@@ -580,19 +676,23 @@ class RegimeEngine:
             "reasons": reasons,
             "model_version": self.model_version,
             "permissions": permissions_for(hyst["current_regime"]),
-            # Provenance metadata
-            "latest_1m_close_time": last_eval_ms,
-            "latest_5m_close_time": bars_5m[-1].open_time_ms if bars_5m else 0,
-            "latest_15m_close_time": bars_15m[-1].open_time_ms if bars_15m else 0,
-            "latest_1h_close_time": bars_1h[-1].open_time_ms if bars_1h else 0,
+            "latest_1m_close_time": bars_1m[-1].close_time_ms if bars_1m else 0,
+            "latest_5m_close_time": bars_5m[-1].close_time_ms if bars_5m else 0,
+            "latest_15m_close_time": bars_15m[-1].close_time_ms if bars_15m else 0,
+            "latest_1h_close_time": bars_1h[-1].close_time_ms if bars_1h else 0,
             "history_gap_count": store.history_gap_count,
+            "unresolved_gap_count": store.unresolved_gap_count,
             "late_trade_count": store.late_trade_count,
             "duplicate_trade_count": store.duplicate_trade_count,
             "queue_overflow_count": store.queue_overflow_count,
-            "reconciliation_mismatch_count": store.reconciliation_mismatch_count
+            "reconciliation_mismatch_count": store.reconciliation_mismatch_count,
+            "feature_version": self.feature_version,
+            "transition_risk": transition_risk,
+            "backfill_state": self.backfill_states.get(symbol, "NOT_STARTED"),
+            "queue_depth": self.queue.qsize()
         }
 
-        # Write to state log
+        # Write state log
         state_log = self.current_regimes[symbol].copy()
         state_log["evaluation_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         state_log["features"] = tf_feats["15m"]

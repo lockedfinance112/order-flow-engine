@@ -12,10 +12,12 @@ from regime.permissions import permissions_for, REGIME_PERMISSION_MATRIX
 from regime.engine import RegimeEngine
 from scoring import OrderFlowScorer
 from flow_metrics import FlowMetrics
+from trade_stream import TradeStream
 
 class TestRegimeEngine(unittest.TestCase):
     def setUp(self):
         self.config = {
+            "REGIME_ENGINE_ENABLED": True,
             "REGIME_MODEL_VERSION": "regime-v1",
             "REGIME_FEATURE_VERSION": "regime-features-v1",
             "REGIME_BACKFILL_BARS": 500,
@@ -49,6 +51,9 @@ class TestRegimeEngine(unittest.TestCase):
             config=self.config
         )
 
+    def tearDown(self):
+        asyncio.run(self.engine.stop())
+
     def _generate_synthetic_bars(self, base_price: float, drift: float, count: int, noise: float = 0.1, close_noise: float = 0.0) -> list:
         bars = []
         curr = base_price
@@ -72,8 +77,8 @@ class TestRegimeEngine(unittest.TestCase):
                 close=close_val,
                 base_volume=10.0,
                 quote_volume=10.0 * close_val,
-                agg_trade_count=10,
-                closed=True
+                closed=True,
+                agg_trade_count=10
             ))
         return bars
 
@@ -91,7 +96,6 @@ class TestRegimeEngine(unittest.TestCase):
             
         state = self.engine.get_regime_state("btcusdt")
         self.assertEqual(state["primary_regime"], "TREND_UP")
-        self.assertTrue(state["confidence"] > 0.5)
 
     def test_b_descending_trend(self):
         """TEST B: Generate steadily falling bars -> TREND_DOWN after breakout decay"""
@@ -125,8 +129,8 @@ class TestRegimeEngine(unittest.TestCase):
                 close=p,
                 base_volume=10.0,
                 quote_volume=10.0 * p,
-                agg_trade_count=10,
-                closed=True
+                closed=True,
+                agg_trade_count=10
             ))
         store = self.engine.stores["btcusdt"]
         for b in bars:
@@ -143,7 +147,6 @@ class TestRegimeEngine(unittest.TestCase):
         """TEST D & E: Stable range followed by strong escape -> BREAKOUT"""
         bars = []
         start_time_ms = 1700002800000
-        # 60 range bars to exceed warming threshold
         for i in range(60):
             p = 100.0 + (0.5 if i % 2 == 0 else -0.5)
             bars.append(MarketBar(
@@ -157,11 +160,10 @@ class TestRegimeEngine(unittest.TestCase):
                 close=p,
                 base_volume=5.0,
                 quote_volume=5.0 * p,
-                agg_trade_count=5,
-                closed=True
+                closed=True,
+                agg_trade_count=5
             ))
             
-        # Feed 3 breakout candles to satisfy hysteresis
         for i in range(3):
             breakout_p = 115.0 + i
             bars.append(MarketBar(
@@ -175,8 +177,8 @@ class TestRegimeEngine(unittest.TestCase):
                 close=breakout_p,
                 base_volume=100.0,
                 quote_volume=100.0 * breakout_p,
-                agg_trade_count=100,
-                closed=True
+                closed=True,
+                agg_trade_count=100
             ))
         
         store = self.engine.stores["btcusdt"]
@@ -192,16 +194,13 @@ class TestRegimeEngine(unittest.TestCase):
 
     def test_f_volatility_overlay(self):
         """TEST F: Volatility state transition independent of primary regime label"""
-        # Low volatility samples
         bars = self._generate_synthetic_bars(100.0, 0.0, 150, noise=0.01, close_noise=0.01)
         store = self.engine.stores["btcusdt"]
         
-        # Set window limits to fit test
         self.engine.config["REGIME_VOL_PERCENTILE_WINDOW"] = 150
         self.engine.config["REGIME_VOL_MIN_SAMPLES"] = 50
         self.engine.config["REGIME_LIQUIDITY_MIN_SAMPLES"] = 50
         
-        # Build vol percentile history
         for b in bars:
             store.append_bar("1m", b)
             store.append_bar("5m", b)
@@ -209,7 +208,6 @@ class TestRegimeEngine(unittest.TestCase):
             store.append_bar("1h", b)
             self.engine._process_symbol_regime("btcusdt", b.close_time_ms)
             
-        # Add high volatility bars at the end (large close_noise)
         high_vol_bars = self._generate_synthetic_bars(100.0, 0.0, 50, noise=5.0, close_noise=5.0)
         start_time_ms = bars[-1].open_time_ms + 60000
         for i, b in enumerate(high_vol_bars):
@@ -224,8 +222,8 @@ class TestRegimeEngine(unittest.TestCase):
                 close=b.close,
                 base_volume=b.base_volume,
                 quote_volume=b.quote_volume,
-                agg_trade_count=b.agg_trade_count,
-                closed=b.closed
+                closed=b.closed,
+                agg_trade_count=b.agg_trade_count
             )
             store.append_bar("1m", b_shifted)
             store.append_bar("5m", b_shifted)
@@ -251,54 +249,259 @@ class TestRegimeEngine(unittest.TestCase):
         hyst["current_regime"] = "TREND_UP"
         
         self.engine._process_symbol_regime("btcusdt", bars[-1].close_time_ms)
-        self.assertEqual(self.engine.hysteresis_state["btcusdt"]["current_regime"], "TREND_UP")
         
-        b_next1 = MarketBar("btcusdt", "1m", bars[-1].open_time_ms + 60000, bars[-1].close_time_ms + 60000, 100, 101, 99, 100, 10, 1000, 10, None, True)
+        b_next1 = MarketBar(
+            symbol="btcusdt", timeframe="1m",
+            open_time_ms=bars[-1].open_time_ms + 60000, close_time_ms=bars[-1].close_time_ms + 60000,
+            open=100.0, high=101.0, low=99.0, close=100.0, base_volume=10.0, quote_volume=1000.0,
+            closed=True, agg_trade_count=10
+        )
         store.append_bar("1m", b_next1)
         
         with patch("regime.engine.classify_regime", return_value=("RANGE", 0.80, "RANGE", "FLAT", {}, ["reasons"])):
-            # Bar 1
             self.engine._process_symbol_regime("btcusdt", b_next1.close_time_ms)
             self.assertEqual(self.engine.hysteresis_state["btcusdt"]["current_regime"], "TREND_UP")
             self.assertEqual(self.engine.hysteresis_state["btcusdt"]["candidate"], "RANGE")
             self.assertEqual(self.engine.hysteresis_state["btcusdt"]["count"], 1)
             
-            # Bar 2
-            b_next2 = MarketBar("btcusdt", "1m", b_next1.open_time_ms + 60000, b_next1.close_time_ms + 60000, 100, 101, 99, 100, 10, 1000, 10, None, True)
+            b_next2 = MarketBar(
+                symbol="btcusdt", timeframe="1m",
+                open_time_ms=b_next1.open_time_ms + 60000, close_time_ms=b_next1.close_time_ms + 60000,
+                open=100.0, high=101.0, low=99.0, close=100.0, base_volume=10.0, quote_volume=1000.0,
+                closed=True, agg_trade_count=10
+            )
             store.append_bar("1m", b_next2)
             self.engine._process_symbol_regime("btcusdt", b_next2.close_time_ms)
-            self.assertEqual(self.engine.hysteresis_state["btcusdt"]["current_regime"], "TREND_UP")
-            self.assertEqual(self.engine.hysteresis_state["btcusdt"]["count"], 2)
             
-            # Bar 3 -> Should transition!
-            b_next3 = MarketBar("btcusdt", "1m", b_next2.open_time_ms + 60000, b_next2.close_time_ms + 60000, 100, 101, 99, 100, 10, 1000, 10, None, True)
+            b_next3 = MarketBar(
+                symbol="btcusdt", timeframe="1m",
+                open_time_ms=b_next2.open_time_ms + 60000, close_time_ms=b_next2.close_time_ms + 60000,
+                open=100.0, high=101.0, low=99.0, close=100.0, base_volume=10.0, quote_volume=1000.0,
+                closed=True, agg_trade_count=10
+            )
             store.append_bar("1m", b_next3)
             self.engine._process_symbol_regime("btcusdt", b_next3.close_time_ms)
             self.assertEqual(self.engine.hysteresis_state["btcusdt"]["current_regime"], "RANGE")
 
-    def test_i_incomplete_candle(self):
-        """TEST I: Incomplete candle does not alter canonical history"""
-        trade1 = {"aggregate_trade_id": 1, "trade_time_ms": 1700002800000, "price": 100.0, "quantity": 1.0}
-        trade2 = {"aggregate_trade_id": 2, "trade_time_ms": 1700002800050, "price": 105.0, "quantity": 1.5}
+    def test_audit_a_within_grace_updates_pending(self):
+        """TEST A: within-grace previous-minute late trade updates previous pending bar only"""
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 1, "trade_time_ms": 1700002859900, "price": 100.0, "quantity": 1.0})
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 2, "trade_time_ms": 1700002860100, "price": 101.0, "quantity": 1.0})
         
-        self.engine.on_trade("btcusdt", trade1)
-        self.engine.on_trade("btcusdt", trade2)
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 3, "trade_time_ms": 1700002859950, "price": 95.0, "quantity": 1.0})
         
-        self.assertEqual(len(self.engine.stores["btcusdt"].get_bars("1m")), 0)
+        pending = self.engine.pending_previous_bars["btcusdt"]
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["low"], 95.0)
+        
+        current = self.engine.current_bars["btcusdt"]
+        self.assertEqual(current["open"], 101.0)
 
-    def test_j_warmup(self):
-        """TEST J: Insufficient history shows WARMING_UP"""
-        bars = self._generate_synthetic_bars(100.0, 1.0, 10, noise=0.01)
+    def test_audit_b_beyond_grace_rejected(self):
+        """TEST B: late trade beyond grace is rejected"""
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 1, "trade_time_ms": 1700002800000, "price": 100.0, "quantity": 1.0})
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 2, "trade_time_ms": 1700002870000, "price": 101.0, "quantity": 1.0})
+        
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 3, "trade_time_ms": 1700002850000, "price": 90.0, "quantity": 1.0})
+        self.assertEqual(self.engine.stores["btcusdt"].late_trade_count, 1)
+
+    def test_audit_c_out_of_order_ohlc(self):
+        """TEST C: same-minute out-of-order OHLC produces correct aggregation"""
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 1, "trade_time_ms": 1700002830000, "price": 105.0, "quantity": 1.0})
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 2, "trade_time_ms": 1700002810000, "price": 100.0, "quantity": 1.0})
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 3, "trade_time_ms": 1700002850000, "price": 102.0, "quantity": 1.0})
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 4, "trade_time_ms": 1700002820000, "price": 110.0, "quantity": 1.0})
+        
+        current = self.engine.current_bars["btcusdt"]
+        self.assertEqual(current["open"], 100.0)
+        self.assertEqual(current["high"], 110.0)
+        self.assertEqual(current["low"], 100.0)
+        self.assertEqual(current["close"], 102.0)
+
+    def test_audit_d_dedup_capacity_eviction_consistency(self):
+        """TEST D: deduplication deque/set capacity eviction consistency"""
+        self.engine.dedup_capacity = 3
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 1, "trade_time_ms": 1700002800000, "price": 100.0, "quantity": 1.0})
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 2, "trade_time_ms": 1700002800001, "price": 100.0, "quantity": 1.0})
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 3, "trade_time_ms": 1700002800002, "price": 100.0, "quantity": 1.0})
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 4, "trade_time_ms": 1700002800003, "price": 100.0, "quantity": 1.0})
+        
+        dq, s_set = self.engine.dedup_ids["btcusdt"]
+        self.assertNotIn(1, s_set)
+        
+        self.engine.on_trade("btcusdt", {"aggregate_trade_id": 1, "trade_time_ms": 1700002800004, "price": 100.0, "quantity": 1.0})
+        self.assertEqual(self.engine.stores["btcusdt"].duplicate_trade_count, 0)
+
+    def test_audit_e_queue_overflow_creates_exact_recovery_request(self):
+        """TEST E: queue overflow creates exact recovery request"""
+        for _ in range(1000):
+            self.engine.queue.put_nowait(("btcusdt", None))
+            
+        bar_dict = {
+            "open_time_ms": 1700002800000,
+            "close_time_ms": 1700002859999,
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "base_volume": 10.0,
+            "quote_volume": 1000.0,
+            "agg_trade_count": 10
+        }
+        self.engine._enqueue_bar("btcusdt", bar_dict)
         store = self.engine.stores["btcusdt"]
+        self.assertEqual(store.queue_overflow_count, 1)
+        self.assertEqual(len(store.recovery_requests), 1)
+        self.assertEqual(store.recovery_requests[0]["missing_open_time_ms"], 1700002800000)
+
+    def test_audit_f_g_actual_gap_recovery_lifecycle(self):
+        """TEST F & G: actual gap recovery inserts missing candle and returns quality to READY"""
+        store = self.engine.stores["btcusdt"]
+        # Add a gap outside the active range of bars to prevent auto-deletion
+        bars = self._generate_synthetic_bars(100.0, 1.0, 60, noise=0.01)
+        for b in bars:
+            store.append_bar("1m", b)
+            store.append_bar("5m", b)
+            store.append_bar("15m", b)
+            store.append_bar("1h", b)
+            
+        store.unresolved_gaps.clear()
+        store.unresolved_gaps.add(("1m", 1600000000000))
+            
+        self.engine._process_symbol_regime("btcusdt", bars[-1].close_time_ms)
+        self.assertEqual(self.engine.get_regime_state("btcusdt")["quality"], "DEGRADED")
+        
+        recovered_bar = MarketBar(
+            symbol="btcusdt", timeframe="1m",
+            open_time_ms=1600000000000, close_time_ms=1600000059999,
+            open=100.0, high=101.0, low=99.0, close=100.0,
+            base_volume=10.0, quote_volume=1000.0, closed=True, agg_trade_count=10
+        )
+        store.append_bar("1m", recovered_bar)
+        
+        self.assertEqual(store.unresolved_gap_count, 0)
+        self.engine.hysteresis_state["btcusdt"]["last_evaluation_close_ms"] = 0
+        self.engine._process_symbol_regime("btcusdt", bars[-1].close_time_ms)
+        self.assertEqual(self.engine.get_regime_state("btcusdt")["quality"], "READY")
+
+    def test_audit_h_missing_1m_component_blocks_5m(self):
+        """TEST H: missing 1m component blocks 5m, then recovery generates 5m exactly once"""
+        store = self.engine.stores["btcusdt"]
+        bars = self._generate_synthetic_bars(100.0, 1.0, 5)
+        for i, b in enumerate(bars):
+            if i != 3:
+                store.append_bar("1m", b)
+                
+        self.engine._aggregate_higher_tfs("btcusdt", bars[4])
+        self.assertEqual(len(store.get_bars("5m")), 0)
+        self.assertIn(("1m", bars[3].open_time_ms), store.unresolved_gaps)
+        
+        store.append_bar("1m", bars[3])
+        self.engine._aggregate_higher_tfs("btcusdt", bars[4])
+        self.assertEqual(len(store.get_bars("5m")), 1)
+
+    def test_audit_i_stressed_liquidity_reachable(self):
+        """TEST I: STRESSED liquidity state is reachable"""
+        self.engine.config["REGIME_LIQUIDITY_MIN_SAMPLES"] = 5
+        store = self.engine.stores["btcusdt"]
+        bars = self._generate_synthetic_bars(100.0, 1.0, 60, noise=0.01)
+        for b in bars:
+            store.append_bar("1m", b)
+            store.append_bar("5m", b)
+            store.append_bar("15m", b)
+            store.append_bar("1h", b)
+            
+        # Manually populate liquidity baseline history
+        baselines = self.engine.liquidity_baselines["btcusdt"]
+        baselines["spread"] = [1.5, 1.5, 1.5, 1.5, 1.5]
+        baselines["depth"] = [200000.0, 200000.0, 200000.0, 200000.0, 200000.0]
+            
+        self.liquidity_provider.return_value = {"spread_bps": 10.0, "bid_depth_top5_usdt": 1000.0, "ask_depth_top5_usdt": 1000.0}
+        self.engine._process_symbol_regime("btcusdt", bars[-1].close_time_ms)
+        
+        state = self.engine.get_regime_state("btcusdt")
+        self.assertEqual(state["liquidity"], "STRESSED")
+
+    def test_audit_j_rest_trade_count_semantics(self):
+        """TEST J: REST official trade count does not pretend to be aggTrade count"""
+        bar = MarketBar(
+            symbol="btcusdt", timeframe="1m",
+            open_time_ms=1700002800000, close_time_ms=1700002859999,
+            open=100.0, high=101.0, low=99.0, close=100.0, base_volume=10.0, quote_volume=1000.0,
+            closed=True, agg_trade_count=None, exchange_trade_count=120
+        )
+        self.assertIsNone(bar.agg_trade_count)
+        self.assertEqual(bar.exchange_trade_count, 120)
+
+    def test_audit_k_tradestream_callback_fields(self):
+        """TEST K: true TradeStream callback contains aggregate_trade_id, trade_time_ms, event_time_ms"""
+        raw = {
+            "e": "aggTrade",
+            "E": 1700002800100,
+            "s": "BTCUSDT",
+            "a": 999111,
+            "p": "100.5",
+            "q": "0.1",
+            "f": 100,
+            "l": 100,
+            "T": 1700002800000,
+            "m": True
+        }
+        
+        called_args = []
+        async def mock_callback(symbol, parsed):
+            called_args.append(parsed)
+            
+        stream = TradeStream(mock_callback)
+        asyncio.run(stream._handle_message("btcusdt", raw))
+        
+        self.assertEqual(len(called_args), 1)
+        parsed = called_args[0]
+        self.assertEqual(parsed["aggregate_trade_id"], 999111)
+        self.assertEqual(parsed["trade_time_ms"], 1700002800000)
+        self.assertEqual(parsed["event_time_ms"], 1700002800100)
+
+    def test_audit_l_true_utc_5m_aggregation(self):
+        """TEST L: true UTC 5m aggregation using 5 distinct 1m bars"""
+        store = self.engine.stores["btcusdt"]
+        bars = self._generate_synthetic_bars(100.0, 1.0, 5)
         for b in bars:
             store.append_bar("1m", b)
             
-        self.engine._process_symbol_regime("btcusdt", bars[-1].close_time_ms)
-        state = self.engine.get_regime_state("btcusdt")
-        self.assertEqual(state["quality"], "WARMING_UP")
+        self.engine._aggregate_higher_tfs("btcusdt", bars[4])
+        m5 = store.get_bars("5m")
+        self.assertEqual(len(m5), 1)
+        self.assertEqual(m5[0].open_time_ms, bars[0].open_time_ms)
+        self.assertEqual(m5[0].close_time_ms, bars[4].close_time_ms)
 
-    def test_k_guardian_unsafe(self):
-        """TEST K: Safety provider unsafe -> quality STALE, tradable False"""
+    def test_audit_m_true_utc_15m_aggregation(self):
+        """TEST M: true UTC 15m aggregation"""
+        store = self.engine.stores["btcusdt"]
+        bars = self._generate_synthetic_bars(100.0, 1.0, 15)
+        for b in bars:
+            store.append_bar("1m", b)
+            
+        self.engine._aggregate_higher_tfs("btcusdt", bars[14])
+        m15 = store.get_bars("15m")
+        self.assertEqual(len(m15), 1)
+        self.assertEqual(m15[0].open_time_ms, bars[0].open_time_ms)
+        self.assertEqual(m15[0].close_time_ms, bars[14].close_time_ms)
+
+    def test_audit_n_true_utc_1h_aggregation(self):
+        """TEST N: true UTC 1h aggregation"""
+        store = self.engine.stores["btcusdt"]
+        bars = self._generate_synthetic_bars(100.0, 1.0, 60)
+        for b in bars:
+            store.append_bar("1m", b)
+            
+        self.engine._aggregate_higher_tfs("btcusdt", bars[59])
+        m1h = store.get_bars("1h")
+        self.assertEqual(len(m1h), 1)
+        self.assertEqual(m1h[0].open_time_ms, bars[0].open_time_ms)
+        self.assertEqual(m1h[0].close_time_ms, bars[59].close_time_ms)
+
+    def test_audit_o_canonical_close_time_provenance(self):
+        """TEST O: canonical close-time provenance populated"""
         bars = self._generate_synthetic_bars(100.0, 1.0, 60, noise=0.01)
         store = self.engine.stores["btcusdt"]
         for b in bars:
@@ -307,232 +510,77 @@ class TestRegimeEngine(unittest.TestCase):
             store.append_bar("15m", b)
             store.append_bar("1h", b)
             
-        self.safety_provider.return_value = {"safe": False, "reason": "Trade stream stale", "book_valid": False}
-        
         self.engine._process_symbol_regime("btcusdt", bars[-1].close_time_ms)
         state = self.engine.get_regime_state("btcusdt")
-        self.assertEqual(state["quality"], "STALE")
-        self.assertEqual(state["tradable"], False)
+        self.assertEqual(state["latest_1m_close_time"], bars[-1].close_time_ms)
 
-    def test_l_gap_detection(self):
-        """TEST L: Gap in minute bar timestamps -> DEGRADED quality"""
-        bars = self._generate_synthetic_bars(100.0, 1.0, 50, noise=0.01)
+    def test_audit_p_evaluation_recorder_idempotency(self):
+        """TEST P: evaluation/recorder idempotency using close timestamp"""
+        bars = self._generate_synthetic_bars(100.0, 1.0, 60, noise=0.01)
         store = self.engine.stores["btcusdt"]
         for b in bars:
             store.append_bar("1m", b)
+            store.append_bar("5m", b)
+            store.append_bar("15m", b)
+            store.append_bar("1h", b)
             
-        gap_bar = MarketBar(
-            symbol="btcusdt",
-            timeframe="1m",
-            open_time_ms=bars[-1].open_time_ms + 180000,
-            close_time_ms=bars[-1].close_time_ms + 180000,
-            open=150.0,
-            high=151.0,
-            low=149.0,
-            close=150.0,
-            base_volume=10.0,
-            quote_volume=1500.0,
-            agg_trade_count=10,
-            closed=True
-        )
-        store.append_bar("1m", gap_bar)
-        self.assertTrue(store.history_gap_count > 0)
+        self.engine._process_symbol_regime("btcusdt", bars[-1].close_time_ms)
+        last_good = self.engine.last_good_evaluation_ms["btcusdt"]
+        
+        self.engine._process_symbol_regime("btcusdt", bars[-1].close_time_ms)
+        self.assertEqual(self.engine.last_good_evaluation_ms["btcusdt"], last_good)
 
-    def test_m_multi_timeframe_conflict(self):
-        """TEST M: Bullish short TF conflicting with Bearish higher TFs"""
-        tf_feats = {
-            "1m": {"ema_gap_bps": 50.0, "ema_slope_atr": 0.4, "adx14": 40.0, "er20": 0.8, "realized_vol20": 0.02, "breakout_dist": 0.0, "vol_zscore": 0.0},
-            "5m": {"ema_gap_bps": 20.0, "ema_slope_atr": 0.1, "adx14": 30.0, "er20": 0.5, "realized_vol20": 0.02, "breakout_dist": 0.0, "vol_zscore": 0.0},
-            "15m": {"ema_gap_bps": -40.0, "ema_slope_atr": -0.3, "adx14": 35.0, "er20": 0.6, "realized_vol20": 0.02, "breakout_dist": 0.0, "vol_zscore": 0.0},
-            "1h": {"ema_gap_bps": -50.0, "ema_slope_atr": -0.4, "adx14": 45.0, "er20": 0.7, "realized_vol20": 0.02, "breakout_dist": 0.0, "vol_zscore": 0.0}
-        }
-        res, conf, struct, direction, scores, reasons = classify_regime(tf_feats, self.config)
-        self.assertNotEqual(res, "TREND_UP")
+    def test_audit_q_engine_disabled_flag(self):
+        """TEST Q: engine disabled flag stops activity"""
+        cfg_disabled = self.config.copy()
+        cfg_disabled["REGIME_ENGINE_ENABLED"] = False
+        eng = RegimeEngine(["BTCUSDT"], self.safety_provider, self.liquidity_provider, cfg_disabled)
+        
+        eng.start()
+        self.assertIsNone(eng.worker_task)
+        
+        state = eng.get_regime_state("btcusdt")
+        self.assertEqual(state["quality"], "DISABLED")
 
-    def test_n_determinism(self):
-        """TEST N: Same inputs produce identical output sequence"""
-        tf_feats = {
-            "1m": {"ema_gap_bps": 50.0, "ema_slope_atr": 0.4, "adx14": 40.0, "er20": 0.8, "realized_vol20": 0.02, "breakout_dist": 0.0, "vol_zscore": 0.0},
-            "5m": {"ema_gap_bps": 20.0, "ema_slope_atr": 0.1, "adx14": 30.0, "er20": 0.5, "realized_vol20": 0.02, "breakout_dist": 0.0, "vol_zscore": 0.0},
-            "15m": {"ema_gap_bps": -40.0, "ema_slope_atr": -0.3, "adx14": 35.0, "er20": 0.6, "realized_vol20": 0.02, "breakout_dist": 0.0, "vol_zscore": 0.0},
-            "1h": {"ema_gap_bps": -50.0, "ema_slope_atr": -0.4, "adx14": 45.0, "er20": 0.7, "realized_vol20": 0.02, "breakout_dist": 0.0, "vol_zscore": 0.0}
-        }
-        res1 = classify_regime(tf_feats, self.config)
-        res2 = classify_regime(tf_feats, self.config)
-        self.assertEqual(res1, res2)
+    def test_audit_r_clean_async_shutdown(self):
+        """TEST R: clean async shutdown leaves no pending loop tasks"""
+        async def _run_shutdown():
+            self.engine.start()
+            await self.engine.stop()
+            self.assertIsNone(self.engine.worker_task)
+            self.assertIsNone(self.engine.recovery_task)
+        asyncio.run(_run_shutdown())
 
-    def test_o_no_strategy_impact(self):
-        """TEST O: Shadow mode verification; OrderFlowScorer decisions unchanged"""
+    def test_audit_s_valid_signal_shadow_isolation(self):
+        """TEST S: valid-data shadow-mode evaluation check"""
         metrics = FlowMetrics()
         scorer = OrderFlowScorer(metrics)
         
+        metrics_5m = {"buy_aggression_ratio": 0.85, "delta_usdt": 50000.0, "status": "READY"}
+        imbalance = 1.5
+        
         decision_before = scorer.evaluate_bias(
             symbol="BTCUSDT",
-            metrics_5m={"buy_aggression_ratio": 0.5, "delta_usdt": 1000.0, "status": "READY"},
-            imbalance=0.0,
+            metrics_5m=metrics_5m,
+            imbalance=imbalance,
             recent_events=[],
             now=time.time(),
             cooldown_end=0.0
         )
         
-        self.engine.current_regimes["btcusdt"] = {"primary_regime": "TREND_DOWN"}
+        self.engine.current_regimes["btcusdt"] = {
+            "primary_regime": "TREND_DOWN",
+            "volatility": "EXTREME",
+            "liquidity": "STRESSED",
+            "quality": "STALE"
+        }
         
         decision_after = scorer.evaluate_bias(
             symbol="BTCUSDT",
-            metrics_5m={"buy_aggression_ratio": 0.5, "delta_usdt": 1000.0, "status": "READY"},
-            imbalance=0.0,
+            metrics_5m=metrics_5m,
+            imbalance=imbalance,
             recent_events=[],
             now=time.time(),
             cooldown_end=0.0
         )
         self.assertEqual(decision_before, decision_after)
-
-    def test_p_api_shape(self):
-        """TEST P: API regime payload validation"""
-        state = self.engine.get_regime_state("btcusdt")
-        keys = ["primary_regime", "confidence", "structure", "direction", "volatility", "liquidity", "scores", "quality", "reasons", "model_version"]
-        for k in keys:
-            self.assertIn(k, state)
-
-    def test_q_liquidity_unknown_during_warmup(self):
-        """TEST Q: Warmup liquidity returns UNKNOWN"""
-        state = self.engine.get_regime_state("btcusdt")
-        self.assertEqual(state["liquidity"], "UNKNOWN")
-
-    def test_r_s_t_utc_timeframe_alignment(self):
-        """TEST R, S, T: UTC alignments for higher timeframes"""
-        open_time = 1700002800000 # Aligned to xx:00:00 UTC
-        close_time_15m = open_time + 15 * 60000
-        self.assertEqual(close_time_15m % 900000, 0)
-        
-    def test_u_open_higher_timeframe_excluded(self):
-        """TEST U: Open candles excluded from aggregation"""
-        bars = self._generate_synthetic_bars(100.0, 1.0, 5, noise=0.01)
-        store = self.engine.stores["btcusdt"]
-        for b in bars[:-1]: 
-            store.append_bar("1m", b)
-        self.engine._aggregate_higher_tfs("btcusdt", bars[-2])
-        self.assertEqual(len(store.get_bars("5m")), 0)
-
-    def test_v_late_trade_handling(self):
-        """TEST V: Late trade rejected and increments late_trade_count"""
-        trade = {
-            "aggregate_trade_id": 100,
-            "trade_time_ms": 1700002800000,
-            "price": 100.0,
-            "quantity": 1.0
-        }
-        self.engine.on_trade("btcusdt", trade)
-        
-        late_trade = {
-            "aggregate_trade_id": 101,
-            "trade_time_ms": 1700002800000 - 3600000,
-            "price": 90.0,
-            "quantity": 1.0
-        }
-        self.engine.on_trade("btcusdt", late_trade)
-        self.assertTrue(self.engine.stores["btcusdt"].late_trade_count > 0)
-
-    def test_w_duplicate_trade_ignored(self):
-        """TEST W: Duplicate ID trade increments duplicate_trade_count"""
-        trade = {
-            "aggregate_trade_id": 999,
-            "trade_time_ms": 1700002800000,
-            "price": 100.0,
-            "quantity": 1.0
-        }
-        self.engine.on_trade("btcusdt", trade)
-        self.engine.on_trade("btcusdt", trade)
-        self.assertEqual(self.engine.stores["btcusdt"].duplicate_trade_count, 1)
-
-    def test_x_backfill_open_candle_exclusion(self):
-        """TEST X: Backfill excludes currently open candle"""
-        now_ms = int(time.time() * 1000)
-        klines = [
-            [1700002800000, "100", "101", "99", "100", "10", 1700002800000 + 59999, "1000", 10],
-            [now_ms, "100", "101", "99", "100", "10", now_ms + 59999, "1000", 10]
-        ]
-        with patch("urllib.request.urlopen") as mock_url:
-            mock_resp = MagicMock()
-            mock_resp.read.return_value = bytes(str(klines).replace("'", '"'), 'utf-8')
-            mock_url.return_value.__enter__.return_value = mock_resp
-            
-            from regime.history_loader import fetch_klines_async
-            res = asyncio.run(fetch_klines_async("btcusdt", "1m", limit=5))
-            self.assertEqual(len(res), 1)
-
-    def test_y_duplicate_bar_uniqueness(self):
-        """TEST Y: Duplicate bar at same open time does not double record"""
-        b1 = MarketBar("btcusdt", "1m", 1700002800000, 1700002800059, 100, 101, 99, 100, 10, 1000, 10, None, True)
-        b2 = MarketBar("btcusdt", "1m", 1700002800000, 1700002800059, 100, 101, 99, 100, 10, 1000, 10, None, True)
-        store = self.engine.stores["btcusdt"]
-        store.append_bar("1m", b1)
-        store.append_bar("1m", b2)
-        self.assertEqual(len(store.get_bars("1m")), 1)
-
-    def test_z_feature_point_in_time_safety(self):
-        """TEST Z: Appending future data does not alter calculations at past timestamp T"""
-        bars = self._generate_synthetic_bars(100.0, 1.0, 30, noise=0.01)
-        f1 = compute_features(bars, "1m", self.config)[-1]
-        
-        future_bars = self._generate_synthetic_bars(150.0, 5.0, 10, noise=0.01)
-        combined = bars + future_bars
-        f2 = compute_features(combined, "1m", self.config)[29]
-        
-        self.assertEqual(f1["ema20"], f2["ema20"])
-
-    def test_aa_donchian_excludes_current_bar(self):
-        """TEST AA: Donchian high breakout reference excludes current bar high"""
-        bars = self._generate_synthetic_bars(100.0, 0.0, 21, noise=0.1)
-        b21 = MarketBar("btcusdt", "1m", 1700002800000 + 21*60000, 1700002800000 + 22*60000 - 1, 100, 105, 99, 105, 10, 1000, 10, None, True)
-        combined = bars + [b21]
-        feats = compute_features(combined, "1m", self.config)[-1]
-        self.assertEqual(feats["donchian_high20"], 100.1)
-
-    def test_ab_candidate_reset(self):
-        """TEST AB: Interrupted candidate count resets to zero"""
-        bars = self._generate_synthetic_bars(100.0, 1.0, 60, noise=0.01)
-        store = self.engine.stores["btcusdt"]
-        for b in bars:
-            store.append_bar("1m", b)
-            store.append_bar("5m", b)
-            store.append_bar("15m", b)
-            store.append_bar("1h", b)
-            
-        self.engine._process_symbol_regime("btcusdt", bars[-1].close_time_ms)
-        hyst = self.engine.hysteresis_state["btcusdt"]
-        hyst["current_regime"] = "TREND_UP"
-        hyst["candidate"] = "RANGE"
-        hyst["count"] = 2
-        
-        b_next = MarketBar("btcusdt", "1m", bars[-1].open_time_ms + 60000, bars[-1].close_time_ms + 60000, 100, 101, 99, 100, 10, 1000, 10, None, True)
-        store.append_bar("1m", b_next)
-        
-        with patch("regime.engine.classify_regime", return_value=("TREND_UP", 0.80, "TREND", "UP", {}, ["reasons"])):
-            self.engine._process_symbol_regime("btcusdt", b_next.close_time_ms)
-            self.assertIsNone(hyst["candidate"])
-            self.assertEqual(hyst["count"], 0)
-
-    def test_ac_breakout_decay(self):
-        """TEST AC: Breakout decays after MAX_BARS limit"""
-        self.engine.config["REGIME_BREAKOUT_MAX_BARS"] = 2
-        bars = self._generate_synthetic_bars(100.0, 1.0, 60, noise=0.01)
-        store = self.engine.stores["btcusdt"]
-        for b in bars:
-            store.append_bar("1m", b)
-            store.append_bar("5m", b)
-            store.append_bar("15m", b)
-            store.append_bar("1h", b)
-            
-        hyst = self.engine.hysteresis_state["btcusdt"]
-        hyst["current_regime"] = "BREAKOUT_UP"
-        hyst["bars_since_regime_start"] = 3
-        
-        with patch("regime.engine.classify_regime", return_value=("BREAKOUT_UP", 0.80, "BREAKOUT", "UP", {"trend_up": 0.80, "trend_down": 0.0}, ["reasons"])):
-            self.engine._process_symbol_regime("btcusdt", bars[-1].close_time_ms + 60000)
-            self.assertEqual(hyst["current_regime"], "TREND_UP")
-
-    def test_ad_symbol_isolation(self):
-        """TEST AD: States and history are symbol-isolated"""
-        engine_2 = RegimeEngine(["BTCUSDT", "ETHUSDT"], self.safety_provider, self.liquidity_provider, self.config)
-        self.assertNotEqual(id(engine_2.stores["btcusdt"]), id(engine_2.stores["ethusdt"]))

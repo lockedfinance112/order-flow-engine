@@ -725,7 +725,8 @@ class OrderFlowEngine:
                 rec.start()
 
         # Start TICS Regime Engine
-        self.regime_engine.start()
+        if self.regime_engine.enabled:
+            self.regime_engine.start()
 
         await self.stream.start()
         await self.depth_stream.start()
@@ -744,7 +745,8 @@ class OrderFlowEngine:
             logger.info("Order Flow Engine stopped.")
         finally:
             # Stop TICS Regime Engine
-            self.regime_engine.stop()
+            if self.regime_engine.enabled:
+                await self.regime_engine.stop()
 
             if config.RECORDING_ENABLED:
                 for rec in self.recorders.values():

@@ -16,6 +16,6 @@ class MarketBar:
 
     base_volume: float
     quote_volume: float
-    agg_trade_count: int
     closed: bool
+    agg_trade_count: Optional[int] = None
     exchange_trade_count: Optional[int] = None
