@@ -288,7 +288,9 @@ class RegimeEngine:
                 "symbol": symbol,
                 "timeframe": "1m",
                 "missing_open_time_ms": bar_dict["open_time_ms"],
-                "reason": "QUEUE_OVERFLOW"
+                "reason": "QUEUE_OVERFLOW",
+                "attempts": 0,
+                "last_attempt_time": 0.0
             })
             store.unresolved_gaps.add(("1m", bar_dict["open_time_ms"]))
             logger.error(f"[{symbol.upper()}] Queue full! Registered recovery request for {bar_dict['open_time_ms']}.")
@@ -332,13 +334,6 @@ class RegimeEngine:
 
     async def _recovery_loop(self):
         """Asynchronous background loop resolving gaps from Binance Futures API."""
-        from regime.history_loader import fetch_klines_async
-        interval_ms = {
-            "1m": 60000,
-            "5m": 300000,
-            "15m": 900000,
-            "1h": 3600000
-        }
         while True:
             try:
                 await asyncio.sleep(5.0)
@@ -347,93 +342,159 @@ class RegimeEngine:
                     if not store.recovery_requests:
                         continue
                         
-                    req = store.recovery_requests.pop(0)
-                    tf = req["timeframe"]
-                    open_ms = req["missing_open_time_ms"]
+                    now = time.time()
+                    pending_requests = []
+                    to_process = None
                     
-                    try:
-                        bars = await fetch_klines_async(
-                            symbol=symbol,
-                            timeframe=tf,
-                            start_time_ms=open_ms,
-                            end_time_ms=open_ms + interval_ms[tf] - 1
-                        )
-                        for bar in bars:
-                            store.append_bar(tf, bar)
+                    for req in store.recovery_requests:
+                        backoff = min(2.0 * req.get("attempts", 0), 30.0)
+                        if now - req.get("last_attempt_time", 0.0) >= backoff:
+                            if to_process is None:
+                                to_process = req
+                            else:
+                                pending_requests.append(req)
+                        else:
+                            pending_requests.append(req)
                             
-                        # If a 1m bar was recovered, trigger re-evaluation of higher TFs
-                        if tf == "1m" and bars:
-                            self._aggregate_higher_tfs(symbol, bars[0])
-                    except Exception as err:
-                        logger.warning(f"[{symbol.upper()}] Gap recovery failed for {open_ms}: {err}")
-                        # Put request back
-                        store.recovery_requests.append(req)
+                    if to_process:
+                        success = await self._process_one_recovery_request(symbol, to_process)
+                        if not success:
+                            pending_requests.append(to_process)
+                        store.recovery_requests = pending_requests
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in recovery loop: {e}")
                 await asyncio.sleep(5.0)
 
-    def _aggregate_higher_tfs(self, symbol: str, new_1m_bar: MarketBar):
-        store = self.stores[symbol]
-        m1_bars = store.get_bars("1m")
+    async def _process_one_recovery_request(self, symbol: str, req: Dict[str, Any]) -> bool:
+        """
+        Attempts to resolve one recovery request.
+        Returns True if resolved and successfully fetched, False otherwise.
+        """
+        from regime.history_loader import fetch_klines_async
+        interval_ms = {
+            "1m": 60000,
+            "5m": 300000,
+            "15m": 900000,
+            "1h": 3600000
+        }
         
-        def aggregate_components(open_time_ms: int, count: int, tf: str) -> Optional[MarketBar]:
-            components = [b for b in m1_bars if open_time_ms <= b.open_time_ms < open_time_ms + (count * 60000)]
-            if len(components) < count:
-                # Add component recovery request
-                expected_times = set(open_time_ms + i * 60000 for i in range(count))
-                existing_times = set(b.open_time_ms for b in components)
-                missing_times = expected_times - existing_times
-                
-                for t in missing_times:
-                    if not any(req["missing_open_time_ms"] == t and req["timeframe"] == "1m" for req in store.recovery_requests):
-                        store.recovery_requests.append({
-                            "symbol": symbol,
-                            "timeframe": "1m",
-                            "missing_open_time_ms": t,
-                            "reason": "HIGHER_TF_COMPONENT_MISSING"
-                        })
-                        store.unresolved_gaps.add(("1m", t))
-                return None
-                
-            open_val = components[0].open
-            high_val = max(b.high for b in components)
-            low_val = min(b.low for b in components)
-            close_val = components[-1].close
-            base_vol = sum(b.base_volume for b in components)
-            quote_vol = sum(b.quote_volume for b in components)
-            
-            return MarketBar(
+        store = self.stores[symbol]
+        tf = req["timeframe"]
+        open_ms = req["missing_open_time_ms"]
+        
+        req["attempts"] = req.get("attempts", 0) + 1
+        req["last_attempt_time"] = time.time()
+        
+        try:
+            bars = await fetch_klines_async(
                 symbol=symbol,
                 timeframe=tf,
-                open_time_ms=open_time_ms,
-                close_time_ms=open_time_ms + (count * 60000) - 1,
-                open=open_val,
-                high=high_val,
-                low=low_val,
-                close=close_val,
-                base_volume=base_vol,
-                quote_volume=quote_vol,
-                closed=True
+                start_time_ms=open_ms,
+                end_time_ms=open_ms + interval_ms[tf] - 1
             )
+            
+            matching_bar = None
+            for b in bars:
+                if b.open_time_ms == open_ms:
+                    matching_bar = b
+                    break
+                    
+            if matching_bar:
+                store.append_bar(tf, matching_bar)
+                store.unresolved_gaps.discard((tf, open_ms))
+                
+                if tf == "1m":
+                    self._rebuild_parent_timeframes_for_1m(symbol, open_ms)
+                return True
+                
+        except Exception as err:
+            logger.warning(f"[{symbol.upper()}] Recovery fetch error for {open_ms}: {err}")
+            
+        return False
 
+    def _try_build_parent(self, symbol: str, timeframe: str, parent_open_ms: int, expected_components: int) -> Optional[MarketBar]:
+        """
+        Attempts construction of a parent bar from 1m components.
+        Enqueues recovery requests for missing pieces.
+        """
+        store = self.stores[symbol]
+        m1_bars = store.get_bars("1m")
+        components = [b for b in m1_bars if parent_open_ms <= b.open_time_ms < parent_open_ms + (expected_components * 60000)]
+        
+        if len(components) < expected_components:
+            expected_times = set(parent_open_ms + i * 60000 for i in range(expected_components))
+            existing_times = set(b.open_time_ms for b in components)
+            missing_times = expected_times - existing_times
+            
+            for t in missing_times:
+                if not any(req["missing_open_time_ms"] == t and req["timeframe"] == "1m" for req in store.recovery_requests):
+                    store.recovery_requests.append({
+                        "symbol": symbol,
+                        "timeframe": "1m",
+                        "missing_open_time_ms": t,
+                        "reason": "HIGHER_TF_COMPONENT_MISSING",
+                        "attempts": 0,
+                        "last_attempt_time": 0.0
+                    })
+                    store.unresolved_gaps.add(("1m", t))
+            return None
+
+        open_val = components[0].open
+        high_val = max(b.high for b in components)
+        low_val = min(b.low for b in components)
+        close_val = components[-1].close
+        base_vol = sum(b.base_volume for b in components)
+        quote_vol = sum(b.quote_volume for b in components)
+        
+        return MarketBar(
+            symbol=symbol,
+            timeframe=timeframe,
+            open_time_ms=parent_open_ms,
+            close_time_ms=parent_open_ms + (expected_components * 60000) - 1,
+            open=open_val,
+            high=high_val,
+            low=low_val,
+            close=close_val,
+            base_volume=base_vol,
+            quote_volume=quote_vol,
+            closed=True
+        )
+
+    def _rebuild_parent_timeframes_for_1m(self, symbol: str, recovered_open_ms: int):
+        """Rebuilds parent timeframes when an interior 1m bar is recovered."""
+        intervals = {
+            "5m": (300000, 5),
+            "15m": (900000, 15),
+            "1h": (3600000, 60)
+        }
+        store = self.stores[symbol]
+        for tf, (span_ms, count) in intervals.items():
+            parent_open_ms = (recovered_open_ms // span_ms) * span_ms
+            parent_bar = self._try_build_parent(symbol, tf, parent_open_ms, count)
+            if parent_bar:
+                store.append_bar(tf, parent_bar)
+
+    def _aggregate_higher_tfs(self, symbol: str, new_1m_bar: MarketBar):
+        store = self.stores[symbol]
         close_time = new_1m_bar.open_time_ms + 60000
+        
         if close_time % 300000 == 0:
             m5_open = close_time - 300000
-            m5_bar = aggregate_components(m5_open, 5, "5m")
+            m5_bar = self._try_build_parent(symbol, "5m", m5_open, 5)
             if m5_bar:
                 store.append_bar("5m", m5_bar)
 
         if close_time % 900000 == 0:
             m15_open = close_time - 900000
-            m15_bar = aggregate_components(m15_open, 15, "15m")
+            m15_bar = self._try_build_parent(symbol, "15m", m15_open, 15)
             if m15_bar:
                 store.append_bar("15m", m15_bar)
 
         if close_time % 3600000 == 0:
             m1h_open = close_time - 3600000
-            m1h_bar = aggregate_components(m1h_open, 60, "1h")
+            m1h_bar = self._try_build_parent(symbol, "1h", m1h_open, 60)
             if m1h_bar:
                 store.append_bar("1h", m1h_bar)
 
@@ -461,6 +522,44 @@ class RegimeEngine:
         bars_15m = store.get_bars("15m")
         bars_1h = store.get_bars("1h")
         
+        # Freeze canonical regime mutation if gaps exist
+        if store.unresolved_gap_count > 0:
+            hyst = self.hysteresis_state[symbol]
+            self.current_regimes[symbol] = {
+                "symbol": symbol.upper(),
+                "quality": "DEGRADED",
+                "tradable": False,
+                "primary_regime": hyst["current_regime"],
+                "confidence": self.current_regimes.get(symbol, {}).get("confidence", 0.0),
+                "structure": self.current_regimes.get(symbol, {}).get("structure", "UNKNOWN"),
+                "direction": self.current_regimes.get(symbol, {}).get("direction", "UNKNOWN"),
+                "volatility": self.current_regimes.get(symbol, {}).get("volatility", "UNKNOWN"),
+                "liquidity": self.current_regimes.get(symbol, {}).get("liquidity", "UNKNOWN"),
+                "scores": self.current_regimes.get(symbol, {}).get("scores", {}),
+                "persistence_bars": hyst["bars_since_regime_start"],
+                "regime_since_ms": hyst["regime_since_ms"],
+                "candidate_regime": hyst["candidate"],
+                "candidate_count": hyst["count"],
+                "reasons": ["Unresolved gaps in historical closed bars"],
+                "model_version": self.model_version,
+                "permissions": permissions_for(hyst["current_regime"]),
+                "latest_1m_close_time": bars_1m[-1].close_time_ms if bars_1m else 0,
+                "latest_5m_close_time": bars_5m[-1].close_time_ms if bars_5m else 0,
+                "latest_15m_close_time": bars_15m[-1].close_time_ms if bars_15m else 0,
+                "latest_1h_close_time": bars_1h[-1].close_time_ms if bars_1h else 0,
+                "history_gap_count": store.history_gap_count,
+                "unresolved_gap_count": store.unresolved_gap_count,
+                "late_trade_count": store.late_trade_count,
+                "duplicate_trade_count": store.duplicate_trade_count,
+                "queue_overflow_count": store.queue_overflow_count,
+                "reconciliation_mismatch_count": store.reconciliation_mismatch_count,
+                "feature_version": self.feature_version,
+                "transition_risk": self.current_regimes.get(symbol, {}).get("transition_risk", 0.0),
+                "backfill_state": self.backfill_states.get(symbol, "NOT_STARTED"),
+                "queue_depth": self.queue.qsize()
+            }
+            return
+
         if len(bars_1m) < 50 or len(bars_5m) < 21 or len(bars_15m) < 21 or len(bars_1h) < 21:
             self.current_regimes[symbol] = {
                 "symbol": symbol.upper(),
@@ -473,7 +572,7 @@ class RegimeEngine:
             }
             return
 
-        # Calculate features (Pure functions) - VOLATILITY prefix recalculation removed!
+        # Calculate features (Pure functions)
         features_1m = compute_features(bars_1m, "1m", self.config)
         features_5m = compute_features(bars_5m, "5m", self.config)
         features_15m = compute_features(bars_15m, "15m", self.config)
@@ -492,8 +591,6 @@ class RegimeEngine:
         # 3. Volatility Overlay
         vol_window = self.config.get("REGIME_VOL_PERCENTILE_WINDOW", 200)
         min_vol_samples = self.config.get("REGIME_VOL_MIN_SAMPLES", 100)
-        
-        # Bounded O(N) extraction of vol percentile values
         vol_samples = [f.get("realized_vol20") for f in features_15m if f.get("realized_vol20") is not None][-vol_window:]
         
         vol_regime = "UNKNOWN"
@@ -536,7 +633,6 @@ class RegimeEngine:
             med_spread = sorted_spreads[len(sorted_spreads) // 2]
             med_depth = sorted_depths[len(sorted_depths) // 2]
             
-            # Stressed first check order
             if spread_bps > med_spread * 3.0 or depth_usdt < med_depth * 0.2:
                 liq_regime = "STRESSED"
             elif spread_bps > med_spread * 1.5 or depth_usdt < med_depth * 0.5:
@@ -650,7 +746,6 @@ class RegimeEngine:
         if store.unresolved_gap_count > 0:
             quality = "DEGRADED"
 
-        # Transition risk computation
         margin = 0.0
         sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         if len(sorted_scores) > 1:

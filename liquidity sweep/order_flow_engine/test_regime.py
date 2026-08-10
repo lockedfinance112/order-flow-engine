@@ -357,7 +357,6 @@ class TestRegimeEngine(unittest.TestCase):
     def test_audit_f_g_actual_gap_recovery_lifecycle(self):
         """TEST F & G: actual gap recovery inserts missing candle and returns quality to READY"""
         store = self.engine.stores["btcusdt"]
-        # Add a gap outside the active range of bars to prevent auto-deletion
         bars = self._generate_synthetic_bars(100.0, 1.0, 60, noise=0.01)
         for b in bars:
             store.append_bar("1m", b)
@@ -411,7 +410,6 @@ class TestRegimeEngine(unittest.TestCase):
             store.append_bar("15m", b)
             store.append_bar("1h", b)
             
-        # Manually populate liquidity baseline history
         baselines = self.engine.liquidity_baselines["btcusdt"]
         baselines["spread"] = [1.5, 1.5, 1.5, 1.5, 1.5]
         baselines["depth"] = [200000.0, 200000.0, 200000.0, 200000.0, 200000.0]
@@ -584,3 +582,172 @@ class TestRegimeEngine(unittest.TestCase):
             cooldown_end=0.0
         )
         self.assertEqual(decision_before, decision_after)
+
+    # Recovery Finalization Patch targeted tests (1 to 5)
+
+    def test_audit_async_recovery_loop_step(self):
+        """TEST 7: test process one recovery request step asynchronously"""
+        store = self.engine.stores["btcusdt"]
+        bars = self._generate_synthetic_bars(100.0, 1.0, 5)
+        # Skip 12:03 (index 3)
+        for i, b in enumerate(bars):
+            if i != 3:
+                store.append_bar("1m", b)
+                
+        # Register missing request
+        store.unresolved_gaps.add(("1m", bars[3].open_time_ms))
+        req = {
+            "symbol": "btcusdt",
+            "timeframe": "1m",
+            "missing_open_time_ms": bars[3].open_time_ms,
+            "reason": "STREAM_GAP",
+            "attempts": 0,
+            "last_attempt_time": 0.0
+        }
+        store.recovery_requests.append(req)
+        
+        # Mock fetch response returning the exact missing bar
+        with patch("regime.history_loader.fetch_klines_async", return_value=[bars[3]]) as mock_fetch:
+            success = asyncio.run(self.engine._process_one_recovery_request("btcusdt", req))
+            self.assertTrue(success)
+            self.assertEqual(len(store.get_bars("1m")), 5)
+            self.assertNotIn(("1m", bars[3].open_time_ms), store.unresolved_gaps)
+
+    def test_audit_automatic_parent_rebuild(self):
+        """TEST 8: interior 1m recovery automatically rebuilds parent 5m, 15m, 1h bar idempotently"""
+        store = self.engine.stores["btcusdt"]
+        bars = self._generate_synthetic_bars(100.0, 1.0, 5)
+        for i, b in enumerate(bars):
+            if i != 3:
+                store.append_bar("1m", b)
+                
+        # Before recovery: canonical 5m 12:00 is absent
+        self.assertEqual(len(store.get_bars("5m")), 0)
+        
+        # Run recovery for 12:03
+        req = {
+            "symbol": "btcusdt",
+            "timeframe": "1m",
+            "missing_open_time_ms": bars[3].open_time_ms,
+            "reason": "STREAM_GAP"
+        }
+        with patch("regime.history_loader.fetch_klines_async", return_value=[bars[3]]):
+            success = asyncio.run(self.engine._process_one_recovery_request("btcusdt", req))
+            self.assertTrue(success)
+            
+        # After recovering 12:03: parent 5m 12:00 is present
+        self.assertEqual(len(store.get_bars("5m")), 1)
+        
+        # Run reconstruction again -> remains exactly one (idempotent)
+        self.engine._rebuild_parent_timeframes_for_1m("btcusdt", bars[3].open_time_ms)
+        self.assertEqual(len(store.get_bars("5m")), 1)
+
+    def test_audit_empty_response_retry(self):
+        """TEST 9: empty recovery response requeues and increments attempt count"""
+        store = self.engine.stores["btcusdt"]
+        bars = self._generate_synthetic_bars(100.0, 1.0, 5)
+        store.unresolved_gaps.add(("1m", bars[3].open_time_ms))
+        
+        req = {
+            "symbol": "btcusdt",
+            "timeframe": "1m",
+            "missing_open_time_ms": bars[3].open_time_ms,
+            "reason": "STREAM_GAP",
+            "attempts": 0,
+            "last_attempt_time": 0.0
+        }
+        
+        # First attempt: returns empty response
+        with patch("regime.history_loader.fetch_klines_async", return_value=[]):
+            success = asyncio.run(self.engine._process_one_recovery_request("btcusdt", req))
+            self.assertFalse(success)
+            self.assertEqual(req["attempts"], 1)
+            self.assertIn(("1m", bars[3].open_time_ms), store.unresolved_gaps)
+            self.assertEqual(len(store.get_bars("5m")), 0)
+            
+        # Second attempt: returns correct candle
+        for i, b in enumerate(bars):
+            if i != 3:
+                store.append_bar("1m", b)
+        with patch("regime.history_loader.fetch_klines_async", return_value=[bars[3]]):
+            success = asyncio.run(self.engine._process_one_recovery_request("btcusdt", req))
+            self.assertTrue(success)
+            self.assertEqual(req["attempts"], 2)
+            self.assertNotIn(("1m", bars[3].open_time_ms), store.unresolved_gaps)
+            self.assertEqual(len(store.get_bars("5m")), 1)
+
+    def test_audit_wrong_candle_recovery(self):
+        """TEST 10: wrong candle cannot resolve gap"""
+        store = self.engine.stores["btcusdt"]
+        bars = self._generate_synthetic_bars(100.0, 1.0, 5)
+        store.unresolved_gaps.add(("1m", bars[3].open_time_ms))
+        
+        req = {
+            "symbol": "btcusdt",
+            "timeframe": "1m",
+            "missing_open_time_ms": bars[3].open_time_ms,
+            "reason": "STREAM_GAP",
+            "attempts": 0,
+            "last_attempt_time": 0.0
+        }
+        
+        # Returns wrong candle (e.g. index 2)
+        with patch("regime.history_loader.fetch_klines_async", return_value=[bars[2]]):
+            success = asyncio.run(self.engine._process_one_recovery_request("btcusdt", req))
+            self.assertFalse(success)
+            self.assertEqual(req["attempts"], 1)
+            self.assertIn(("1m", bars[3].open_time_ms), store.unresolved_gaps)
+
+    def test_audit_canonical_freeze(self):
+        """TEST 11: unresolved gap freezes canonical regime transitions, persistence, and last_good updates"""
+        store = self.engine.stores["btcusdt"]
+        bars = self._generate_synthetic_bars(100.0, 1.0, 60, noise=0.01)
+        for b in bars:
+            store.append_bar("1m", b)
+            store.append_bar("5m", b)
+            store.append_bar("15m", b)
+            store.append_bar("1h", b)
+            
+        hyst = self.engine.hysteresis_state["btcusdt"]
+        hyst["current_regime"] = "TREND_UP"
+        hyst["bars_since_regime_start"] = 10
+        hyst["last_evaluation_close_ms"] = bars[-1].close_time_ms
+        self.engine.last_good_evaluation_ms["btcusdt"] = 555
+        
+        # Add unresolved gap to freeze mutation
+        store.unresolved_gaps.add(("1m", 1600000000000))
+        
+        # Evaluate regime with new timestamp
+        with patch("regime.engine.classify_regime", return_value=("TREND_DOWN", 0.90, "TREND", "DOWN", {"trend_down": 0.90}, ["reasons"])):
+            self.engine._process_symbol_regime("btcusdt", bars[-1].close_time_ms + 60000)
+            
+            # Assert frozen state
+            state = self.engine.get_regime_state("btcusdt")
+            self.assertEqual(state["primary_regime"], "TREND_UP")
+            self.assertEqual(state["persistence_bars"], 10)
+            self.assertEqual(self.engine.last_good_evaluation_ms["btcusdt"], 555)
+            self.assertEqual(state["quality"], "DEGRADED")
+            self.assertEqual(state["tradable"], False)
+            
+        # Repair the gap
+        store.unresolved_gaps.clear()
+        
+        # Re-evaluate -> classification should resume
+        with patch("regime.engine.classify_regime", return_value=("TREND_DOWN", 0.90, "TREND", "DOWN", {"trend_down": 0.90}, ["reasons"])):
+            # Append new consecutive bar to trigger classification
+            b_new = MarketBar(
+                symbol="btcusdt", timeframe="1m",
+                open_time_ms=bars[-1].open_time_ms + 60000, close_time_ms=bars[-1].close_time_ms + 60000,
+                open=100.0, high=101.0, low=99.0, close=100.0, base_volume=10.0, quote_volume=1000.0,
+                closed=True, agg_trade_count=10
+            )
+            store.append_bar("1m", b_new)
+            self.engine._process_symbol_regime("btcusdt", b_new.close_time_ms)
+            
+            state = self.engine.get_regime_state("btcusdt")
+            # Hysteresis confirm_bars is 3, so first transition TREND_DOWN is candidate
+            self.assertEqual(state["primary_regime"], "TREND_UP")
+            self.assertEqual(state["candidate_regime"], "TREND_DOWN")
+            self.assertEqual(state["candidate_count"], 1)
+            self.assertEqual(state["quality"], "READY")
+            self.assertEqual(state["tradable"], True)
