@@ -35,7 +35,7 @@ DEFAULT_PROTOCOL = {
         "max_age_ms": 90000,
         "mode": "as_of_backward"
     },
-    "allowed_signal_sources": ["RECORDED_DECISION_TRANSITION", "LEGACY_SIGNAL_LOG"],
+    "allowed_signal_sources": ["RECORDED_DECISION_TRANSITION"],
     "dataset_quality_requirements": {
         "allow_gaps": False,
         "check_monotonic": True

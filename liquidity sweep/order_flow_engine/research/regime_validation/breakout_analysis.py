@@ -39,10 +39,10 @@ class BreakoutAnalyzer:
             if atr is None or atr <= 0.0:
                 continue
                 
-            forward_bars = bars_1m[b_idx + 1 : b_idx + 16]
+            forward_bars = bars_1m[b_idx + 1 : b_idx + 61] # Fetch up to 60 bars for 30m and transitions
             closes = [fb.close for fb in forward_bars]
-            max_p = max(fb.high for fb in forward_bars)
-            min_p = min(fb.low for fb in forward_bars)
+            max_p = max(fb.high for fb in forward_bars[:15])
+            min_p = min(fb.low for fb in forward_bars[:15])
             
             entry_close = bar.close
             
@@ -62,17 +62,32 @@ class BreakoutAnalyzer:
             
             outcome = "AMBIGUOUS_BREAKOUT"
             if reg == "BREAKOUT_UP":
-                final_move_atr = (closes[-1] - entry_close) / atr
+                final_move_atr = (closes[14] - entry_close) / atr if len(closes) >= 15 else 0.0
                 if final_move_atr >= 0.50 and not returned_to_range:
                     outcome = "SUCCESSFUL_FOLLOW_THROUGH"
-                elif returned_to_range and (closes[-1] - entry_close) <= 0:
+                elif returned_to_range and (closes[14] - entry_close if len(closes) >= 15 else 0.0) <= 0:
                     outcome = "FAILED_BREAKOUT"
             else:
-                final_move_atr = (entry_close - closes[-1]) / atr
+                final_move_atr = (entry_close - closes[14]) / atr if len(closes) >= 15 else 0.0
                 if final_move_atr >= 0.50 and not returned_to_range:
                     outcome = "SUCCESSFUL_FOLLOW_THROUGH"
-                elif returned_to_range and (entry_close - closes[-1]) <= 0:
+                elif returned_to_range and (entry_close - closes[14] if len(closes) >= 15 else 0.0) <= 0:
                     outcome = "FAILED_BREAKOUT"
+                    
+            # 30m return atr (Requirement 13)
+            ret_30m_atr = 0.0
+            if len(closes) >= 30:
+                ret_30m = closes[29] - entry_close if reg == "BREAKOUT_UP" else entry_close - closes[29]
+                ret_30m_atr = ret_30m / atr
+            
+            # Locate next different canonical regime (Requirement 13)
+            next_reg = "UNKNOWN"
+            time_to_next = -1
+            for f_t in timeline[idx + 1 :]:
+                if f_t.get("primary_regime") != reg:
+                    next_reg = f_t.get("primary_regime", "UNKNOWN")
+                    time_to_next = (f_t.get("latest_1m_close_time", 0) - close_ms) // 60000
+                    break
                     
             results.append({
                 "symbol": t.get("symbol", "").upper(),
@@ -87,11 +102,11 @@ class BreakoutAnalyzer:
                 "time_to_return_inside_range": time_to_return,
                 "max_extension_atr": (max_p - entry_close) / atr if reg == "BREAKOUT_UP" else (entry_close - min_p) / atr,
                 "max_retracement_atr": (entry_close - min_p) / atr if reg == "BREAKOUT_UP" else (max_p - entry_close) / atr,
-                "5m_return_atr": (closes[4] - entry_close) / atr if reg == "BREAKOUT_UP" else (entry_close - closes[4]) / atr if len(closes) >= 5 else 0.0,
-                "15m_return_atr": (closes[14] - entry_close) / atr if reg == "BREAKOUT_UP" else (entry_close - closes[14]) / atr if len(closes) >= 15 else 0.0,
-                "30m_return_atr": 0.0, # optional placeholder
-                "next_canonical_regime": "UNKNOWN", # populated by replay runner if needed
-                "time_to_next_regime": -1
+                "5m_return_atr": (closes[4] - entry_close) / atr if reg == "BREAKOUT_UP" and len(closes) >= 5 else (entry_close - closes[4]) / atr if len(closes) >= 5 else 0.0,
+                "15m_return_atr": (closes[14] - entry_close) / atr if reg == "BREAKOUT_UP" and len(closes) >= 15 else (entry_close - closes[14]) / atr if len(closes) >= 15 else 0.0,
+                "30m_return_atr": ret_30m_atr,
+                "next_canonical_regime": next_reg,
+                "time_to_next_regime": time_to_next
             })
             
         return results

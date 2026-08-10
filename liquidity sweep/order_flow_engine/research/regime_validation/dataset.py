@@ -5,7 +5,7 @@ import urllib.request
 import time
 import hashlib
 from typing import Dict, Any, List, Tuple
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from regime.models import MarketBar
 
@@ -36,6 +36,9 @@ class DatasetManager:
         start_date = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         end_date = datetime.strptime(end_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         
+        warmup_start_date = start_date - datetime.timedelta(days=warmup_days) if hasattr(datetime, "timedelta") else start_date - datetime.timedelta(days=warmup_days)
+        # Using timedelta correctly
+        from datetime import timedelta
         warmup_start_date = start_date - timedelta(days=warmup_days)
         warmup_start_ms = int(warmup_start_date.timestamp() * 1000)
         end_ms = int(end_date.timestamp() * 1000) - 1
@@ -83,8 +86,8 @@ class DatasetManager:
             
         return manifest
 
-    def validate_dataset(self, symbol: str, allow_gaps: bool = False) -> Dict[str, Any]:
-        """Runs strict quality checks on the 1m dataset."""
+    def validate_dataset(self, symbol: str, allow_gaps: bool = False, warmup_start_str: str = "", requested_end_str: str = "") -> Dict[str, Any]:
+        """Runs strict quality checks on the 1m dataset including requested completeness and non-negative volumes."""
         filepath = os.path.join(self.dataset_dir, f"{symbol.lower()}_1m.jsonl.gz")
         
         quality = {
@@ -112,7 +115,6 @@ class DatasetManager:
         # Compute SHA256 of decompressed data
         sha = hashlib.sha256()
         last_open_time = -1
-        bars = []
         
         with gzip.open(filepath, "rt", encoding="utf-8") as f:
             for line in f:
@@ -124,6 +126,8 @@ class DatasetManager:
                 high_val = float(k[2])
                 low_val = float(k[3])
                 close_val = float(k[4])
+                volume_val = float(k[5])
+                quote_volume_val = float(k[7])
                 
                 quality["bar_count"] += 1
                 if quality["bar_count"] == 1:
@@ -154,7 +158,8 @@ class DatasetManager:
                         if not allow_gaps:
                             quality["valid"] = False
 
-                if open_val <= 0 or high_val <= 0 or low_val <= 0 or close_val <= 0:
+                # Validate non-negative volumes and OHLC
+                if open_val <= 0 or high_val <= 0 or low_val <= 0 or close_val <= 0 or volume_val < 0 or quote_volume_val < 0:
                     quality["bad_price_count"] += 1
                     quality["invalid_ohlc_count"] += 1
                     quality["valid"] = False
@@ -166,6 +171,18 @@ class DatasetManager:
                 last_open_time = open_time
 
         quality["content_sha256"] = sha.hexdigest()
+        
+        # Enforce requested dataset completeness (Requirement 4)
+        if warmup_start_str and requested_end_str:
+            warmup_start_dt = datetime.strptime(warmup_start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            requested_end_dt = datetime.strptime(requested_end_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            expected_start_ms = int(warmup_start_dt.timestamp() * 1000)
+            expected_end_ms = int(requested_end_dt.timestamp() * 1000) - 1
+            
+            # Allow 1m tolerance
+            if quality["actual_start_ms"] > expected_start_ms + 60000 or quality["actual_end_ms"] < expected_end_ms - 60000:
+                quality["valid"] = False
+
         quality_path = os.path.join(self.dataset_dir, f"{symbol.lower()}_quality.json")
         with open(quality_path, "w") as f:
             json.dump(quality, f, indent=4)
@@ -207,6 +224,9 @@ class DatasetManager:
         warmup_bars = [b for b in bars if b.open_time_ms < warmup_end_ms]
         eval_bars = [b for b in bars if b.open_time_ms >= warmup_end_ms]
         
+        if not eval_bars:
+            return warmup_bars, [], [], []
+            
         total_eval_duration = eval_bars[-1].open_time_ms - eval_bars[0].open_time_ms
         dev_end_ms = eval_bars[0].open_time_ms + int(total_eval_duration * dev_pct)
         val_end_ms = dev_end_ms + int(total_eval_duration * val_pct)

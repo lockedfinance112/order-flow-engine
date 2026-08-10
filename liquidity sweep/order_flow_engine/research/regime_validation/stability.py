@@ -117,32 +117,42 @@ class StabilityAnalyzer:
 
     @staticmethod
     def analyze_candidates(timeline: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        """Analyzes confirmation and reset rates of candidate regimes."""
-        # Trace candidate shifts
+        """Track candidate episodes sequentially (Requirement 12)."""
         results = {}
-        for t in timeline:
+        
+        # We process symbol timelines to find episodes sequentially
+        current_candidate = None
+        
+        for idx, t in enumerate(timeline):
             cand = t.get("candidate_regime")
-            if not cand or cand == "UNKNOWN":
-                continue
-                
-            results.setdefault(cand, {
-                "observations": 0,
-                "confirmations": 0,
-                "resets": 0
-            })
-            results[cand]["observations"] += 1
+            if cand == "UNKNOWN" or cand == "":
+                cand = None
+            prim = t.get("primary_regime")
             
-            # Check confirmation count
-            cc = t.get("candidate_count", 0)
-            # If cc transitions from high back to 0 or count matches switch
-            if cc >= 3:
-                results[cand]["confirmations"] += 1
-            elif cc == 1:
-                results[cand]["resets"] += 1
+            if current_candidate is not None:
+                # Confirmed if primary regime becomes candidate
+                if prim == current_candidate:
+                    results.setdefault(current_candidate, {"episodes": 0, "confirmed": 0, "reset": 0})
+                    results[current_candidate]["confirmed"] += 1
+                    current_candidate = None
+                # Reset if candidate changes or disappears
+                elif cand != current_candidate:
+                    results.setdefault(current_candidate, {"episodes": 0, "confirmed": 0, "reset": 0})
+                    results[current_candidate]["reset"] += 1
+                    current_candidate = None
+                    
+            if current_candidate is None and cand is not None:
+                current_candidate = cand
+                results.setdefault(cand, {"episodes": 0, "confirmed": 0, "reset": 0})
+                results[cand]["episodes"] += 1
                 
+        if current_candidate is not None:
+            results[current_candidate]["reset"] += 1
+            
+        # Calculate rates
         for cand, metrics in results.items():
-            obs = metrics["observations"]
-            metrics["confirmation_rate"] = metrics["confirmations"] / obs if obs > 0 else 0.0
-            metrics["reset_rate"] = metrics["resets"] / obs if obs > 0 else 0.0
+            eps = metrics["episodes"]
+            metrics["confirmation_rate"] = metrics["confirmed"] / eps if eps > 0 else 0.0
+            metrics["reset_rate"] = metrics["reset"] / eps if eps > 0 else 0.0
             
         return results

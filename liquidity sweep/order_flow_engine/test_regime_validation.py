@@ -254,7 +254,7 @@ class TestRegimeValidation(unittest.TestCase):
         # Prevent any network access
         mock_urlopen.side_effect = Exception("Accidental network access in replay!")
         
-        # Write 5 symbol mock datasets with 50 bars of 1m each
+        # Write 5 symbol mock datasets with 1500 bars of 1m each to exceed 21 hours
         symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
         
         # Save baseline CSV file states to verify no mutations
@@ -263,15 +263,19 @@ class TestRegimeValidation(unittest.TestCase):
         states_exist = os.path.exists(states_path)
         trans_exist = os.path.exists(transitions_path)
         
+        # Hour aligned start time
+        aligned_start = 1700000000000 - (1700000000000 % 3600000)
+        
         for sym in symbols:
             raw_klines = []
-            for i in range(100):
-                # 100 closed bars of 1m
+            for i in range(1500):
+                # 1500 closed bars of 1m
+                p = 100.0 + (i * 0.01)
                 raw_klines.append([
-                    1700000000000 + i * 60000,
-                    100.0 + i, 101.0 + i, 99.0 + i, 100.0 + i,
+                    aligned_start + i * 60000,
+                    p, p + 0.05, p - 0.05, p,
                     10.0,
-                    1700000000000 + (i + 1) * 60000 - 1,
+                    aligned_start + (i + 1) * 60000 - 1,
                     1000.0, 10, 0, 0, 0
                 ])
             self._write_compressed_jsonl(f"{sym.lower()}_1m.jsonl.gz", raw_klines)
@@ -280,12 +284,12 @@ class TestRegimeValidation(unittest.TestCase):
             q_data = {
                 "symbol": sym.upper(),
                 "valid": True,
-                "bar_count": 100,
+                "bar_count": 1500,
                 "content_sha256": "mock_sha",
-                "actual_start_ms": 1700000000000,
-                "actual_end_ms": 1700000000000 + 99 * 60000,
-                "actual_start_utc": "2023-11-14T22:13:20+00:00",
-                "actual_end_utc": "2023-11-14T23:52:20+00:00"
+                "actual_start_ms": aligned_start,
+                "actual_end_ms": aligned_start + 1499 * 60000,
+                "actual_start_utc": "2023-11-14T22:00:00+00:00",
+                "actual_end_utc": "2023-11-15T22:59:00+00:00"
             }
             with open(os.path.join(self.tmp_dir, f"{sym.lower()}_quality.json"), "w") as f:
                 json.dump(q_data, f)
@@ -357,9 +361,9 @@ class TestRegimeValidation(unittest.TestCase):
                 q_summary = {}
                 for sym in symbols:
                     q_summary[sym] = {
-                        "symbol": sym.upper(), "valid": True, "bar_count": 100, "content_sha256": "mock_sha",
-                        "actual_start_ms": 1700000000000, "actual_end_ms": 1700000000000 + 99 * 60000,
-                        "actual_start_utc": "2023-11-14T22:13:20+00:00", "actual_end_utc": "2023-11-14T23:52:20+00:00"
+                        "symbol": sym.upper(), "valid": True, "bar_count": 1500, "content_sha256": "mock_sha",
+                        "actual_start_ms": aligned_start, "actual_end_ms": aligned_start + 1499 * 60000,
+                        "actual_start_utc": "2023-11-14T22:00:00+00:00", "actual_end_utc": "2023-11-15T22:59:00+00:00"
                     }
                 with open(os.path.join(target_ds_dir, "dataset_quality.json"), "w") as f:
                     json.dump(q_summary, f)
@@ -407,3 +411,138 @@ class TestRegimeValidation(unittest.TestCase):
         shutil.rmtree(validation_runs_dir)
         if os.path.exists("holdout_lock.json"):
             os.remove("holdout_lock.json")
+
+    # 11. Decision Function Criteria Tests (Requirement 22)
+    def test_enforcement_criteria_decisions(self):
+        from research.regime_validation.cli import evaluate_enforcement_decision
+        
+        def make_mock_inputs(allow_mean=0.0020, block_mean=0.0010, baseline_mean=0.0012,
+                             ci_low=0.0001, retention=0.35, allow_mae=0.0010, baseline_mae=0.0012,
+                             val_lift=0.0005, hold_lift=0.0010, symbol_pos_lifts=3,
+                             num_allow=40, num_block=40, num_total=120):
+            cf = {
+                "HOLDOUT": {
+                    "allow_metrics": {"mean_return": allow_mean, "average_MAE": allow_mae},
+                    "block_metrics": {"mean_return": block_mean},
+                    "baseline_metrics": {"mean_return": baseline_mean, "average_MAE": baseline_mae},
+                    "allow_minus_block_ci": (ci_low, 0.0020),
+                    "allow_minus_block_point": allow_mean - block_mean,
+                    "retention_pct": retention
+                },
+                "VALIDATION": {
+                    "allow_metrics": {"mean_return": val_lift},
+                    "block_metrics": {"mean_return": 0.0}
+                }
+            }
+            
+            signals = []
+            for _ in range(num_allow):
+                signals.append({"split": "HOLDOUT", "joined": True, "safe": True, "permission": "ALLOW", "symbol": "BTCUSDT", "outcomes": {"15m": {"return": 0.0020}}})
+            for _ in range(num_block):
+                signals.append({"split": "HOLDOUT", "joined": True, "safe": True, "permission": "BLOCK", "symbol": "BTCUSDT", "outcomes": {"15m": {"return": 0.0010}}})
+            # Add others to meet num_total
+            for _ in range(num_total - num_allow - num_block):
+                signals.append({"split": "HOLDOUT", "joined": True, "safe": True, "permission": "WATCH", "symbol": "BTCUSDT", "outcomes": {"15m": {"return": 0.0015}}})
+            return cf, signals
+
+        # k) All pass -> YES
+        cf, sigs = make_mock_inputs()
+        self.assertEqual(evaluate_enforcement_decision(cf, sigs), "YES")
+        
+        # a) Bad holdout (too few signals) -> INSUFFICIENT_DATA
+        cf, sigs = make_mock_inputs(num_total=50)
+        self.assertEqual(evaluate_enforcement_decision(cf, sigs), "INSUFFICIENT_DATA")
+
+        # b) fewer than 30 ALLOW -> INSUFFICIENT_DATA
+        cf, sigs = make_mock_inputs(num_allow=20)
+        self.assertEqual(evaluate_enforcement_decision(cf, sigs), "INSUFFICIENT_DATA")
+
+        # c) fewer than 30 BLOCK -> INSUFFICIENT_DATA
+        cf, sigs = make_mock_inputs(num_block=20)
+        self.assertEqual(evaluate_enforcement_decision(cf, sigs), "INSUFFICIENT_DATA")
+
+        # d) criterion A failure -> NO
+        cf, sigs = make_mock_inputs(allow_mean=0.0010, block_mean=0.0015)
+        self.assertEqual(evaluate_enforcement_decision(cf, sigs), "NO")
+
+        # e) criterion B failure (CI low <= 0) -> NO
+        cf, sigs = make_mock_inputs(ci_low=-0.0001)
+        self.assertEqual(evaluate_enforcement_decision(cf, sigs), "NO")
+
+        # f) criterion C failure (ALLOW <= baseline) -> NO
+        cf, sigs = make_mock_inputs(allow_mean=0.0010, baseline_mean=0.0012)
+        self.assertEqual(evaluate_enforcement_decision(cf, sigs), "NO")
+
+        # g) criterion D failure (retention < 30%) -> NO
+        cf, sigs = make_mock_inputs(retention=0.25)
+        self.assertEqual(evaluate_enforcement_decision(cf, sigs), "NO")
+
+        # h) criterion E failure (ALLOW MAE too high) -> NO
+        cf, sigs = make_mock_inputs(allow_mae=0.0020, baseline_mae=0.0010)
+        self.assertEqual(evaluate_enforcement_decision(cf, sigs), "NO")
+
+        # i) criterion G failure (different lift signs) -> NO
+        cf, sigs = make_mock_inputs(val_lift=-0.0005, hold_lift=0.0010)
+        self.assertEqual(evaluate_enforcement_decision(cf, sigs), "NO")
+
+    def test_real_ready_replay_verification(self):
+        bars = []
+        # Hour aligned start time
+        start_time = 1700000000000 - (1700000000000 % 3600000)
+        # 30 hours of 1m closed bars (1800 bars) to exceed 21 CLOSED 1h bars
+        for i in range(1800):
+            # Generate upward trending prices to hit a canonical regime state
+            p = 100.0 + (i * 0.05)
+            bars.append(MarketBar(
+                symbol="btcusdt", timeframe="1m",
+                open_time_ms=start_time + i * 60000,
+                close_time_ms=start_time + (i + 1) * 60000 - 1,
+                open=p, high=p + 0.02, low=p - 0.02, close=p,
+                base_volume=10.0, quote_volume=1000.0, closed=True
+            ))
+            
+        config_dict = {
+            "REGIME_MODEL_VERSION": "regime-v1",
+            "REGIME_FEATURE_VERSION": "regime-features-v1",
+            "REGIME_MAX_BARS_PER_TIMEFRAME": 2000,
+            "REGIME_TRADE_DEDUP_CAPACITY": 5000,
+            "REGIME_MAX_LATE_TRADE_MS": 2000,
+            "REGIME_SWITCH_CONFIRM_BARS": 3,
+            "REGIME_MIN_CONFIDENCE": 0.65,
+            "REGIME_SWITCH_MARGIN": 0.10,
+            "REGIME_VOL_PERCENTILE_WINDOW": 200,
+            "REGIME_VOL_MIN_SAMPLES": 100,
+            "REGIME_LIQUIDITY_WINDOW": 500,
+            "REGIME_LIQUIDITY_MIN_SAMPLES": 100,
+            "REGIME_BREAKOUT_MAX_BARS": 5,
+        }
+        
+        runner = HistoricalRegimeReplayRunner(["BTCUSDT"], config=config_dict)
+        # Using 500 bars warmup, dev_bars 1300 bars
+        timeline = runner.run_replay(bars[:500], bars[500:], [], [])
+        
+        # Check that we have READY states and valid canonical regimes
+        ready_states = [t for t in timeline if t.get("quality") == "READY"]
+        self.assertTrue(len(ready_states) > 0)
+        
+        valid_regime_labels = {
+            "TREND_UP", "TREND_DOWN", "RANGE", "BREAKOUT_UP", "BREAKOUT_DOWN", "TRANSITION"
+        }
+        regimes_found = set(t.get("primary_regime") for t in ready_states)
+        self.assertTrue(any(r in valid_regime_labels for r in regimes_found))
+
+    # 13. Deterministic Dataset Hash Reproducibility Test (Requirement 3)
+    def test_dataset_hash_reproducibility(self):
+        from research.regime_validation.cli import compute_dataset_content_hash
+        
+        q_data = {
+            "symbol": "BTCUSDT", "valid": True, "bar_count": 100, "content_sha256": "mock_sha",
+            "actual_start_ms": 1700000000000, "actual_end_ms": 1700000000000 + 99 * 60000
+        }
+        with open(os.path.join(self.tmp_dir, "btcusdt_quality.json"), "w") as f:
+            json.dump(q_data, f)
+            
+        h1 = compute_dataset_content_hash(self.tmp_dir, ["BTCUSDT"])
+        h2 = compute_dataset_content_hash(self.tmp_dir, ["BTCUSDT"])
+        self.assertEqual(h1, h2)
+
