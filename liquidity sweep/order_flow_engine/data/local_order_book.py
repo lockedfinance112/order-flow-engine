@@ -136,11 +136,10 @@ class LocalOrderBook:
         if force and self.sync_task and not self.sync_task.done():
             self.sync_task.cancel()
         try:
-            loop = asyncio.get_running_loop()
+            self.sync_task = asyncio.create_task(self._fetch_and_apply_snapshot())
         except RuntimeError:
             # We are outside a running loop (like in synchronous unit tests). Sync runs mock-only.
-            return
-        self.sync_task = loop.create_task(self._fetch_and_apply_snapshot())
+            pass
 
     async def _fetch_and_apply_snapshot(self):
         self.health_tracker.record_resync()
