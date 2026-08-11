@@ -2,16 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the deterministic, shadow-only Phase 1C.1 Liquidity Event Engine defined by frozen specification `36865f2`, including exact live/replay parity and all 39 acceptance gates.
+**Goal:** Build the deterministic, shadow-only Phase 1C.1 Liquidity Event Engine defined by frozen specification version `1.0.1`, including exact live/replay parity and all 40 acceptance gates.
 
-**Architecture:** Normalize existing `SweepsMonitor` callbacks into immutable sweep observations, retain symbol-local point-in-time market buffers, validate penetration, and classify a 60-second post-sweep response with a watermark-settled deterministic state machine. Event-local trade accumulators and typed optional-context adapters build evidence; immutable results flow to canonical recorders, exact replay, a read-only API, and a compact shadow display without touching trading authority.
+**Architecture:** Normalize existing `SweepsMonitor` callbacks into immutable sweep observations, claim exact event identity through a persistent standard-library SQLite authority, retain symbol-local point-in-time market buffers, validate penetration, and classify a 60-second post-sweep response with a watermark-settled deterministic state machine. Event-local trade accumulators and typed optional-context adapters build evidence; immutable results flow to canonical recorders, exact replay, a read-only API, and a compact shadow display without touching trading authority.
 
-**Tech Stack:** Python 3 standard library (`dataclasses`, `enum`, `decimal`, `hashlib`, `bisect`, `asyncio`, `csv`, `json`), existing `pytest`/`unittest` suite, existing Rich dashboard and local asyncio HTTP server. No new runtime dependency.
+**Tech Stack:** Python 3 standard library (`dataclasses`, `enum`, `decimal`, `hashlib`, `bisect`, `asyncio`, `csv`, `json`, `sqlite3`), existing `pytest`/`unittest` suite, existing Rich dashboard and local asyncio HTTP server. No new runtime dependency.
 
 ## Global Constraints
 
-- Frozen source of truth: `docs/superpowers/specs/2026-08-11-liquidity-event-engine-foundation-design.md` at commit `36865f2a9661297be3fc169d1a644e6e1355e13d`.
-- Do not edit or reinterpret the frozen specification. Stop and raise a spec issue if an invariant is contradictory or impossible.
+- Frozen source of truth: `docs/superpowers/specs/2026-08-11-liquidity-event-engine-foundation-design.md`, version `1.0.1`, including Spec Patch 001 persistent identity authority.
+- Do not edit or reinterpret the frozen specification beyond the approved Spec Patch 001 contract. Stop and raise a spec issue if an invariant is contradictory or impossible.
 - `LIQUIDITY_EVENT_ENGINE_ENABLED = True`.
 - `LIQUIDITY_EVENT_ENFORCEMENT_ENABLED = False`.
 - `REGIME_ENFORCEMENT_ENABLED = False`.
@@ -20,6 +20,9 @@
 - Price behavior alone selects the outcome; contextual evidence cannot change classification.
 - Classification logic must not call `time.time()` or sample mutable global `FlowMetrics` delta/CVD state.
 - Missing compatible optional context is `UNAVAILABLE`, never numeric zero.
+- `identity_authority.py` is the exact persistent identity authority; bounded volatile stores and recorders are not identity authority.
+- Event identity retention is indefinite for Phase 1C.1; bounded tombstone caches are rejected.
+- Persistent identity uses Python standard-library SQLite (`sqlite3`) only.
 - All production changes follow red-green-refactor: run each named test and observe the expected failure before implementing.
 - Missing modules or symbols must be imported inside the test and converted to an explicit `pytest.fail("required Phase 1C.1 API is not implemented")`; a collection error does not count as RED.
 - Review-fix commits are temporary. After a task review is clean, squash that task's implementation and fix commits into one scoped commit, verify the tree hash is unchanged, and record only the final commit in the ledger.
@@ -35,7 +38,8 @@ liquidity sweep/order_flow_engine/
         models.py         enums, immutable inputs/results, mutable event state
         policy.py         frozen v1 policy, validation, canonical hash
         sweep_adapter.py  legacy callback normalization and rejection
-        event_store.py    semantic identity, deduplication, collisions, bounds
+        identity_authority.py exact SQLite event identity, transition, and result uniqueness
+        event_store.py    bounded volatile working state, active collisions, recent snapshots
         evidence.py       event-local flow and typed optional context
         classifier.py     branch timers and pure outcome truth table
         engine.py         buffers, coverage, watermark, lifecycle orchestration
@@ -282,56 +286,226 @@ git add -- "liquidity sweep/order_flow_engine/liquidity_event/sweep_adapter.py" 
 git commit -m "feat: normalize sweep observations"
 ```
 
-### Task 3: Event Store, Semantic Deduplication, and Collision Bounds
+### Task 3A: Persistent Identity Authority
+
+**Files:**
+- Create: `liquidity sweep/order_flow_engine/liquidity_event/identity_authority.py`
+- Modify: `liquidity sweep/order_flow_engine/test_liquidity_event_adapter_store.py`
+
+**Interfaces:**
+- Consumes: `LiquiditySweepObservation`, `LifecycleTransition`, `LiquidityEventResult`, `LiquidityClassificationPolicy`.
+- Produces: `IdentityClaimOutcome.NEW`, `IdentityClaimOutcome.DUPLICATE_EXISTING`, and `IdentityClaimOutcome.IDENTITY_CONFLICT`.
+- Produces: `IdentityClaimResult(outcome, event_id, existing_identity, conflict_reason)`.
+- Produces: `SQLiteIdentityAuthority(path)`, `claim_observation(observation) -> IdentityClaimResult`, `claim_transition(transition)`, `claim_result(result)`, `lookup(event_id)`, `pending_unresolved()`, and `persisted_transition_sequences(event_id)`.
+
+The store test module defines `observation(**overrides)` by adapting `valid_raw()` and applying `dataclasses.replace`; `level`, `side`, and `event_time_ms` overrides map to `swept_level`, `liquidity_side`, and `event_time_ms` respectively. Its default event ID is `"same"`.
+
+- [ ] **Step 1: Add failing persistent identity tests**
+
+```python
+def test_sqlite_identity_claim_is_exact_and_survives_restart(tmp_path):
+    db_path = tmp_path / "identity.sqlite3"
+    first = SQLiteIdentityAuthority(db_path)
+    assert first.claim_observation(observation(event_id="same")).outcome is IdentityClaimOutcome.NEW
+    first.close()
+
+    restarted = SQLiteIdentityAuthority(db_path)
+    result = restarted.claim_observation(observation(event_id="same"))
+    assert result.outcome is IdentityClaimOutcome.DUPLICATE_EXISTING
+    assert result.event_id == "same"
+
+def test_identity_conflict_fails_closed_for_same_event_id(tmp_path):
+    authority = SQLiteIdentityAuthority(tmp_path / "identity.sqlite3")
+    assert authority.claim_observation(observation(event_id="same", level="117250.00")).outcome is IdentityClaimOutcome.NEW
+    conflict = authority.claim_observation(observation(event_id="same", level="117251.00"))
+    assert conflict.outcome is IdentityClaimOutcome.IDENTITY_CONFLICT
+    assert "immutable identity" in conflict.conflict_reason
+
+def test_finalized_identity_survives_eviction_restart_and_conflict_fails_closed(tmp_path):
+    db_path = tmp_path / "identity.sqlite3"
+    authority = SQLiteIdentityAuthority(db_path)
+    store = LiquidityEventStore(replace(policy, recent_final_events_per_symbol=0))
+    event = observation(event_id="same", level="117250.00")
+    claim = authority.claim_observation(event)
+    opened = store.open_event(event, claim)
+    final = finalized_result(event_id="same")
+    authority.claim_result(final)
+    store.finalize(final)
+    assert opened.event.event_id not in {result.event_id for result in store.recent()}
+    authority.close()
+
+    restarted = SQLiteIdentityAuthority(db_path)
+    duplicate = restarted.claim_observation(event)
+    conflict = restarted.claim_observation(observation(event_id="same", level="117251.00"))
+    assert duplicate.outcome is IdentityClaimOutcome.DUPLICATE_EXISTING
+    assert conflict.outcome is IdentityClaimOutcome.IDENTITY_CONFLICT
+
+def test_transition_and_result_uniqueness_are_hard_constraints(tmp_path):
+    authority = SQLiteIdentityAuthority(tmp_path / "identity.sqlite3")
+    event = observation(event_id="same")
+    authority.claim_observation(event)
+    transition = lifecycle_transition(event_id="same", transition_sequence=0)
+    result = finalized_result(event_id="same")
+    authority.claim_transition(transition)
+    authority.claim_result(result)
+    with pytest.raises(IdentityAlreadyExists):
+        authority.claim_transition(transition)
+    with pytest.raises(IdentityAlreadyExists):
+        authority.claim_result(result)
+
+def test_claimed_unresolved_restart_recovery_emits_only_missing_transition_keys(tmp_path):
+    db_path = tmp_path / "identity.sqlite3"
+    authority = SQLiteIdentityAuthority(db_path)
+    event = observation(event_id="same")
+    authority.claim_observation(event)
+    authority.claim_transition(lifecycle_transition(event_id="same", transition_sequence=0))
+    authority.close()
+
+    restarted = SQLiteIdentityAuthority(db_path)
+    pending = restarted.pending_unresolved()
+    assert [item.event_id for item in pending] == ["same"]
+    assert restarted.persisted_transition_sequences("same") == {0}
+    recovery = recover_claimed_unresolved(
+        authority=restarted,
+        pending_identity=pending[0],
+        retained_history=complete_history_for(event),
+    )
+    assert [transition.transition_sequence for transition in recovery.emitted_transitions] == [1, 2]
+
+def test_claimed_unresolved_restart_without_history_finalizes_once_as_insufficient_replay_history(tmp_path):
+    db_path = tmp_path / "identity.sqlite3"
+    authority = SQLiteIdentityAuthority(db_path)
+    event = observation(event_id="same")
+    authority.claim_observation(event)
+    authority.close()
+
+    restarted = SQLiteIdentityAuthority(db_path)
+    recovery = recover_claimed_unresolved(
+        authority=restarted,
+        pending_identity=restarted.pending_unresolved()[0],
+        retained_history=missing_history_for(event),
+    )
+    assert recovery.result.reason_code == "INSUFFICIENT_REPLAY_HISTORY"
+    with pytest.raises(IdentityAlreadyExists):
+        restarted.claim_result(recovery.result)
+
+def test_authority_failure_prevents_new_event(monkeypatch, tmp_path):
+    authority = SQLiteIdentityAuthority(tmp_path / "identity.sqlite3")
+    monkeypatch.setattr(authority, "_execute", broken_sqlite_execute)
+    with pytest.raises(IdentityAuthorityUnavailable):
+        authority.claim_observation(observation(event_id="same"))
+```
+
+- [ ] **Step 2: Run identity authority tests and verify RED**
+
+Run: `python -m pytest test_liquidity_event_adapter_store.py -k "sqlite_identity or identity_conflict or finalized_identity_survives or transition_and_result_uniqueness or claimed_unresolved_restart or authority_failure" -q`
+
+Expected: import or attribute failure for `SQLiteIdentityAuthority`.
+
+- [ ] **Step 3: Implement exact SQLite identity authority**
+
+Use Python standard-library `sqlite3`, explicit transactions, and schema initialization on construction. Store canonical immutable identity payloads, source observation hash, claim status, and timestamps without absolute paths, hostnames, process IDs, or wall-clock-only values. Enforce these indexes and table constraints:
+
+```sql
+CREATE TABLE IF NOT EXISTS event_identity (
+    event_id TEXT PRIMARY KEY,
+    identity_hash TEXT NOT NULL,
+    identity_payload_json TEXT NOT NULL,
+    observation_payload_json TEXT NOT NULL,
+    source_observation_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('CLAIMED_UNRESOLVED', 'FINALIZED')),
+    first_detection_time_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS event_transition (
+    event_id TEXT NOT NULL,
+    transition_sequence INTEGER NOT NULL,
+    transition_hash TEXT NOT NULL,
+    transition_payload_json TEXT NOT NULL,
+    PRIMARY KEY (event_id, transition_sequence)
+);
+
+CREATE TABLE IF NOT EXISTS event_result (
+    event_id TEXT PRIMARY KEY,
+    result_hash TEXT NOT NULL,
+    result_payload_json TEXT NOT NULL,
+    classification_time_ms INTEGER NOT NULL
+);
+```
+
+`claim_observation()` must start an immediate transaction. If `event_id` is absent, insert a `CLAIMED_UNRESOLVED` row and return `NEW`. If `event_id` exists with the same immutable identity hash, return `DUPLICATE_EXISTING`. If `event_id` exists with a different immutable identity hash or source observation hash, return `IDENTITY_CONFLICT`. Do not fall back to a bounded tombstone cache.
+
+`claim_result()` inserts into `event_result` and updates `event_identity.status` to `FINALIZED` in the same transaction. This commit occurs before recorder notification. `claim_transition()` relies on the `(event_id, transition_sequence)` primary key and raises `IdentityAlreadyExists` on duplicate sequence.
+
+`pending_unresolved()` returns claimed identities whose status is `CLAIMED_UNRESOLVED`, including the persisted observation payload needed to reconstruct the event after process restart. `persisted_transition_sequences(event_id)` returns the committed transition sequence numbers for recovery. On restart, recovery replays each claimed-unresolved identity only when complete required market history is available; it emits only missing transition keys, and otherwise finalizes exactly once as `INVALID / INSUFFICIENT_REPLAY_HISTORY`.
+
+- [ ] **Step 4: Run identity authority tests and verify GREEN**
+
+Run: `python -m pytest test_liquidity_event_adapter_store.py -k "sqlite_identity or identity_conflict or finalized_identity_survives or transition_and_result_uniqueness or claimed_unresolved_restart or authority_failure" -q`
+
+Expected: persistent duplicate, conflict, uniqueness, and failure tests pass.
+
+- [ ] **Step 5: Commit Task 3A**
+
+```powershell
+git add -- "liquidity sweep/order_flow_engine/liquidity_event/identity_authority.py" "liquidity sweep/order_flow_engine/test_liquidity_event_adapter_store.py"
+git commit -m "feat: add persistent liquidity identity authority"
+```
+
+### Task 3B: Bounded Volatile Event Store and Collision Bounds
 
 **Files:**
 - Create: `liquidity sweep/order_flow_engine/liquidity_event/event_store.py`
 - Modify: `liquidity sweep/order_flow_engine/test_liquidity_event_adapter_store.py`
 
 **Interfaces:**
-- Consumes: `LiquiditySweepObservation`, `LiquidityClassificationPolicy`, `LiquidityEvent`, `LiquidityEventResult`.
+- Consumes: `LiquiditySweepObservation`, `LiquidityClassificationPolicy`, `LiquidityEvent`, `LiquidityEventResult`, and `IdentityClaimResult`.
 - Produces: `OpenEventResult(event, created, duplicate, collision_event_ids, rejection)`.
-- Produces: `LiquidityEventStore.open_event(observation)`, `finalize(result)`, `active(symbol=None)`, and `recent(symbol=None)`.
+- Produces: `LiquidityEventStore.open_event(observation, identity_claim)`, `finalize(result)`, `active(symbol=None)`, and `recent(symbol=None)`.
 
-The store test module defines `observation(**overrides)` by adapting `valid_raw()` and applying `dataclasses.replace`; `level`, `side`, and `event_time_ms` overrides map to `swept_level`, `liquidity_side`, and `event_time_ms` respectively. Its default event ID is `"same"`.
+The store is bounded volatile working state only. It does not own lifetime identity, finalized duplicate suppression, restart semantics, or tombstones.
 
-- [ ] **Step 1: Add failing deduplication, collision, and capacity tests**
+- [ ] **Step 1: Add failing collision and capacity tests**
 
 ```python
-def test_duplicate_callback_returns_same_event_without_duplicate():
+def test_duplicate_callback_uses_identity_authority_without_reopening_event():
     store = LiquidityEventStore(policy)
-    first = store.open_event(observation(event_id="same"))
-    second = store.open_event(observation(event_id="same"))
+    first_claim = IdentityClaimResult(IdentityClaimOutcome.NEW, "same", None, None)
+    duplicate_claim = IdentityClaimResult(IdentityClaimOutcome.DUPLICATE_EXISTING, "same", existing_identity(), None)
+    first = store.open_event(observation(event_id="same"), first_claim)
+    second = store.open_event(observation(event_id="same"), duplicate_claim)
     assert first.created is True
     assert second.duplicate is True
     assert second.event is first.event
 
 def test_distinct_levels_and_opposite_sides_remain_separate():
-    assert store.open_event(observation(level="117250")).created
-    assert store.open_event(observation(event_id="two", level="117210")).created
-    assert store.open_event(observation(event_id="three", side=LiquiditySide.BUY_SIDE)).created
+    assert store.open_event(observation(level="117250"), new_claim("same")).created
+    assert store.open_event(observation(event_id="two", level="117210"), new_claim("two")).created
+    assert store.open_event(observation(event_id="three", side=LiquiditySide.BUY_SIDE), new_claim("three")).created
 
 def test_close_same_side_levels_report_ambiguous_collision():
-    store.open_event(observation(level="117250.00"))
-    result = store.open_event(observation(event_id="two", level="117251.00", event_time_ms=1_500))
+    store.open_event(observation(level="117250.00"), new_claim("same"))
+    result = store.open_event(observation(event_id="two", level="117251.00", event_time_ms=1_500), new_claim("two"))
     assert result.collision_event_ids == ("same", "two")
 
 def test_active_capacity_rejects_without_unbounded_growth():
     tiny = replace(policy, max_active_events_per_symbol=1)
     store = LiquidityEventStore(tiny)
-    store.open_event(observation())
-    assert store.open_event(observation(event_id="two", level="118000")).rejection.reason_code == "EVENT_CAPACITY_REACHED"
+    store.open_event(observation(), new_claim("same"))
+    assert store.open_event(observation(event_id="two", level="118000"), new_claim("two")).rejection.reason_code == "EVENT_CAPACITY_REACHED"
 ```
 
 - [ ] **Step 2: Run store tests and verify RED**
 
 Run: `python -m pytest test_liquidity_event_adapter_store.py -k "store or duplicate or collision or capacity" -q`
 
-Expected: import or attribute failure for `LiquidityEventStore`.
+Expected: import or attribute failure for `LiquidityEventStore` or its identity-claim-aware `open_event` signature.
 
-- [ ] **Step 3: Implement bounded identity-aware storage**
+- [ ] **Step 3: Implement bounded volatile storage**
 
-Use `dict[event_id, LiquidityEvent]` for active events and `dict[symbol, deque(maxlen=recent_final_events_per_symbol)]` for immutable recent results. Compute fallback level identity with the Task 1 Decimal normalizer. Compare same-side levels in bps only inside `collision_window_ms`; return collisions to the engine instead of silently merging different IDs.
+Use `dict[event_id, LiquidityEvent]` for active events and `dict[symbol, deque(maxlen=recent_final_events_per_symbol)]` for immutable recent results. Do not maintain finalized-ID tombstones. When `identity_claim.outcome` is `DUPLICATE_EXISTING`, return a duplicate result if the event remains active or a duplicate-without-event result if the volatile event has been evicted. When the claim is `IDENTITY_CONFLICT`, return a rejection that the engine treats as fail-closed without opening/classifying a new event.
+
+Compute fallback level identity with the Task 1 Decimal normalizer. Compare same-side levels in bps only inside `collision_window_ms`; return collisions to the engine instead of silently merging different IDs.
 
 ```python
 def fallback_level_identity(obs, policy):
@@ -349,11 +523,11 @@ Run: `python -m pytest test_liquidity_event_adapter_store.py -q`
 
 Expected: all adapter/store tests pass.
 
-- [ ] **Step 5: Commit Task 3**
+- [ ] **Step 5: Commit Task 3B**
 
 ```powershell
 git add -- "liquidity sweep/order_flow_engine/liquidity_event/event_store.py" "liquidity sweep/order_flow_engine/test_liquidity_event_adapter_store.py"
-git commit -m "feat: add bounded liquidity event store"
+git commit -m "feat: add bounded volatile liquidity event store"
 ```
 
 ### Task 4: Event-Local Flow and Typed Context Evidence
@@ -561,16 +735,21 @@ Expected: tests fail explicitly with `required Phase 1C.1 API is not implemented
 
 Use a `SymbolRuntime` containing sorted trade/depth buffers, `max_seen_exchange_time_ms`, watermark, and open event trackers. Prune only data older than `max_seen - market_buffer_retention_ms`. Insert tolerated out-of-order records with `bisect`; quarantine records older than the settled watermark.
 
+On engine startup, query `SQLiteIdentityAuthority.pending_unresolved()`. For each claimed-unresolved identity, recover from the persisted observation payload only when complete required market history is retained; skip already persisted transition keys returned by `persisted_transition_sequences(event_id)`. If the complete required history is unavailable, finalize that identity exactly once as `INVALID / INSUFFICIENT_REPLAY_HISTORY`.
+
 `on_sweep` must:
 
 ```python
-1. open/deduplicate in EventStore
-2. reject capacity or invalidate ambiguous collisions
-3. prove retained interval and TradeCoverage validity
-4. replay buffered trades from event_time_ms in canonical order
-5. validate strict penetration
-6. settle candidates only through the symbol watermark
-7. emit ordered lifecycle transitions and at most one immutable result
+1. atomically claim identity in `SQLiteIdentityAuthority`
+2. open/deduplicate bounded working state in `LiquidityEventStore`
+3. reject capacity, duplicate existing identities, identity conflicts, or ambiguous collisions
+4. prove retained interval and TradeCoverage validity
+5. replay buffered trades from event_time_ms in canonical order
+6. validate strict penetration
+7. settle candidates only through the symbol watermark
+8. claim each transition sequence in the authority
+9. commit final result identity in the authority before recorder notification
+10. emit ordered lifecycle transitions and at most one immutable result
 ```
 
 `advance_time` must require explicit coverage and never inspect wall clock. Mark unresolved replay events `INSUFFICIENT_FUTURE_COVERAGE` when the caller declares terminal input before the full interval.
@@ -599,6 +778,8 @@ git commit -m "feat: orchestrate liquidity event lifecycle"
 - Produces: `CanonicalRecord`, `RecorderTelemetry`, `LiquidityEventRecorder(mode, output_dir, queue_max_items)`, and `certify(expected_event_ids, expected_transition_keys) -> ArtifactIntegrity`.
 
 The recorder test module's `render_records(output_dir, ordered_records)` creates a replay-mode recorder, enqueues every supplied canonical record, calls `flush_replay()`, and returns an object containing bytes read from all three fixed artifact filenames.
+
+The recorder is not the identity authority. Recorder rows and certification can report artifact integrity, but duplicate suppression and one-result uniqueness are enforced by `SQLiteIdentityAuthority` before recorder notification.
 
 - [ ] **Step 1: Write failing deterministic recorder tests**
 
@@ -655,7 +836,7 @@ git commit -m "feat: record canonical liquidity artifacts"
 - Create: `liquidity sweep/order_flow_engine/test_liquidity_event_replay.py`
 
 **Interfaces:**
-- Consumes: existing gzip JSONL trade/depth recordings, sweep callback dictionaries, the production adapter/engine/recorder/policy.
+- Consumes: existing gzip JSONL trade/depth recordings, sweep callback dictionaries, the production adapter/engine/identity authority/recorder/policy.
 - Produces: `LiquidityReplayRunner.run() -> LiquidityReplayResult` with `artifact_integrity`, counts, failures, overflows, and policy hash.
 
 `LiquidityReplayRunner` accepts `inputs: Iterable[ReplayInput]`, `output_dir: Path`, and optional policy. `ReplayInput` is a frozen union wrapper with constructors `from_trade`, `from_depth`, and `from_sweep_callback`. File parsing is provided by `LiquidityReplayRunner.from_recordings(market_paths, sweep_callbacks, output_dir, policy=None)`. Replay tests build `canonical_inputs` exclusively through these constructors; `drive_engine(inputs)` feeds the same normalized values to a production engine in processing-key order.
@@ -691,7 +872,7 @@ Expected: tests fail explicitly with `required Phase 1C.1 API is not implemented
 
 Normalize recording messages into `MarketTrade` and `DepthObservation`. Present sweeps at `detection_time_ms`, not event time. Stable-sort by `(processing_time_ms, exchange_sequence, source_rank, content_hash)`, where trade rank is `0`, depth `1`, and sweep `2`. After the last input, call per-symbol terminal advance only through proven coverage; do not invent coverage beyond the recording.
 
-Use production `SweepsMonitorAdapter`, `LiquidityEventEngine`, `LiquidityEvidenceBuilder`, classifier, store, and replay-mode recorder. Return a non-complete result and CLI exit code `1` on artifact-integrity failure.
+Use production `SweepsMonitorAdapter`, `LiquidityEventEngine`, `LiquidityEvidenceBuilder`, classifier, store, a fresh per-run `SQLiteIdentityAuthority`, and replay-mode recorder. Do not reuse live identity authority or any identity authority from a prior independent replay run. Return a non-complete result and CLI exit code `1` on artifact-integrity failure.
 
 - [ ] **Step 4: Run replay and existing replay tests**
 
@@ -762,7 +943,7 @@ LIQUIDITY_EVENT_ENFORCEMENT_ENABLED = False
 LIQUIDITY_EVENT_OUTPUT_DIR = os.path.join(BASE_DIR, "liquidity_event_artifacts")
 ```
 
-In `OrderFlowEngine.__init__`, instantiate policy/store/evidence/recorder/engine only when enabled. Wire callbacks to the recorder and dashboard. Do not pass the event engine to `OrderFlowScorer`, `PaperTrader`, or regime permissions.
+In `OrderFlowEngine.__init__`, instantiate policy/identity authority/store/evidence/recorder/engine only when enabled. Wire callbacks to the recorder and dashboard. Do not pass the event engine to `OrderFlowScorer`, `PaperTrader`, or regime permissions.
 
 - [ ] **Step 4: Feed canonical market and sweep observations**
 
@@ -808,7 +989,7 @@ git add -- "liquidity sweep/order_flow_engine/config.py" "liquidity sweep/order_
 git commit -m "feat: integrate liquidity engine in shadow mode"
 ```
 
-### Task 10: Architecture and 39-Gate Acceptance Audit
+### Task 10: Architecture and 40-Gate Acceptance Audit
 
 **Files:**
 - Modify: all Phase 1C.1 test files created in Tasks 1-9 only where a frozen gate lacks direct coverage.
@@ -846,7 +1027,7 @@ def test_phase1c_does_not_mutate_paper_or_regime_authority():
 
 - [ ] **Step 2: Add a gate-to-test manifest and fail on missing coverage**
 
-Define the manifest with these exact pytest node IDs and assert that its keys equal `set(range(1, 40))`. Use the frozen spec's numbered requirement text as comments beside the corresponding entries. This is traceability, not a substitute for behavioral assertions.
+Define the manifest with these exact pytest node IDs and assert that its keys equal `set(range(1, 41))`. Use the frozen spec's numbered requirement text as comments beside the corresponding entries. This is traceability, not a substitute for behavioral assertions.
 
 ```python
 ACCEPTANCE_GATE_TESTS = {
@@ -856,7 +1037,7 @@ ACCEPTANCE_GATE_TESTS = {
     4: "test_liquidity_event_classifier.py::test_buy_side_acceptance_is_bullish_continuation",
     5: "test_liquidity_event_engine.py::test_insufficient_follow_through_is_indeterminate",
     6: "test_liquidity_event_engine.py::test_no_actual_penetration_is_invalid",
-    7: "test_liquidity_event_adapter_store.py::test_duplicate_callback_returns_same_event_without_duplicate",
+    7: "test_liquidity_event_adapter_store.py::test_duplicate_callback_uses_identity_authority_without_reopening_event",
     8: "test_liquidity_event_engine.py::test_out_of_order_inside_tolerance_settles_deterministically",
     9: "test_liquidity_event_engine.py::test_late_trade_behind_watermark_is_quarantined_without_mutation",
     10: "test_liquidity_event_engine.py::test_confirmation_window_timeout_is_indeterminate",
@@ -889,17 +1070,18 @@ ACCEPTANCE_GATE_TESTS = {
     37: "test_liquidity_event_recorder.py::test_recorder_failure_preserves_result_but_invalidates_research",
     38: "test_liquidity_event_recorder.py::test_replay_flush_is_byte_equivalent_across_enqueue_order",
     39: "test_liquidity_event_engine.py::test_quiet_healthy_interval_is_valid_but_gap_is_invalid",
+    40: "test_liquidity_event_adapter_store.py::test_finalized_identity_survives_eviction_restart_and_conflict_fails_closed",
 }
 
 def test_all_frozen_acceptance_gates_have_named_behavioral_tests():
-    assert set(ACCEPTANCE_GATE_TESTS) == set(range(1, 40))
+    assert set(ACCEPTANCE_GATE_TESTS) == set(range(1, 41))
 ```
 
 - [ ] **Step 3: Run acceptance audit and verify RED/GREEN honestly**
 
 Run: `python -m pytest test_liquidity_event_acceptance.py -q`
 
-Expected before filling any uncovered gate: failure naming the missing gate. Add only the missing behavioral test to the owning lower-level file, rerun its focused node to observe RED, implement/fix production behavior, then rerun until all 39 mappings pass.
+Expected before filling any uncovered gate: failure naming the missing gate. Add only the missing behavioral test to the owning lower-level file, rerun its focused node to observe RED, implement/fix production behavior, then rerun until all 40 mappings pass.
 
 - [ ] **Step 4: Run the complete Phase 1C.1 suite**
 
@@ -922,21 +1104,21 @@ git commit -m "test: certify Phase 1C.1 acceptance gates"
 
 **Files:**
 - No production edits unless a failing test exposes a real implementation defect.
-- Verify: `docs/superpowers/specs/2026-08-11-liquidity-event-engine-foundation-design.md` remains byte-identical to commit `36865f2`.
+- Verify: `docs/superpowers/specs/2026-08-11-liquidity-event-engine-foundation-design.md` is version `1.0.1` and includes Spec Patch 001 persistent identity authority.
 
 **Interfaces:**
 - Consumes: complete repository and clean Phase 1C.1 commits.
 - Produces: final verification evidence suitable for Phase 1C.1 sign-off.
 
-- [ ] **Step 1: Prove the frozen specification was not changed**
+- [ ] **Step 1: Prove the patched frozen specification is present**
 
 Run:
 
 ```powershell
-git diff 36865f2 -- "docs/superpowers/specs/2026-08-11-liquidity-event-engine-foundation-design.md"
+Select-String -Path "docs/superpowers/specs/2026-08-11-liquidity-event-engine-foundation-design.md" -Pattern "Spec Version:\\*\\* 1.0.1","PERSISTENT_EXACT_IDENTITY_AUTHORITY = APPROVED","IDENTITY_RETENTION = INDEFINITE"
 ```
 
-Expected: no output.
+Expected: all three patterns are found.
 
 - [ ] **Step 2: Run syntax/import verification**
 
@@ -944,7 +1126,7 @@ Run:
 
 ```powershell
 python -m compileall -q liquidity_event
-python -c "from liquidity_event.engine import LiquidityEventEngine; from liquidity_event.replay import LiquidityReplayRunner"
+python -c "from liquidity_event.engine import LiquidityEventEngine; from liquidity_event.identity_authority import SQLiteIdentityAuthority; from liquidity_event.replay import LiquidityReplayRunner"
 ```
 
 Expected: exit code `0`, no output or warnings.
@@ -972,15 +1154,15 @@ Run:
 
 ```powershell
 git status --short
-git diff --stat 36865f2..HEAD
-git log --oneline 36865f2..HEAD
+git diff --stat
+git log --oneline --decorate -n 20
 ```
 
 Expected: implementation commits contain only Phase 1C.1 files; the pre-existing order-book modifications may still appear as unstaged working-tree changes and must remain outside every Phase 1C.1 commit.
 
 - [ ] **Step 6: Record final verification in the implementation handoff**
 
-Report exact test counts, artifact-integrity result, policy hash, frozen spec SHA, authority flag values, and any residual operational limitation. Do not claim completion if artifact integrity is not `COMPLETE` or if any warning appears.
+Report exact test counts, artifact-integrity result, policy hash, patched spec version, authority flag values, and any residual operational limitation. Do not claim completion if artifact integrity is not `COMPLETE` or if any warning appears.
 
 ## Acceptance Gate Traceability
 
@@ -988,7 +1170,7 @@ Report exact test counts, artifact-integrity result, policy hash, frozen spec SH
 |---|---|
 | 1-5 outcome truth table and unresolved behavior | Task 5, Task 6 |
 | 6 penetration validation | Task 6 |
-| 7 duplicate suppression | Task 2, Task 3 |
+| 7 duplicate suppression | Task 2, Task 3A, Task 3B |
 | 8-9 reorder settlement and late-data immutability | Task 6 |
 | 10 timeout | Task 5, Task 6 |
 | 11-12 Guardian trade/depth semantics | Task 6 |
@@ -998,17 +1180,18 @@ Report exact test counts, artifact-integrity result, policy hash, frozen spec SH
 | 18 legacy side mapping | Task 2 |
 | 19-21 neutral pause, opposite reset, tie | Task 5 |
 | 22-23 late callback reconstruction/eviction | Task 6 |
-| 24-25 overlap and collision semantics | Task 3, Task 6 |
+| 24-25 overlap and collision semantics | Task 3A, Task 3B, Task 6 |
 | 26-27 policy hash and serialization | Task 1, Task 7 |
 | 28 forbidden imports | Task 10 |
 | 29 recorder failure isolation/bounds | Task 7 |
 | 30 live/replay parity | Task 8 |
 | 31 symbol-local watermarks | Task 6 |
 | 32 incomplete future coverage | Task 6, Task 8 |
-| 33 bounded stores/queues | Task 3, Task 7 |
+| 33 bounded stores/queues | Task 3B, Task 7 |
 | 34 event-local flow parity | Task 4, Task 8 |
 | 35 typed legacy detector boundary | Task 4, Task 9 |
-| 36 source-level identity fallback | Task 2, Task 3 |
+| 36 source-level identity fallback | Task 2, Task 3A, Task 3B |
 | 37 artifact-integrity invalidation | Task 7, Task 8 |
 | 38 canonical flush ordering | Task 7 |
 | 39 healthy quiet interval versus known gap | Task 6 |
+| 40 finalized identity survives volatile eviction/restart and conflicts fail closed | Task 3A, Task 3B, Task 6 |

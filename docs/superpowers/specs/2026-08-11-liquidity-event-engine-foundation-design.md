@@ -1,6 +1,6 @@
 # Phase 1C.1 Liquidity Event Engine Foundation Design
 
-**Spec Version:** 1.0
+**Spec Version:** 1.0.1
 
 **Status:** FROZEN_FOR_IMPLEMENTATION
 
@@ -91,6 +91,7 @@ liquidity_event/
     models.py
     policy.py
     sweep_adapter.py
+    identity_authority.py
     event_store.py
     evidence.py
     classifier.py
@@ -99,7 +100,7 @@ liquidity_event/
     replay.py
 ```
 
-`models.py` owns typed immutable inputs/results, mutable internal event state, enums, and availability wrappers. `policy.py` owns all behavior-affecting constants and the policy hash. `sweep_adapter.py` is the only module that knows legacy sweep terminology. `event_store.py` owns identity, collisions, retention, and lookup. `evidence.py` derives timestamped evidence without choosing an outcome. `classifier.py` applies the frozen truth table. `engine.py` owns buffers, ordering, watermarking, and lifecycle transitions. `recorder.py` owns deterministic artifacts and telemetry. `replay.py` merges recorded sources and drives the same live components.
+`models.py` owns typed immutable inputs/results, mutable internal event state, enums, and availability wrappers. `policy.py` owns all behavior-affecting constants and the policy hash. `sweep_adapter.py` is the only module that knows legacy sweep terminology. `identity_authority.py` owns exact persistent event identity, atomic claims, restart lookup, and hard uniqueness. `event_store.py` owns bounded volatile working state, collision inspection for active claims, and recent in-memory snapshots; it is not the lifetime identity authority. `evidence.py` derives timestamped evidence without choosing an outcome. `classifier.py` applies the frozen truth table. `engine.py` owns buffers, ordering, watermarking, and lifecycle transitions. `recorder.py` owns deterministic artifacts and telemetry. `replay.py` merges recorded sources and drives the same live components.
 
 ## Canonical Sweep Input
 
@@ -142,6 +143,44 @@ Malformed observations are not guessed or partially accepted. They are written t
 
 ## Event Identity and Collision Rules
 
+### Spec Amendment 1.0.1: Persistent Exact Identity Authority
+
+Phase 1C.1 approves Option 3 for Spec Issue 001:
+
+```text
+PERSISTENT_EXACT_IDENTITY_AUTHORITY = APPROVED
+SQLITE_STDLIB_IMPLEMENTATION = APPROVED
+IDENTITY_RETENTION = INDEFINITE
+VOLATILE_EVENT_STORAGE = REMAINS_BOUNDED
+BOUNDED_TOMBSTONE_IMPLEMENTATION = REJECTED
+```
+
+`identity_authority.py` is the exact identity authority for live operation. It uses Python standard-library SQLite (`sqlite3`) and no runtime dependency beyond the standard library. The authority retains canonical event identities indefinitely for Phase 1C.1, independent of active-event and recent-final in-memory bounds. Bounded volatile storage remains working state only and may evict finalized event objects; eviction must not remove or weaken identity claims.
+
+Opening an observation is an atomic authority operation with exactly one of these outcomes:
+
+```text
+new
+duplicate_existing
+identity_conflict
+```
+
+`new` claims the canonical `event_id` and the semantic identity payload before the engine opens a volatile event. `duplicate_existing` means the exact canonical `event_id` is already known and no new event, transition, or result may be created. `identity_conflict` means the same canonical `event_id` is presented with materially different immutable identity fields or provenance hash; the engine fails closed and must not open or classify a new event for that observation.
+
+The SQLite schema must enforce hard uniqueness for:
+
+```text
+event_identity(event_id)
+event_transition(event_id, transition_sequence)
+event_result(event_id)
+```
+
+Finalization commits the immutable result identity to the authority before notifying the recorder. The recorder is not the identity authority and must not be used as the source of truth for duplicate suppression. If the authority cannot complete an identity claim, duplicate lookup, transition claim, or result claim, the engine fails closed for that observation or finalization attempt: it records the operational failure where possible, does not open/classify a replacement event, and never treats uncertainty as permission to create another canonical event.
+
+After process restart, a finalized identity remains a duplicate forever. A claimed but unresolved identity also remains claimed after restart; a repeated observation with the same canonical `event_id` returns `duplicate_existing` and must not create a second lifecycle. On startup, the engine queries claimed-unresolved identities from the authority. If the complete required market history can be reconstructed from retained canonical inputs, the engine recovers and replays the unresolved event from its persisted identity payload. Recovery emits only transition keys whose `(event_id, transition_sequence)` are not already persisted, so transitions committed before a crash are not duplicated. If complete required market history cannot be reconstructed, the engine finalizes that identity exactly once as `INVALID / INSUFFICIENT_REPLAY_HISTORY`, with the result uniqueness constraint preventing duplicate final rows.
+
+Replay uses a fresh identity authority for each independent replay run. This preserves exact duplicate behavior inside the replay while preventing prior live runs or other replay runs from affecting byte-equivalent replay certification.
+
 The semantic event ID is SHA-256 over canonical serialized values:
 
 ```text
@@ -155,7 +194,7 @@ normalized swept level
 
 CSV path, row number, temporary directory, process identity, and machine identity are not part of canonical identity.
 
-Repeated callbacks with the same event ID return the existing event and create no duplicate transition or result. A semantic collision candidate is defined by the same symbol, side, level identity, and event time within the policy collision window. Level identity uses `source_level_id` when present; otherwise it is the SHA-256 hash of normalized symbol, liquidity side, and swept level. Swept levels are normalized with `Decimal(str(price)).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_EVEN)` and serialized with exactly eight decimal places. Identical candidates merge provenance. Materially different levels and opposite-side sweeps remain separate events. Only same-side events whose levels are too close to attribute market evidence safely are finalized `INVALID` with `AMBIGUOUS_EVENT_COLLISION`.
+Repeated callbacks with the same event ID return the existing authority identity and create no duplicate transition or result, even after volatile event eviction or process restart. A semantic collision candidate is defined by the same symbol, side, level identity, and event time within the policy collision window. Level identity uses `source_level_id` when present; otherwise it is the SHA-256 hash of normalized symbol, liquidity side, and swept level. Swept levels are normalized with `Decimal(str(price)).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_EVEN)` and serialized with exactly eight decimal places. Identical candidates merge provenance when the persistent authority claim is exact. Materially different levels and opposite-side sweeps remain separate events. Only same-side events whose levels are too close to attribute market evidence safely are finalized `INVALID` with `AMBIGUOUS_EVENT_COLLISION`.
 
 ## Time, Ordering, and Buffers
 
@@ -424,7 +463,7 @@ An exact replay is valid research evidence only when `artifact_integrity == COMP
 
 ## Replay
 
-Exact replay merges sweep observations, trades, and depth observations in canonical order. Sweep observations enter at detection time and reconstruct from event time. Replay uses the same adapter, policy, event store, engine, evidence builder, classifier, and recorder as live mode.
+Exact replay merges sweep observations, trades, and depth observations in canonical order. Sweep observations enter at detection time and reconstruct from event time. Replay uses the same adapter, policy, fresh per-run identity authority, event store, engine, evidence builder, classifier, and recorder as live mode.
 
 There is no research-only classifier, alternate replay threshold, or bar approximation in Phase 1C.1. Identical canonical inputs and policy hashes must produce byte-equivalent event and transition artifacts.
 
@@ -473,6 +512,7 @@ The implementation must prove:
 37. Recorder failure leaves in-memory classification unchanged but makes replay artifact integrity non-complete.
 38. Canonical replay flush ordering is independent of asynchronous completion order.
 39. A healthy quiet trade interval is valid zero-activity coverage, while an interval with a known gap is compromised.
+40. Finalized identity survives volatile eviction and process restart: a repeated exact canonical event ID creates no duplicate event, transition, or result, and a restarted claim with conflicting immutable identity fields fails closed as an identity conflict.
 
 Phase 1C.1 is complete only when these engineering gates pass and the full existing test suite remains green without new warnings.
 
