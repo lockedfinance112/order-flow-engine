@@ -1,6 +1,8 @@
 import unittest
 import time
 import asyncio
+import gc
+import warnings
 from collections import deque
 from unittest.mock import MagicMock, patch
 
@@ -27,6 +29,18 @@ class TestOrderBookDataIntegrity(unittest.TestCase):
         self.assertEqual(val.validate_and_update(9, 15, 8), "DUPLICATE")
         self.assertEqual(val.validate_and_update(18, 25, 9), "OUT_OF_ORDER")
         self.assertEqual(val.validate_and_update(25, 30, 22), "GAP")
+
+    def test_trigger_sync_without_running_loop_does_not_leak_coroutine_warning(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            self.book.trigger_sync()
+            gc.collect()
+
+        leaked_coroutines = [
+            warning for warning in caught
+            if "was never awaited" in str(warning.message)
+        ]
+        self.assertEqual([], leaked_coroutines)
 
     def test_apply_diff_update_and_level_deletion(self):
         snapshot = {
