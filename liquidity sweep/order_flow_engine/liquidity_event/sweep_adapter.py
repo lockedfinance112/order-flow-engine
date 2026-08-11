@@ -36,6 +36,8 @@ def parse_utc_ms(value: str) -> int:
     utc_value = parsed.astimezone(timezone.utc)
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     delta = utc_value - epoch
+    if delta.microseconds % 1_000:
+        raise ValueError("timestamp must have millisecond precision")
     return delta.days * 86_400_000 + delta.seconds * 1_000 + delta.microseconds // 1_000
 
 
@@ -85,10 +87,15 @@ def _optional_float(
     if isinstance(value, bool) or not isinstance(value, (Decimal, float, int, str)):
         raise _InvalidSweepObservation(detail_code)
     try:
-        parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+        supplied = Decimal(str(value))
+        parsed = float(supplied)
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
         raise _InvalidSweepObservation(detail_code) from None
-    if not math.isfinite(parsed):
+    if (
+        not supplied.is_finite()
+        or not math.isfinite(parsed)
+        or Decimal(str(parsed)) != supplied
+    ):
         raise _InvalidSweepObservation(detail_code)
     return parsed
 
@@ -119,6 +126,16 @@ def _sanitized_source_row_hash(raw: Mapping[str, Any]) -> str | None:
     ):
         return value
     return None
+
+
+def _source_row_hash(raw: Mapping[str, Any]) -> str | None:
+    value = raw.get("source_row_hash")
+    if value is None:
+        return None
+    sanitized = _sanitized_source_row_hash(raw)
+    if sanitized is None:
+        raise _InvalidSweepObservation("INVALID_SOURCE_ROW_HASH")
+    return sanitized
 
 
 def _source_observation_hash(raw: Mapping[str, Any]) -> str | None:
@@ -200,19 +217,22 @@ class SweepsMonitorAdapter:
                 )
             except (InvalidOperation, TypeError, ValueError):
                 raise _InvalidSweepObservation("INVALID_SWEPT_LEVEL") from None
+            if Decimal(normalized_swept_level) <= 0:
+                raise _InvalidSweepObservation("INVALID_SWEPT_LEVEL")
 
             source_event_id = _required_text(
                 raw, "sweep_id", "INVALID_SOURCE_EVENT_ID"
             )
             symbol = _required_text(raw, "symbol", "INVALID_SYMBOL").upper()
             source_file_id = _source_file_id(raw)
+            source_row_hash = _source_row_hash(raw)
 
             source_sweep_price = _optional_decimal(
                 raw, "source_sweep_price", "INVALID_SOURCE_SWEEP_PRICE"
             )
             if source_sweep_price is not None:
                 try:
-                    normalize_price(
+                    normalized_source_sweep_price = normalize_price(
                         source_sweep_price,
                         self.policy.canonical_price_decimal_places,
                     )
@@ -220,6 +240,11 @@ class SweepsMonitorAdapter:
                     raise _InvalidSweepObservation(
                         "INVALID_SOURCE_SWEEP_PRICE"
                     ) from None
+                if (
+                    source_sweep_price != 0
+                    and Decimal(normalized_source_sweep_price) == 0
+                ):
+                    raise _InvalidSweepObservation("INVALID_SOURCE_SWEEP_PRICE")
             source_penetration_bps = _optional_float(
                 raw,
                 "source_penetration_bps",
@@ -271,7 +296,7 @@ class SweepsMonitorAdapter:
             source_penetration_bps=source_penetration_bps,
             source=SweepSource.SWEEPS_MONITOR_CSV,
             source_file_id=source_file_id,
-            source_row_hash=_sanitized_source_row_hash(raw),
+            source_row_hash=source_row_hash,
             source_observation_hash=source_observation_hash,
             detector_version=detector_version,
         )

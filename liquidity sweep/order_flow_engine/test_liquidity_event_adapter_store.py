@@ -443,6 +443,36 @@ def test_adapter_extreme_finite_level_returns_deterministic_rejection():
     assert first_bytes == second_bytes
 
 
+def test_adapter_level_that_normalizes_to_zero_returns_deterministic_rejection():
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    rejections = [
+        adapter.adapt(
+            valid_raw(sweep_level="1e-100"), detection_time_ms=2_000
+        ).rejected
+        for _ in range(2)
+    ]
+
+    assert all(rejection is not None for rejection in rejections)
+    rejection_bytes = [
+        canonical_json(rejection.to_canonical_dict()).encode("ascii")
+        for rejection in rejections
+    ]
+    assert all(
+        rejection.reason_detail == "INVALID_SWEPT_LEVEL"
+        for rejection in rejections
+    )
+    assert rejection_bytes[0] == rejection_bytes[1]
+
+
+def test_adapter_accepts_smallest_canonical_positive_level():
+    result = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        valid_raw(sweep_level="0.00000001"), detection_time_ms=2_000
+    )
+
+    assert result.rejected is None
+    assert result.observation.to_canonical_dict()["swept_level"] == "0.00000001"
+
+
 def test_adapter_extreme_source_sweep_price_returns_deterministic_rejection():
     adapter = adapter_api()(LiquidityClassificationPolicy())
     rejections = []
@@ -467,6 +497,153 @@ def test_adapter_extreme_source_sweep_price_returns_deterministic_rejection():
     assert rejections[0].reason_detail == "INVALID_SOURCE_SWEEP_PRICE"
     assert rejections[1].reason_detail == "INVALID_SOURCE_SWEEP_PRICE"
     assert first_bytes == second_bytes
+
+
+def test_adapter_source_price_that_normalizes_to_zero_is_rejected_deterministically():
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    rejections = [
+        adapter.adapt(
+            valid_raw(source_sweep_price="1e-100"), detection_time_ms=2_000
+        ).rejected
+        for _ in range(2)
+    ]
+
+    assert all(rejection is not None for rejection in rejections)
+    rejection_bytes = [
+        canonical_json(rejection.to_canonical_dict()).encode("ascii")
+        for rejection in rejections
+    ]
+    assert all(
+        rejection.reason_detail == "INVALID_SOURCE_SWEEP_PRICE"
+        for rejection in rejections
+    )
+    assert rejection_bytes[0] == rejection_bytes[1]
+
+
+def test_adapter_accepts_smallest_canonical_positive_source_price():
+    result = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        valid_raw(source_sweep_price="0.00000001"), detection_time_ms=2_000
+    )
+
+    assert result.rejected is None
+    assert (
+        result.observation.to_canonical_dict()["source_sweep_price"]
+        == "0.00000001"
+    )
+
+
+@pytest.mark.parametrize(
+    "source_penetration_bps",
+    ["1e-1000000", "9007199254740993"],
+)
+def test_adapter_rejects_lossy_source_penetration_conversion_deterministically(
+    source_penetration_bps,
+):
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    rejections = [
+        adapter.adapt(
+            valid_raw(source_penetration_bps=source_penetration_bps),
+            detection_time_ms=2_000,
+        ).rejected
+        for _ in range(2)
+    ]
+
+    assert all(rejection is not None for rejection in rejections)
+    rejection_bytes = [
+        canonical_json(rejection.to_canonical_dict()).encode("ascii")
+        for rejection in rejections
+    ]
+    assert all(
+        rejection.reason_detail == "INVALID_SOURCE_PENETRATION_BPS"
+        for rejection in rejections
+    )
+    assert rejection_bytes[0] == rejection_bytes[1]
+
+
+@pytest.mark.parametrize(
+    ("source_penetration_bps", "expected"),
+    [("0", 0.0), ("5e-324", 5e-324), ("0.1", 0.1)],
+)
+def test_adapter_preserves_representable_source_penetration_values(
+    source_penetration_bps, expected
+):
+    result = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        valid_raw(source_penetration_bps=source_penetration_bps),
+        detection_time_ms=2_000,
+    )
+
+    assert result.rejected is None
+    assert result.observation.source_penetration_bps == expected
+
+
+@pytest.mark.parametrize(
+    "source_row_hash",
+    ["", "a" * 63, "A" * 64, "g" * 64, 123],
+)
+def test_adapter_rejects_malformed_supplied_source_row_hash_deterministically(
+    source_row_hash,
+):
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    rejections = [
+        adapter.adapt(
+            valid_raw(source_row_hash=source_row_hash), detection_time_ms=2_000
+        ).rejected
+        for _ in range(2)
+    ]
+
+    assert all(rejection is not None for rejection in rejections)
+    rejection_bytes = [
+        canonical_json(rejection.to_canonical_dict()).encode("ascii")
+        for rejection in rejections
+    ]
+    assert all(
+        rejection.reason_detail == "INVALID_SOURCE_ROW_HASH"
+        for rejection in rejections
+    )
+    assert all(rejection.source_row_hash is None for rejection in rejections)
+    assert rejection_bytes[0] == rejection_bytes[1]
+
+
+@pytest.mark.parametrize("source_row_hash", [None, "b" * 64])
+def test_adapter_preserves_absent_or_valid_lowercase_source_row_hash(source_row_hash):
+    result = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        valid_raw(source_row_hash=source_row_hash), detection_time_ms=2_000
+    )
+
+    assert result.rejected is None
+    assert result.observation.source_row_hash == source_row_hash
+
+
+def test_adapter_accepts_missing_source_row_hash():
+    raw = valid_raw()
+    raw.pop("source_row_hash")
+
+    result = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        raw, detection_time_ms=2_000
+    )
+
+    assert result.rejected is None
+    assert result.observation.source_row_hash is None
+
+
+def test_adapter_rejects_sub_millisecond_timestamp_without_truncating():
+    result = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        valid_raw(timestamp="1970-01-01T00:00:01.000001Z"),
+        detection_time_ms=2_000,
+    )
+
+    assert result.observation is None
+    assert result.rejected.reason_detail == "INVALID_TIMESTAMP"
+
+
+def test_adapter_preserves_exact_millisecond_timestamp():
+    result = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        valid_raw(timestamp="1970-01-01T00:00:01.001000Z"),
+        detection_time_ms=2_000,
+    )
+
+    assert result.rejected is None
+    assert result.observation.event_time_ms == 1_001
 
 
 def test_adapter_object_detection_time_uses_deterministic_integer_sentinel():
