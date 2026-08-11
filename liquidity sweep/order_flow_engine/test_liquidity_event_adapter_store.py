@@ -62,8 +62,9 @@ def observation(**overrides):
     return replace(adapted, **values)
 
 
-def final_result(event, market_resolution_time_ms=2_000):
+def final_result(event, market_resolution_time_ms=2_000, policy=None):
     source = event.observation
+    policy = policy or LiquidityClassificationPolicy()
     classification_time_ms = max(
         market_resolution_time_ms,
         source.detection_time_ms,
@@ -80,9 +81,26 @@ def final_result(event, market_resolution_time_ms=2_000):
         classification_time_ms=classification_time_ms,
         source_observation_hash=source.source_observation_hash,
         evidence=LiquidityEvidence(),
-        policy_hash=LiquidityClassificationPolicy().policy_hash,
-        model_version="1C.1-v1",
+        policy_hash=policy.policy_hash,
+        model_version=policy.model_version,
     )
+
+
+def result_with_mismatch(event, field, value):
+    result = final_result(event, market_resolution_time_ms=3_000)
+    changes = {field: value}
+    if field == "detection_time_ms":
+        changes["classification_time_ms"] = max(
+            result.market_resolution_time_ms,
+            value,
+        )
+    return replace(result, **changes)
+
+
+def result_with_invalid_timing(event):
+    result = final_result(event, market_resolution_time_ms=3_000)
+    object.__setattr__(result, "classification_time_ms", 2_999)
+    return result
 
 
 def test_duplicate_callback_returns_same_event_without_duplicate():
@@ -211,8 +229,16 @@ def test_finalize_moves_matching_result_once_and_bounds_recent_results():
     store = LiquidityEventStore(policy)
     first = store.open_event(observation(event_id="one")).event
     second = store.open_event(observation(event_id="two", level="200")).event
-    first_result = final_result(first, market_resolution_time_ms=3_000)
-    second_result = final_result(second, market_resolution_time_ms=2_000)
+    first_result = final_result(
+        first,
+        market_resolution_time_ms=3_000,
+        policy=policy,
+    )
+    second_result = final_result(
+        second,
+        market_resolution_time_ms=2_000,
+        policy=policy,
+    )
 
     store.finalize(first_result)
     store.finalize(first_result)
@@ -220,6 +246,116 @@ def test_finalize_moves_matching_result_once_and_bounds_recent_results():
 
     assert tuple(event.event_id for event in store.active()) == ()
     assert store.recent() == (second_result,)
+
+
+def test_finalized_duplicate_is_a_deterministic_tombstone_not_a_new_event():
+    LiquidityEventStore = store_api()
+    store = LiquidityEventStore(LiquidityClassificationPolicy())
+    event = store.open_event(observation(event_id="finalized")).event
+    result = final_result(event)
+
+    store.finalize(result)
+    duplicate = store.open_event(event.observation)
+
+    assert duplicate.event is None
+    assert duplicate.created is False
+    assert duplicate.duplicate is True
+    assert duplicate.collision_event_ids == ()
+    assert duplicate.rejection is None
+    assert store.active() == ()
+    assert store.recent() == (result,)
+
+
+def test_finalized_tombstone_wins_over_capacity_before_opening():
+    LiquidityEventStore = store_api()
+    policy = replace(LiquidityClassificationPolicy(), max_active_events_per_symbol=1)
+    store = LiquidityEventStore(policy)
+    finalized = store.open_event(observation(event_id="finalized")).event
+
+    store.finalize(final_result(finalized, policy=policy))
+    active = store.open_event(observation(event_id="active", level="200"))
+    duplicate = store.open_event(finalized.observation)
+
+    assert active.created is True
+    assert duplicate.event is None
+    assert duplicate.created is False
+    assert duplicate.duplicate is True
+    assert duplicate.rejection is None
+    assert store.active() == (active.event,)
+
+
+def test_finalized_tombstones_follow_recent_retention_per_symbol():
+    LiquidityEventStore = store_api()
+    policy = replace(LiquidityClassificationPolicy(), recent_final_events_per_symbol=1)
+    store = LiquidityEventStore(policy)
+    btc_evicted = store.open_event(observation(event_id="btc-evicted")).event
+    btc_retained = store.open_event(
+        observation(event_id="btc-retained", level="200")
+    ).event
+    eth_retained = store.open_event(
+        observation(event_id="eth-retained", symbol="ETHUSDT", level="300")
+    ).event
+
+    store.finalize(final_result(btc_evicted, policy=policy))
+    store.finalize(final_result(eth_retained, policy=policy))
+    store.finalize(final_result(btc_retained, policy=policy))
+
+    evicted = store.open_event(btc_evicted.observation)
+    btc_duplicate = store.open_event(btc_retained.observation)
+    eth_duplicate = store.open_event(eth_retained.observation)
+
+    assert evicted.created is True
+    assert btc_duplicate.event is None and btc_duplicate.duplicate is True
+    assert eth_duplicate.event is None and eth_duplicate.duplicate is True
+    assert tuple(result.event_id for result in store.recent("BTCUSDT")) == (
+        "btc-retained",
+    )
+    assert tuple(result.event_id for result in store.recent("ETHUSDT")) == (
+        "eth-retained",
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("event_id", "other-event"),
+        ("symbol", "ETHUSDT"),
+        ("liquidity_side", LiquiditySide.BUY_SIDE),
+        ("source_observation_hash", "b" * 64),
+        ("event_time_ms", 1_001),
+        ("detection_time_ms", 3_001),
+        ("policy_hash", "c" * 64),
+        ("model_version", "other-model"),
+    ],
+)
+def test_finalize_rejects_each_nonmatching_result_field_without_mutation(field, value):
+    LiquidityEventStore = store_api()
+    policy = LiquidityClassificationPolicy()
+    store = LiquidityEventStore(policy)
+    event = store.open_event(observation(event_id="strict")).event
+    valid = final_result(event, market_resolution_time_ms=3_000)
+
+    store.finalize(result_with_mismatch(event, field, value))
+
+    assert store.active() == (event,)
+    assert store.recent() == ()
+
+    store.finalize(valid)
+    store.finalize(valid)
+
+    assert store.active() == ()
+    assert store.recent() == (valid,)
+
+
+def test_finalize_rejects_invalid_model_timing_without_mutation():
+    LiquidityEventStore = store_api()
+    store = LiquidityEventStore(LiquidityClassificationPolicy())
+    event = store.open_event(observation(event_id="invalid-timing")).event
+
+    store.finalize(result_with_invalid_timing(event))
+
+    assert store.active() == (event,)
+    assert store.recent() == ()
 
 
 def test_recent_retention_eviction_is_independent_per_symbol():
@@ -231,9 +367,21 @@ def test_recent_retention_eviction_is_independent_per_symbol():
     eth = store.open_event(
         observation(event_id="eth", symbol="ETHUSDT", level="300")
     ).event
-    btc_old_result = final_result(btc_old, market_resolution_time_ms=1_000)
-    btc_new_result = final_result(btc_new, market_resolution_time_ms=2_000)
-    eth_result = final_result(eth, market_resolution_time_ms=1_500)
+    btc_old_result = final_result(
+        btc_old,
+        market_resolution_time_ms=1_000,
+        policy=policy,
+    )
+    btc_new_result = final_result(
+        btc_new,
+        market_resolution_time_ms=2_000,
+        policy=policy,
+    )
+    eth_result = final_result(
+        eth,
+        market_resolution_time_ms=1_500,
+        policy=policy,
+    )
 
     store.finalize(btc_old_result)
     store.finalize(eth_result)

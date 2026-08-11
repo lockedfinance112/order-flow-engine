@@ -29,6 +29,7 @@ class LiquidityEventStore:
         self._policy = policy
         self._active: dict[str, LiquidityEvent] = {}
         self._recent: dict[str, deque[LiquidityEventResult]] = {}
+        self._finalized_event_ids: dict[str, deque[str]] = {}
 
     def level_identity(self, observation: LiquiditySweepObservation) -> str:
         if observation.source_level_id is not None:
@@ -48,6 +49,11 @@ class LiquidityEventStore:
         existing = self._active.get(observation.event_id)
         if existing is not None:
             return OpenEventResult(existing, False, True, (), None)
+
+        if observation.event_id in self._finalized_event_ids.get(
+            observation.symbol, ()
+        ):
+            return OpenEventResult(None, False, True, (), None)
 
         active_for_symbol = sum(
             event.observation.symbol == observation.symbol
@@ -85,6 +91,10 @@ class LiquidityEventStore:
             result.symbol,
             deque(maxlen=self._policy.recent_final_events_per_symbol),
         ).append(result)
+        self._finalized_event_ids.setdefault(
+            result.symbol,
+            deque(maxlen=self._policy.recent_final_events_per_symbol),
+        ).append(result.event_id)
 
     def active(self, symbol: str | None = None) -> tuple[LiquidityEvent, ...]:
         events = self._active.values()
@@ -138,16 +148,23 @@ class LiquidityEventStore:
         )
         return difference_bps <= Decimal(str(self._policy.collision_level_tolerance_bps))
 
-    @staticmethod
     def _matches_result(
+        self,
         event: LiquidityEvent,
         result: LiquidityEventResult,
     ) -> bool:
         observation = event.observation
         return (
-            observation.symbol == result.symbol
+            event.event_id == result.event_id
+            and observation.symbol == result.symbol
             and observation.liquidity_side is result.liquidity_side
             and observation.source_observation_hash == result.source_observation_hash
+            and observation.event_time_ms == result.event_time_ms
+            and observation.detection_time_ms == result.detection_time_ms
+            and result.policy_hash == self._policy.policy_hash
+            and result.model_version == self._policy.model_version
+            and result.classification_time_ms
+            == max(result.market_resolution_time_ms, result.detection_time_ms)
         )
 
     @staticmethod
