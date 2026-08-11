@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, is_dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields, is_dataclass
 from decimal import Decimal, ROUND_HALF_EVEN
 from enum import Enum
 from hashlib import sha256
 import json
+from math import isfinite
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol
+from typing import Any, Protocol
 
 
 class _StringEnum(str, Enum):
@@ -72,8 +74,14 @@ def _canonical_value(value: Any) -> Any:
     if isinstance(value, Decimal):
         return format(value, "f")
     if is_dataclass(value) and not isinstance(value, type):
-        return _canonical_value(asdict(value))
-    if isinstance(value, dict):
+        to_canonical_dict = getattr(value, "to_canonical_dict", None)
+        if callable(to_canonical_dict):
+            return _canonical_value(to_canonical_dict())
+        return {
+            item.name: _canonical_value(getattr(value, item.name))
+            for item in fields(value)
+        }
+    if isinstance(value, Mapping):
         return {str(key): _canonical_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_canonical_value(item) for item in value]
@@ -114,6 +122,29 @@ class EvidenceValue:
     availability: EvidenceAvailability
     value: float | None
     as_of_ms: int | None
+
+    def __post_init__(self) -> None:
+        timestamp_valid = (
+            isinstance(self.as_of_ms, int)
+            and not isinstance(self.as_of_ms, bool)
+            and self.as_of_ms >= 0
+        )
+        if self.availability is EvidenceAvailability.UNAVAILABLE:
+            if self.value is not None or self.as_of_ms is not None:
+                raise ValueError("unavailable evidence must have no value or timestamp")
+            return
+        if self.availability is EvidenceAvailability.UNSAFE:
+            if self.value is not None or not timestamp_valid:
+                raise ValueError(
+                    "unsafe evidence requires no value and a non-negative timestamp"
+                )
+            return
+        if self.value is None or not timestamp_valid:
+            raise ValueError(
+                "available evidence requires a value and non-negative timestamp"
+            )
+        if not isfinite(self.value):
+            raise ValueError("available evidence value must be finite")
 
 
 @dataclass(frozen=True)
@@ -159,6 +190,10 @@ class DepthObservation:
     exchange_time_ms: int
     sequence_id: int | str
     source: str = "BINANCE_DEPTH"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bids", tuple(tuple(level) for level in self.bids))
+        object.__setattr__(self, "asks", tuple(tuple(level) for level in self.asks))
 
     def to_canonical_dict(self) -> dict[str, Any]:
         return {
@@ -368,6 +403,13 @@ class LiquidityEventResult:
     evidence: LiquidityEvidence
     policy_hash: str
     model_version: str
+
+    def __post_init__(self) -> None:
+        expected = max(self.market_resolution_time_ms, self.detection_time_ms)
+        if self.classification_time_ms != expected:
+            raise ValueError(
+                "classification time must equal the later of market resolution and detection"
+            )
 
     def to_canonical_dict(self) -> dict[str, Any]:
         return {
