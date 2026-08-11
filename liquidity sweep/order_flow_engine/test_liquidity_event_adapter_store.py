@@ -443,6 +443,32 @@ def test_adapter_extreme_finite_level_returns_deterministic_rejection():
     assert first_bytes == second_bytes
 
 
+def test_adapter_extreme_source_sweep_price_returns_deterministic_rejection():
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    rejections = []
+
+    for _ in range(2):
+        try:
+            result = adapter.adapt(
+                valid_raw(source_sweep_price="1e100"), detection_time_ms=2_000
+            )
+            if result.observation is not None:
+                canonical_json(result.observation.to_canonical_dict())
+        except Exception as exc:
+            pytest.fail(
+                "adapter accepted a non-representable source sweep price: "
+                f"{type(exc).__name__}"
+            )
+        rejections.append(result.rejected)
+
+    assert all(rejection is not None for rejection in rejections)
+    first_bytes = canonical_json(rejections[0].to_canonical_dict()).encode("ascii")
+    second_bytes = canonical_json(rejections[1].to_canonical_dict()).encode("ascii")
+    assert rejections[0].reason_detail == "INVALID_SOURCE_SWEEP_PRICE"
+    assert rejections[1].reason_detail == "INVALID_SOURCE_SWEEP_PRICE"
+    assert first_bytes == second_bytes
+
+
 def test_adapter_object_detection_time_uses_deterministic_integer_sentinel():
     adapter = adapter_api()(LiquidityClassificationPolicy())
     first = adapter.adapt(valid_raw(), detection_time_ms=object()).rejected

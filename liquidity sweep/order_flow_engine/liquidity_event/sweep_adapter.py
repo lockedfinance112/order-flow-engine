@@ -210,6 +210,16 @@ class SweepsMonitorAdapter:
             source_sweep_price = _optional_decimal(
                 raw, "source_sweep_price", "INVALID_SOURCE_SWEEP_PRICE"
             )
+            if source_sweep_price is not None:
+                try:
+                    normalize_price(
+                        source_sweep_price,
+                        self.policy.canonical_price_decimal_places,
+                    )
+                except (InvalidOperation, TypeError, ValueError):
+                    raise _InvalidSweepObservation(
+                        "INVALID_SOURCE_SWEEP_PRICE"
+                    ) from None
             source_penetration_bps = _optional_float(
                 raw,
                 "source_penetration_bps",
