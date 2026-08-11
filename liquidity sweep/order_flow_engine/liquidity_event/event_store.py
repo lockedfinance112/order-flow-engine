@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
 
+from .identity_authority import IdentityClaimOutcome, IdentityClaimResult
 from .models import (
     LiquidityEvent,
     LiquidityEventResult,
@@ -29,7 +31,6 @@ class LiquidityEventStore:
         self._policy = policy
         self._active: dict[str, LiquidityEvent] = {}
         self._recent: dict[str, deque[LiquidityEventResult]] = {}
-        self._finalized_event_ids: dict[str, deque[str]] = {}
 
     def level_identity(self, observation: LiquiditySweepObservation) -> str:
         if observation.source_level_id is not None:
@@ -45,15 +46,37 @@ class LiquidityEventStore:
             }
         )
 
-    def open_event(self, observation: LiquiditySweepObservation) -> OpenEventResult:
-        existing = self._active.get(observation.event_id)
-        if existing is not None:
-            return OpenEventResult(existing, False, True, (), None)
+    def open_event(
+        self,
+        observation: LiquiditySweepObservation,
+        identity_claim: IdentityClaimResult,
+    ) -> OpenEventResult:
+        if identity_claim.outcome is IdentityClaimOutcome.DUPLICATE_EXISTING:
+            return OpenEventResult(
+                self._active.get(identity_claim.event_id),
+                False,
+                True,
+                (),
+                None,
+            )
 
-        if observation.event_id in self._finalized_event_ids.get(
-            observation.symbol, ()
-        ):
-            return OpenEventResult(None, False, True, (), None)
+        if identity_claim.outcome is IdentityClaimOutcome.IDENTITY_CONFLICT:
+            return OpenEventResult(
+                None,
+                False,
+                False,
+                (),
+                RejectedSweepInput(
+                    source=observation.source,
+                    detection_time_ms=observation.detection_time_ms,
+                    reason_code="IDENTITY_CONFLICT",
+                    reason_detail=identity_claim.conflict_reason
+                    or "identity authority rejected conflicting event identity",
+                    source_file_id=observation.source_file_id,
+                    source_row_hash=observation.source_row_hash,
+                    source_observation_hash=observation.source_observation_hash,
+                ),
+            )
 
         active_for_symbol = sum(
             event.observation.symbol == observation.symbol
@@ -91,10 +114,6 @@ class LiquidityEventStore:
             result.symbol,
             deque(maxlen=self._policy.recent_final_events_per_symbol),
         ).append(result)
-        self._finalized_event_ids.setdefault(
-            result.symbol,
-            deque(maxlen=self._policy.recent_final_events_per_symbol),
-        ).append(result.event_id)
 
     def active(self, symbol: str | None = None) -> tuple[LiquidityEvent, ...]:
         events = self._active.values()
@@ -102,7 +121,7 @@ class LiquidityEventStore:
             events = (
                 event for event in events if event.observation.symbol == symbol
             )
-        return tuple(sorted(events, key=self._event_order))
+        return tuple(deepcopy(event) for event in sorted(events, key=self._event_order))
 
     def recent(self, symbol: str | None = None) -> tuple[LiquidityEventResult, ...]:
         if symbol is not None:
