@@ -126,6 +126,8 @@ class EvidenceValue:
     as_of_ms: int | None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.availability, EvidenceAvailability):
+            raise TypeError("availability must be an EvidenceAvailability member")
         timestamp_valid = (
             isinstance(self.as_of_ms, int)
             and not isinstance(self.as_of_ms, bool)

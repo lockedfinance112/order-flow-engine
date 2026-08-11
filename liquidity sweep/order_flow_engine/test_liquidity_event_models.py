@@ -46,6 +46,14 @@ def test_models_keep_missing_optional_evidence_distinct_from_zero():
     assert missing != zero
 
 
+@pytest.mark.parametrize("availability", ["NOT_A_STATE", 1, None])
+def test_evidence_rejects_raw_availability_values(availability):
+    _, EvidenceValue, _, _ = _required_api()
+
+    with pytest.raises(TypeError, match="EvidenceAvailability"):
+        EvidenceValue(availability, 1.0, 1_000)
+
+
 @pytest.mark.parametrize("value, as_of_ms", [(0.0, None), (None, 1_000)])
 def test_unavailable_evidence_rejects_value_or_timestamp(value, as_of_ms):
     EvidenceAvailability, EvidenceValue, _, _ = _required_api()
