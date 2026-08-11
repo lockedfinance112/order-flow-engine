@@ -285,3 +285,11 @@ def test_canonical_hash_serializes_event_result_directly():
     result = _event_result()
 
     assert canonical_hash(result) == canonical_hash(result.to_canonical_dict())
+
+
+def test_canonical_json_rejects_non_string_mapping_keys_without_collision():
+    *_, canonical_json = _review_api()
+
+    assert canonical_json({"1": "string"}) == '{"1":"string"}'
+    with pytest.raises(TypeError, match="string keys"):
+        canonical_json({1: "integer", "1": "string"})

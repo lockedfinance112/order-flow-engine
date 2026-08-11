@@ -82,7 +82,9 @@ def _canonical_value(value: Any) -> Any:
             for item in fields(value)
         }
     if isinstance(value, Mapping):
-        return {str(key): _canonical_value(item) for key, item in value.items()}
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("canonical JSON mappings require string keys")
+        return {key: _canonical_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_canonical_value(item) for item in value]
     return value
