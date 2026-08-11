@@ -12,6 +12,7 @@ from liquidity_event import (
     LiquidityEvidence,
     LiquiditySide,
     canonical_hash,
+    canonical_json,
 )
 from sweeps_monitor import SweepsMonitor
 
@@ -306,6 +307,58 @@ def test_adapter_is_deterministic_and_does_not_invent_sweep_price():
     assert first.source_penetration_bps is None
 
 
+def test_adapter_event_id_uses_frozen_canonical_identity_payload():
+    observation = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        valid_raw(), detection_time_ms=2_000
+    ).observation
+
+    assert observation.event_id == (
+        "d8aad5699389f81a034433669a9bf97dea0a1ff9c66ef40e05ace14dfaef270e"
+    )
+    assert observation.source_event_id == "sweep-a"
+    assert observation.event_id != observation.source_event_id
+
+
+def test_adapter_event_id_distinguishes_frozen_identity_components():
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    base = adapter.adapt(valid_raw(), detection_time_ms=2_000).observation
+    same_legacy_id_variants = (
+        valid_raw(symbol="ETHUSDT"),
+        valid_raw(type="BEARISH"),
+        valid_raw(timestamp="1970-01-01T00:00:02Z"),
+        valid_raw(sweep_level="100.00000001"),
+    )
+
+    variant_ids = {
+        adapter.adapt(raw, detection_time_ms=2_000).observation.event_id
+        for raw in same_legacy_id_variants
+    }
+    different_source_id = adapter.adapt(
+        valid_raw(sweep_id="sweep-b"), detection_time_ms=2_000
+    ).observation
+
+    assert base.event_id not in variant_ids
+    assert len(variant_ids) == len(same_legacy_id_variants)
+    assert different_source_id.event_id != base.event_id
+    assert different_source_id.source_event_id == "sweep-b"
+
+
+def test_adapter_event_id_matches_for_semantically_identical_callbacks():
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    base = adapter.adapt(valid_raw(), detection_time_ms=2_000).observation
+    equivalent_raw = valid_raw(
+        symbol="btcusdt",
+        sweep_level="100.000000004",
+        source_row_hash="b" * 64,
+        detector_version="legacy-v2",
+    )
+    equivalent_raw.pop("source_file_id")
+    equivalent = adapter.adapt(equivalent_raw, detection_time_ms=9_000).observation
+
+    assert equivalent.event_id == base.event_id
+    assert equivalent.source_event_id == base.source_event_id == "sweep-a"
+
+
 @pytest.mark.parametrize(
     ("raw", "detection_time_ms"),
     [
@@ -336,6 +389,38 @@ def test_adapter_preserves_supplied_source_level_id():
     )
 
     assert result.observation.source_level_id == "detector-level-42"
+
+
+def test_adapter_rejects_absolute_source_file_id_without_path_provenance():
+    result = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        valid_raw(source_file_id=r"C:\\Users\\someone\\sweeps.csv"),
+        detection_time_ms=2_000,
+    )
+
+    assert result.observation is None
+    assert result.rejected.reason_detail == "INVALID_SOURCE_FILE_ID"
+    assert result.rejected.source_file_id is None
+    assert result.rejected.source_observation_hash is None
+    assert "Users" not in canonical_json(result.rejected.to_canonical_dict())
+
+
+def test_adapter_object_timestamp_rejection_is_byte_deterministic():
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    first_value = object()
+    second_value = object()
+
+    first = adapter.adapt(
+        valid_raw(timestamp=first_value), detection_time_ms=2_000
+    ).rejected
+    second = adapter.adapt(
+        valid_raw(timestamp=second_value), detection_time_ms=2_000
+    ).rejected
+
+    first_bytes = canonical_json(first.to_canonical_dict()).encode("ascii")
+    second_bytes = canonical_json(second.to_canonical_dict()).encode("ascii")
+    assert first.reason_detail == second.reason_detail == "INVALID_TIMESTAMP"
+    assert first_bytes == second_bytes
+    assert b"0x" not in first_bytes
 
 
 def test_monitor_callback_provenance_is_stable_for_replay_and_live_rows(tmp_path):
