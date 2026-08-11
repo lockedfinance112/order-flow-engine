@@ -1,6 +1,8 @@
 # Phase 1C.1 Liquidity Event Engine Foundation Design
 
-**Status:** Approved design, ready for implementation planning
+**Spec Version:** 1.0
+
+**Status:** FROZEN_FOR_IMPLEMENTATION
 
 **Date:** 2026-08-11
 
@@ -28,6 +30,7 @@ Phase 1C.1 excludes:
 - Native sweep detection or a rewrite of `SweepsMonitor`.
 - Regime-conditioned liquidity classification.
 - Machine learning or calibrated probability claims.
+- New or materially redesigned absorption, replenishment, or stacking/pulling detection algorithms.
 - Any scoring, execution, allocation, sizing, or trade-governance behavior.
 - Phase 1C.2 absorption/replenishment expansion and Phase 1C.3 liquidity mapping.
 
@@ -116,6 +119,7 @@ The adapter produces a frozen observation containing:
 ```text
 event_id
 source_event_id
+source_level_id
 symbol
 liquidity_side
 swept_level
@@ -130,7 +134,7 @@ source_observation_hash
 detector_version
 ```
 
-`source_file_id` is a stable logical identifier, never an absolute path. `source_row_hash` is populated when the monitor can provide the original row; otherwise it is `None`. `source_observation_hash`, computed from canonical callback content, is always present.
+`source_file_id` is a stable logical identifier, never an absolute path. `source_row_hash` is populated when the monitor can provide the original row; otherwise it is `None`. `source_observation_hash`, computed from canonical callback content, is always present. `source_level_id` preserves a stable detector-provided level identity when available and is otherwise `None`.
 
 Missing source sweep price and penetration remain `None`. The event engine derives `confirmed_sweep_price` and `confirmed_penetration_bps` only from retained canonical trades.
 
@@ -151,7 +155,7 @@ normalized swept level
 
 CSV path, row number, temporary directory, process identity, and machine identity are not part of canonical identity.
 
-Repeated callbacks with the same event ID return the existing event and create no duplicate transition or result. A semantic collision candidate is defined by the same symbol, side, source level identity, and event time within the policy collision window. Identical candidates merge provenance. Materially different levels and opposite-side sweeps remain separate events. Only same-side events whose levels are too close to attribute market evidence safely are finalized `INVALID` with `AMBIGUOUS_EVENT_COLLISION`.
+Repeated callbacks with the same event ID return the existing event and create no duplicate transition or result. A semantic collision candidate is defined by the same symbol, side, level identity, and event time within the policy collision window. Level identity uses `source_level_id` when present; otherwise it is the SHA-256 hash of normalized symbol, liquidity side, and swept level. Swept levels are normalized with `Decimal(str(price)).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_EVEN)` and serialized with exactly eight decimal places. Identical candidates merge provenance. Materially different levels and opposite-side sweeps remain separate events. Only same-side events whose levels are too close to attribute market evidence safely are finalized `INVALID` with `AMBIGUOUS_EVENT_COLLISION`.
 
 ## Time, Ordering, and Buffers
 
@@ -174,7 +178,9 @@ max_seen_exchange_time_ms - reorder_tolerance_ms
 
 Evidence newer than the watermark is provisional. A sufficient branch cannot finalize until its sufficient timestamp is behind the watermark.
 
-The engine exposes `advance_time(symbol, as_of_exchange_time_ms)` and never advances one symbol from another symbol's activity. Live trade and depth observations advance it from exchange timestamps. A sweep callback may advance it to detection time only after retained market data proves continuous mandatory trade coverage through that point. Replay performs an explicit deterministic final advance for each symbol. If replay input ends before an unresolved event's required interval is covered, the event becomes `INVALID / INSUFFICIENT_FUTURE_COVERAGE`, not an assumed timeout.
+The engine exposes `advance_time(symbol, as_of_exchange_time_ms)` and never advances one symbol from another symbol's activity. Live trade and depth observations advance it from exchange timestamps. A sweep callback may advance it to detection time only after retained market data proves valid mandatory trade coverage through that point. Replay performs an explicit deterministic final advance for each symbol. If replay input ends before an unresolved event's required interval is covered, the event becomes `INVALID / INSUFFICIENT_FUTURE_COVERAGE`, not an assumed timeout.
+
+Mandatory trade coverage for an interval is valid exactly when the Guardian reports the trade feed safe, no known stream gap intersects the interval, no buffer overflow affects the interval, no sequence discontinuity remains unresolved, and the complete interval is inside retained history. Valid coverage does not require trades to occur continuously. A quiet interval with a healthy feed is valid zero-activity evidence; the same interval during a known outage is unknown evidence.
 
 The v1 buffer policy is:
 
@@ -191,7 +197,7 @@ recorder_queue_max_items = 10_000
 
 Policy validation requires retention to be at least the sum of the first four values.
 
-A late trade or depth update older than the settled watermark is quarantined and increments late-data telemetry. It cannot mutate settled evidence. An overlapping unresolved event whose mandatory trade interval is compromised becomes `INVALID`; finalized events remain immutable.
+A late trade or depth update older than the settled watermark is quarantined and increments late-data telemetry. It cannot mutate settled evidence. Any unresolved event whose required interval contains compromised mandatory trade data becomes `INVALID / MARKET_DATA_INTEGRITY_COMPROMISED`; finalized events remain immutable.
 
 A late sweep callback is allowed when the complete event interval remains buffered. The engine reconstructs evidence from `event_time_ms`. If required history has been evicted, it finalizes `INVALID` with `INSUFFICIENT_REPLAY_HISTORY`.
 
@@ -238,6 +244,7 @@ acceptance_buffer_bps = 1.0
 reorder_tolerance_ms = 2_000
 collision_window_ms = 2_000
 collision_level_tolerance_bps = 0.5
+canonical_price_decimal_places = 8
 model_version = 1C.1-v1
 ```
 
@@ -281,6 +288,24 @@ Final results are immutable.
 ## Evidence Model
 
 Price behavior determines the outcome. Context may explain, support, or contradict that outcome but cannot change it.
+
+Canonical event-local delta and CVD are derived only from normalized point-in-time trades. Phase 1C.1 must not sample mutable global `FlowMetrics` state for these values. Each event owns an `EventFlowAccumulator` that processes canonically ordered trades from `event_time_ms` and records:
+
+```text
+buy_volume_usdt
+sell_volume_usdt
+signed_delta_usdt
+cumulative_delta_usdt
+post_sweep_cvd_usdt
+cvd_min_usdt
+cvd_max_usdt
+cvd_recovery_usdt
+as_of_ms
+```
+
+Buy-aggressor notional is positive and sell-aggressor notional is negative. Event CVD starts at zero at `event_time_ms`; its minimum, maximum, and direction-normalized recovery are derived from that event-local series. Live and replay therefore produce identical flow evidence from identical trades without depending on existing scanner aggregates.
+
+Phase 1C.1 may consume existing absorption, replenishment, and stacking/pulling observations only through typed normalization adapters. It must not implement or materially redesign those detectors. A missing or incompatible observation is `UNAVAILABLE`; advanced detection remains Phase 1C.2 scope.
 
 Evidence fields include their as-of timestamps and availability state. The model covers:
 
@@ -371,11 +396,39 @@ Recorder I/O is independent of classification. Writes use a bounded queue. Recor
 
 The event store retains at most 128 active events and 1,000 recent final events per symbol. A source observation that would exceed active capacity is rejected with `EVENT_CAPACITY_REACHED`. The recorder queue retains at most 10,000 pending rows and rejects additional writes with an operational failure counter rather than growing without bound.
 
+Every record carries a canonical write key:
+
+```text
+(
+    canonical_record_time_ms,
+    event_id,
+    transition_sequence,
+    record_type_rank,
+    record_content_hash,
+)
+```
+
+`canonical_record_time_ms` is transition time for a transition, classification time for a final event, and detection time for a rejected input. Transition sequence is a zero-based per-event integer. Record type ranks are transition `0`, final event `1`, and rejected input `2`. Live mode may use the bounded asynchronous queue, but keys and row serialization remain canonical. Replay certification accumulates records, performs a stable sort by the full write key, and flushes synchronously through the same row serializers, so thread or operating-system scheduling cannot affect byte output.
+
+Recorder failure does not alter an in-memory classification. It does alter research-run validity. `artifact_integrity` has these values:
+
+```text
+COMPLETE
+RECORDER_FAILURE
+QUEUE_OVERFLOW
+MISSING_EVENT_ROW
+MISSING_TRANSITION_ROW
+```
+
+An exact replay is valid research evidence only when `artifact_integrity == COMPLETE`.
+
 ## Replay
 
 Exact replay merges sweep observations, trades, and depth observations in canonical order. Sweep observations enter at detection time and reconstruct from event time. Replay uses the same adapter, policy, event store, engine, evidence builder, classifier, and recorder as live mode.
 
 There is no research-only classifier, alternate replay threshold, or bar approximation in Phase 1C.1. Identical canonical inputs and policy hashes must produce byte-equivalent event and transition artifacts.
+
+Replay returns a `LiquidityReplayResult` containing `artifact_integrity`, event and transition counts, missing-row counts, recorder failures, queue overflows, and the final policy hash. Certification fails and the replay command exits nonzero for every artifact-integrity value other than `COMPLETE`; classification results remain available for diagnostics but cannot be reported as parity or research evidence.
 
 ## Testing and Acceptance
 
@@ -414,6 +467,12 @@ The implementation must prove:
 31. One symbol's activity cannot advance another symbol's watermark.
 32. Replay without complete future coverage produces `INVALID / INSUFFICIENT_FUTURE_COVERAGE`.
 33. Active-event, recent-event, and recorder queues enforce their frozen bounds.
+34. Event-local delta and CVD are identical live and in replay and do not read sampled `FlowMetrics` state.
+35. Existing absorption, replenishment, and stacking/pulling evidence enters only through typed adapters.
+36. Detector-provided level identity is preserved and missing identity falls back to deterministic normalized level identity.
+37. Recorder failure leaves in-memory classification unchanged but makes replay artifact integrity non-complete.
+38. Canonical replay flush ordering is independent of asynchronous completion order.
+39. A healthy quiet trade interval is valid zero-activity coverage, while an interval with a known gap is compromised.
 
 Phase 1C.1 is complete only when these engineering gates pass and the full existing test suite remains green without new warnings.
 
