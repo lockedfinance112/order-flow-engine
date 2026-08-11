@@ -423,6 +423,45 @@ def test_adapter_object_timestamp_rejection_is_byte_deterministic():
     assert b"0x" not in first_bytes
 
 
+def test_adapter_extreme_finite_level_returns_deterministic_rejection():
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    rejections = []
+
+    for _ in range(2):
+        try:
+            result = adapter.adapt(
+                valid_raw(sweep_level="1e100"), detection_time_ms=2_000
+            )
+        except Exception as exc:
+            pytest.fail(f"adapter escaped instead of rejecting: {type(exc).__name__}")
+        rejections.append(result.rejected)
+
+    first_bytes = canonical_json(rejections[0].to_canonical_dict()).encode("ascii")
+    second_bytes = canonical_json(rejections[1].to_canonical_dict()).encode("ascii")
+    assert rejections[0].reason_detail == "INVALID_SWEPT_LEVEL"
+    assert rejections[1].reason_detail == "INVALID_SWEPT_LEVEL"
+    assert first_bytes == second_bytes
+
+
+def test_adapter_object_detection_time_uses_deterministic_integer_sentinel():
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    first = adapter.adapt(valid_raw(), detection_time_ms=object()).rejected
+    second = adapter.adapt(valid_raw(), detection_time_ms=object()).rejected
+
+    try:
+        first_bytes = canonical_json(first.to_canonical_dict()).encode("ascii")
+        second_bytes = canonical_json(second.to_canonical_dict()).encode("ascii")
+    except (TypeError, ValueError) as exc:
+        pytest.fail(
+            f"rejection must remain canonical-serializable: {type(exc).__name__}"
+        )
+
+    assert first.detection_time_ms == second.detection_time_ms == -1
+    assert first.reason_detail == second.reason_detail == "INVALID_DETECTION_TIME"
+    assert first_bytes == second_bytes
+    assert b"0x" not in first_bytes
+
+
 def test_monitor_callback_provenance_is_stable_for_replay_and_live_rows(tmp_path):
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     row = [timestamp, "BTCUSDT", "BULLISH", "100.0", "sweep-a", "", "", "RAW_SWEEP"]

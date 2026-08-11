@@ -158,6 +158,12 @@ class SweepsMonitorAdapter:
     def adapt(
         self, raw: Mapping[str, Any], detection_time_ms: int
     ) -> SweepAdapterResult:
+        rejection_detection_time_ms = (
+            detection_time_ms
+            if isinstance(detection_time_ms, int)
+            and not isinstance(detection_time_ms, bool)
+            else -1
+        )
         try:
             if not isinstance(detection_time_ms, int) or isinstance(detection_time_ms, bool):
                 raise _InvalidSweepObservation("INVALID_DETECTION_TIME")
@@ -187,6 +193,13 @@ class SweepsMonitorAdapter:
                 raise _InvalidSweepObservation("INVALID_SWEPT_LEVEL") from None
             if not swept_level.is_finite() or swept_level <= 0:
                 raise _InvalidSweepObservation("INVALID_SWEPT_LEVEL")
+            try:
+                normalized_swept_level = normalize_price(
+                    swept_level,
+                    self.policy.canonical_price_decimal_places,
+                )
+            except (InvalidOperation, TypeError, ValueError):
+                raise _InvalidSweepObservation("INVALID_SWEPT_LEVEL") from None
 
             source_event_id = _required_text(
                 raw, "sweep_id", "INVALID_SOURCE_EVENT_ID"
@@ -221,17 +234,18 @@ class SweepsMonitorAdapter:
                     "liquidity_side": side.value,
                     "source": SweepSource.SWEEPS_MONITOR_CSV.value,
                     "source_event_id": source_event_id,
-                    "swept_level": normalize_price(
-                        swept_level,
-                        self.policy.canonical_price_decimal_places,
-                    ),
+                    "swept_level": normalized_swept_level,
                     "symbol": symbol,
                 }
             )
         except _InvalidSweepObservation as exc:
             return SweepAdapterResult(
                 observation=None,
-                rejected=rejected_from(raw, detection_time_ms, exc.detail_code),
+                rejected=rejected_from(
+                    raw,
+                    rejection_detection_time_ms,
+                    exc.detail_code,
+                ),
             )
 
         observation = LiquiditySweepObservation(
