@@ -60,8 +60,12 @@ def observation(**overrides):
     return replace(adapted, **values)
 
 
-def final_result(event, classification_time_ms=2_000):
+def final_result(event, market_resolution_time_ms=2_000):
     source = event.observation
+    classification_time_ms = max(
+        market_resolution_time_ms,
+        source.detection_time_ms,
+    )
     return LiquidityEventResult(
         event_id=event.event_id,
         symbol=source.symbol,
@@ -70,7 +74,7 @@ def final_result(event, classification_time_ms=2_000):
         reason_code="TEST_FINALIZATION",
         event_time_ms=source.event_time_ms,
         detection_time_ms=source.detection_time_ms,
-        market_resolution_time_ms=classification_time_ms,
+        market_resolution_time_ms=market_resolution_time_ms,
         classification_time_ms=classification_time_ms,
         source_observation_hash=source.source_observation_hash,
         evidence=LiquidityEvidence(),
@@ -205,8 +209,8 @@ def test_finalize_moves_matching_result_once_and_bounds_recent_results():
     store = LiquidityEventStore(policy)
     first = store.open_event(observation(event_id="one")).event
     second = store.open_event(observation(event_id="two", level="200")).event
-    first_result = final_result(first, classification_time_ms=3_000)
-    second_result = final_result(second, classification_time_ms=2_000)
+    first_result = final_result(first, market_resolution_time_ms=3_000)
+    second_result = final_result(second, market_resolution_time_ms=2_000)
 
     store.finalize(first_result)
     store.finalize(first_result)
@@ -225,9 +229,9 @@ def test_recent_retention_eviction_is_independent_per_symbol():
     eth = store.open_event(
         observation(event_id="eth", symbol="ETHUSDT", level="300")
     ).event
-    btc_old_result = final_result(btc_old, classification_time_ms=1_000)
-    btc_new_result = final_result(btc_new, classification_time_ms=2_000)
-    eth_result = final_result(eth, classification_time_ms=1_500)
+    btc_old_result = final_result(btc_old, market_resolution_time_ms=1_000)
+    btc_new_result = final_result(btc_new, market_resolution_time_ms=2_000)
+    eth_result = final_result(eth, market_resolution_time_ms=1_500)
 
     store.finalize(btc_old_result)
     store.finalize(eth_result)
@@ -249,9 +253,9 @@ def test_recent_symbol_filtering_returns_multiple_results_in_canonical_order():
     eth = store.open_event(
         observation(event_id="eth", symbol="ETHUSDT", level="300")
     ).event
-    later_result = final_result(later, classification_time_ms=5_000)
-    earlier_result = final_result(earlier, classification_time_ms=3_000)
-    eth_result = final_result(eth, classification_time_ms=1_000)
+    later_result = final_result(later, market_resolution_time_ms=5_000)
+    earlier_result = final_result(earlier, market_resolution_time_ms=3_000)
+    eth_result = final_result(eth, market_resolution_time_ms=1_000)
 
     store.finalize(later_result)
     store.finalize(eth_result)
