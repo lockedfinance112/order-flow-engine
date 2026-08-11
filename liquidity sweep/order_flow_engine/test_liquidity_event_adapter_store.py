@@ -8,12 +8,19 @@ import pytest
 
 from liquidity_event import (
     EventClassification,
+    EventState,
+    IdentityAlreadyExists,
+    IdentityAuthorityUnavailable,
+    IdentityClaimOutcome,
+    LifecycleTransition,
     LiquidityClassificationPolicy,
     LiquidityEventResult,
     LiquidityEvidence,
     LiquiditySide,
+    SQLiteIdentityAuthority,
     canonical_hash,
     canonical_json,
+    recover_claimed_unresolved,
 )
 from sweeps_monitor import SweepsMonitor
 
@@ -48,6 +55,10 @@ def store_api():
     return LiquidityEventStore
 
 
+def broken_sqlite_execute(*args, **kwargs):
+    raise RuntimeError("sqlite unavailable")
+
+
 def observation(**overrides):
     aliases = {
         "level": "swept_level",
@@ -60,6 +71,72 @@ def observation(**overrides):
     values = {aliases.get(key, key): value for key, value in overrides.items()}
     values.setdefault("event_id", "same")
     return replace(adapted, **values)
+
+
+def lifecycle_transition(event_id="same", transition_sequence=0):
+    previous = None if transition_sequence == 0 else EventState.OBSERVED
+    next_state = EventState.OBSERVED if transition_sequence == 0 else EventState.UNRESOLVED
+    return LifecycleTransition(
+        event_id=event_id,
+        previous_state=previous,
+        next_state=next_state,
+        transition_time_ms=2_000 + transition_sequence,
+        transition_sequence=transition_sequence,
+        reason_code=f"TEST_TRANSITION_{transition_sequence}",
+    )
+
+
+def finalized_result(event_id="same", policy=None):
+    source = observation(event_id=event_id)
+    policy = policy or LiquidityClassificationPolicy()
+    return LiquidityEventResult(
+        event_id=event_id,
+        symbol=source.symbol,
+        liquidity_side=source.liquidity_side,
+        classification=EventClassification.INVALID,
+        reason_code="TEST_FINALIZATION",
+        event_time_ms=source.event_time_ms,
+        detection_time_ms=source.detection_time_ms,
+        market_resolution_time_ms=2_000,
+        classification_time_ms=2_000,
+        source_observation_hash=source.source_observation_hash,
+        evidence=LiquidityEvidence(),
+        policy_hash=policy.policy_hash,
+        model_version=policy.model_version,
+    )
+
+
+def complete_history_for(event):
+    return {
+        "complete": True,
+        "transitions": (
+            lifecycle_transition(event_id=event.event_id, transition_sequence=0),
+            lifecycle_transition(event_id=event.event_id, transition_sequence=1),
+            lifecycle_transition(event_id=event.event_id, transition_sequence=2),
+        ),
+    }
+
+
+def missing_history_for(event):
+    policy = LiquidityClassificationPolicy()
+    return {
+        "complete": False,
+        "result": LiquidityEventResult(
+            event_id=event.event_id,
+            symbol=event.symbol,
+            liquidity_side=event.liquidity_side,
+            classification=EventClassification.INVALID,
+            reason_code="INSUFFICIENT_REPLAY_HISTORY",
+            event_time_ms=event.event_time_ms,
+            detection_time_ms=event.detection_time_ms,
+            market_resolution_time_ms=event.detection_time_ms,
+            classification_time_ms=event.detection_time_ms,
+            source_observation_hash=event.source_observation_hash,
+            evidence=LiquidityEvidence(),
+            policy_hash=policy.policy_hash,
+            model_version=policy.model_version,
+        ),
+    }
 
 
 def final_result(event, market_resolution_time_ms=2_000, policy=None):
@@ -101,6 +178,122 @@ def result_with_invalid_timing(event):
     result = final_result(event, market_resolution_time_ms=3_000)
     object.__setattr__(result, "classification_time_ms", 2_999)
     return result
+
+
+def test_sqlite_identity_claim_is_exact_and_survives_restart(tmp_path):
+    db_path = tmp_path / "identity.sqlite3"
+    first = SQLiteIdentityAuthority(db_path)
+    assert first.claim_observation(observation(event_id="same")).outcome is IdentityClaimOutcome.NEW
+    first.close()
+
+    restarted = SQLiteIdentityAuthority(db_path)
+    result = restarted.claim_observation(observation(event_id="same"))
+    assert result.outcome is IdentityClaimOutcome.DUPLICATE_EXISTING
+    assert result.event_id == "same"
+
+
+def test_identity_conflict_fails_closed_for_same_event_id(tmp_path):
+    authority = SQLiteIdentityAuthority(tmp_path / "identity.sqlite3")
+    assert authority.claim_observation(observation(event_id="same", level="117250.00")).outcome is IdentityClaimOutcome.NEW
+    conflict = authority.claim_observation(observation(event_id="same", level="117251.00"))
+    assert conflict.outcome is IdentityClaimOutcome.IDENTITY_CONFLICT
+    assert "immutable identity" in conflict.conflict_reason
+
+
+def test_finalized_identity_survives_eviction_restart_and_conflict_fails_closed(tmp_path):
+    db_path = tmp_path / "identity.sqlite3"
+    authority = SQLiteIdentityAuthority(db_path)
+    policy = replace(LiquidityClassificationPolicy(), recent_final_events_per_symbol=0)
+    store = store_api()(policy)
+    event = observation(event_id="same", level="117250.00")
+    claim = authority.claim_observation(event)
+    opened = store.open_event(event)
+    final = finalized_result(event_id="same", policy=policy)
+    authority.claim_result(final)
+    store.finalize(final)
+    assert claim.outcome is IdentityClaimOutcome.NEW
+    assert opened.event.event_id not in {result.event_id for result in store.recent()}
+    authority.close()
+
+    restarted = SQLiteIdentityAuthority(db_path)
+    duplicate = restarted.claim_observation(event)
+    conflict = restarted.claim_observation(observation(event_id="same", level="117251.00"))
+    assert duplicate.outcome is IdentityClaimOutcome.DUPLICATE_EXISTING
+    assert conflict.outcome is IdentityClaimOutcome.IDENTITY_CONFLICT
+
+
+def test_transition_and_result_uniqueness_are_hard_constraints(tmp_path):
+    authority = SQLiteIdentityAuthority(tmp_path / "identity.sqlite3")
+    event = observation(event_id="same")
+    authority.claim_observation(event)
+    transition = lifecycle_transition(event_id="same", transition_sequence=0)
+    result = finalized_result(event_id="same")
+    authority.claim_transition(transition)
+    authority.claim_result(result)
+    with pytest.raises(IdentityAlreadyExists):
+        authority.claim_transition(transition)
+    with pytest.raises(IdentityAlreadyExists):
+        authority.claim_result(result)
+
+
+def test_orphan_transition_and_result_claims_fail_closed(tmp_path):
+    transition_authority = SQLiteIdentityAuthority(tmp_path / "transition.sqlite3")
+    with pytest.raises(IdentityAuthorityUnavailable):
+        transition_authority.claim_transition(
+            lifecycle_transition(event_id="orphan", transition_sequence=0)
+        )
+    assert transition_authority.lookup("orphan") is None
+    assert transition_authority.persisted_transition_sequences("orphan") == set()
+
+    result_authority = SQLiteIdentityAuthority(tmp_path / "result.sqlite3")
+    with pytest.raises(IdentityAuthorityUnavailable):
+        result_authority.claim_result(finalized_result(event_id="orphan"))
+    assert result_authority.lookup("orphan") is None
+
+
+def test_claimed_unresolved_restart_recovery_emits_only_missing_transition_keys(tmp_path):
+    db_path = tmp_path / "identity.sqlite3"
+    authority = SQLiteIdentityAuthority(db_path)
+    event = observation(event_id="same")
+    authority.claim_observation(event)
+    authority.claim_transition(lifecycle_transition(event_id="same", transition_sequence=0))
+    authority.close()
+
+    restarted = SQLiteIdentityAuthority(db_path)
+    pending = restarted.pending_unresolved()
+    assert [item.event_id for item in pending] == ["same"]
+    assert restarted.persisted_transition_sequences("same") == {0}
+    recovery = recover_claimed_unresolved(
+        authority=restarted,
+        pending_identity=pending[0],
+        retained_history=complete_history_for(event),
+    )
+    assert [transition.transition_sequence for transition in recovery.emitted_transitions] == [1, 2]
+
+
+def test_claimed_unresolved_restart_without_history_finalizes_once_as_insufficient_replay_history(tmp_path):
+    db_path = tmp_path / "identity.sqlite3"
+    authority = SQLiteIdentityAuthority(db_path)
+    event = observation(event_id="same")
+    authority.claim_observation(event)
+    authority.close()
+
+    restarted = SQLiteIdentityAuthority(db_path)
+    recovery = recover_claimed_unresolved(
+        authority=restarted,
+        pending_identity=restarted.pending_unresolved()[0],
+        retained_history=missing_history_for(event),
+    )
+    assert recovery.result.reason_code == "INSUFFICIENT_REPLAY_HISTORY"
+    with pytest.raises(IdentityAlreadyExists):
+        restarted.claim_result(recovery.result)
+
+
+def test_authority_failure_prevents_new_event(monkeypatch, tmp_path):
+    authority = SQLiteIdentityAuthority(tmp_path / "identity.sqlite3")
+    monkeypatch.setattr(authority, "_execute", broken_sqlite_execute)
+    with pytest.raises(IdentityAuthorityUnavailable):
+        authority.claim_observation(observation(event_id="same"))
 
 
 def test_duplicate_callback_returns_same_event_without_duplicate():

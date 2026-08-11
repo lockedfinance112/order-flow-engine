@@ -22,6 +22,16 @@ from .models import (
     canonical_json,
     normalize_price,
 )
+from .identity_authority import (
+    ClaimedUnresolvedRecovery,
+    IdentityAlreadyExists,
+    IdentityAuthorityUnavailable,
+    IdentityClaimOutcome,
+    IdentityClaimResult,
+    PersistedIdentity,
+    SQLiteIdentityAuthority,
+    recover_claimed_unresolved,
+)
 from .policy import LiquidityClassificationPolicy
 
 __all__ = [
@@ -33,6 +43,11 @@ __all__ = [
     "EvidenceValue",
     "EventClassification",
     "EventState",
+    "ClaimedUnresolvedRecovery",
+    "IdentityAlreadyExists",
+    "IdentityAuthorityUnavailable",
+    "IdentityClaimOutcome",
+    "IdentityClaimResult",
     "LifecycleTransition",
     "LiquidityClassificationPolicy",
     "LiquidityEvent",
@@ -41,11 +56,14 @@ __all__ = [
     "LiquiditySide",
     "LiquiditySweepObservation",
     "MarketTrade",
+    "PersistedIdentity",
     "RejectedSweepInput",
+    "SQLiteIdentityAuthority",
     "SweepSource",
     "TradeCoverage",
     "TradeCoverageProvider",
     "canonical_hash",
     "canonical_json",
     "normalize_price",
+    "recover_claimed_unresolved",
 ]
