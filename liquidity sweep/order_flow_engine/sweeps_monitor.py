@@ -5,6 +5,7 @@ import logging
 from typing import Callable, Awaitable
 from datetime import datetime, timezone
 from config import SWEEPS_CSV_PATH
+from liquidity_event import canonical_hash
 
 logger = logging.getLogger("OrderFlow.SweepsMonitor")
 
@@ -50,6 +51,27 @@ class SweepsMonitor:
 
     def _ensure_directory_exists(self):
         os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
+
+    @staticmethod
+    def _callback_sweep_from_row(row: list[str]) -> dict:
+        if len(row) >= 15:
+            sweep_id = row[13]
+        else:
+            sweep_id = row[4] if len(row) > 4 else f"swp_{row[0]}_{row[1]}_{row[2]}_{row[3]}"
+
+        return {
+            "timestamp": row[0],
+            "symbol": row[1],
+            "type": row[2],
+            "sweep_level": float(row[3]),
+            "sweep_id": sweep_id,
+            "source_file_id": "SWEEPS_MONITOR_CSV",
+            "source_row_hash": canonical_hash(row),
+            "source_level_id": None,
+            "detector_version": None,
+            "source_sweep_price": None,
+            "source_penetration_bps": None,
+        }
 
     async def _replay_recent_sweeps(self):
         """
@@ -117,13 +139,7 @@ class SweepsMonitor:
 
                     # Valid sweep matching replay parameters
                     try:
-                        sweep = {
-                            "timestamp": timestamp_str,
-                            "symbol": symbol,
-                            "type": direction, # Callback expects 'type' as the direction field
-                            "sweep_level": float(sweep_level_str),
-                            "sweep_id": sweep_id
-                        }
+                        sweep = self._callback_sweep_from_row(row)
                         
                         logger.info(f"Replaying active sweep on startup: {sweep_id} ({state})")
                         await self.callback(sweep)
@@ -160,23 +176,7 @@ class SweepsMonitor:
                             if row[0] == "timestamp":
                                 continue
                             try:
-                                # Determine columns dynamically or use indices (index 13 in V2)
-                                if len(row) >= 15:
-                                    sweep_id = row[13]
-                                    direction = row[2]
-                                    sweep_level = float(row[3])
-                                else:
-                                    sweep_id = row[4] if len(row) > 4 else f"swp_{row[0]}_{row[1]}_{row[2]}_{row[3]}"
-                                    direction = row[2]
-                                    sweep_level = float(row[3])
-
-                                sweep = {
-                                    "timestamp": row[0],
-                                    "symbol": row[1],
-                                    "type": direction,
-                                    "sweep_level": sweep_level,
-                                    "sweep_id": sweep_id
-                                }
+                                sweep = self._callback_sweep_from_row(row)
                                 logger.info(f"Detected new sweep alert from CSV: {sweep}")
                                 await self.callback(sweep)
                             except Exception as pe:
