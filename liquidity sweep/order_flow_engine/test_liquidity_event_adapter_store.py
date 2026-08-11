@@ -2,6 +2,7 @@ import asyncio
 import csv
 from dataclasses import replace
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -644,6 +645,188 @@ def test_adapter_preserves_exact_millisecond_timestamp():
 
     assert result.rejected is None
     assert result.observation.event_time_ms == 1_001
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "1970-01-01T00:00:01.0011Z",
+        "1970-01-01T00:00:01.0010001Z",
+        "1970-01-01T00:00:01.0010000001Z",
+        "1970-01-01T00:00:01.0010001+00:00",
+        "1970-01-01T00:00:01.0010001-00:00",
+        "1970-01-01t00:00:01.0010001+00:00",
+        "1970-01-01_00:00:01.0010001+00:00",
+        "1970-01-01T00:00:01.001+00:00:00.0000001",
+    ],
+)
+def test_adapter_rejects_nonzero_precision_beyond_milliseconds(timestamp):
+    result = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        valid_raw(timestamp=timestamp), detection_time_ms=2_000
+    )
+
+    assert result.observation is None
+    assert result.rejected.reason_detail == "INVALID_TIMESTAMP"
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "1970-01-01T00:00:01.0010Z",
+        "1970-01-01T00:00:01.0010000Z",
+        "1970-01-01T00:00:01.0010000000Z",
+        "1970-01-01T00:00:01.0010000+00:00",
+        "1970-01-01T00:00:01.0010000-00:00",
+        "1970-01-01t00:00:01.0010000+00:00",
+    ],
+)
+def test_adapter_accepts_zero_precision_beyond_milliseconds(timestamp):
+    result = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        valid_raw(timestamp=timestamp), detection_time_ms=2_000
+    )
+
+    assert result.rejected is None
+    assert result.observation.event_time_ms == 1_001
+
+
+@pytest.mark.parametrize(
+    "source_sweep_price",
+    [
+        0,
+        "0",
+        "-0",
+        Decimal("-0.00000000"),
+        "-0.00000001",
+        "-100",
+        "0.000000004",
+        "-0.000000004",
+    ],
+    ids=[
+        "integer-zero",
+        "string-zero",
+        "signed-zero",
+        "decimal-signed-zero",
+        "smallest-negative",
+        "negative",
+        "positive-rounds-to-zero",
+        "negative-rounds-to-zero",
+    ],
+)
+def test_adapter_rejects_source_price_not_positive_after_normalization(
+    source_sweep_price,
+):
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    rejections = [
+        adapter.adapt(
+            valid_raw(source_sweep_price=source_sweep_price),
+            detection_time_ms=2_000,
+        ).rejected
+        for _ in range(2)
+    ]
+
+    assert all(rejection is not None for rejection in rejections)
+    rejection_bytes = [
+        canonical_json(rejection.to_canonical_dict()).encode("ascii")
+        for rejection in rejections
+    ]
+    assert all(
+        rejection.reason_detail == "INVALID_SOURCE_SWEEP_PRICE"
+        for rejection in rejections
+    )
+    assert rejection_bytes[0] == rejection_bytes[1]
+
+
+def _assert_noncanonical_callback_rejection_is_stable(raw, detection_time_ms=2_000):
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    try:
+        rejections = [
+            adapter.adapt(raw, detection_time_ms=detection_time_ms).rejected
+            for _ in range(2)
+        ]
+    except RecursionError:
+        pytest.fail("recursive callback content escaped instead of being rejected")
+
+    assert all(rejection is not None for rejection in rejections)
+    rejection_bytes = [
+        canonical_json(rejection.to_canonical_dict()).encode("ascii")
+        for rejection in rejections
+    ]
+    assert all(
+        rejection.reason_detail == "NON_CANONICAL_CALLBACK"
+        for rejection in rejections
+    )
+    assert all(rejection.source_observation_hash is None for rejection in rejections)
+    assert rejection_bytes[0] == rejection_bytes[1]
+
+
+def test_adapter_rejects_cyclic_callback_content_without_recursion_error():
+    cycle = []
+    cycle.append(cycle)
+
+    _assert_noncanonical_callback_rejection_is_stable(
+        valid_raw(callback_metadata=cycle)
+    )
+    _assert_noncanonical_callback_rejection_is_stable(
+        valid_raw(type="UP", callback_metadata=cycle), detection_time_ms=-1
+    )
+
+
+def test_adapter_rejects_excessively_deep_callback_content_without_recursion_error():
+    nested = []
+    for _ in range(2_000):
+        nested = [nested]
+
+    _assert_noncanonical_callback_rejection_is_stable(
+        valid_raw(callback_metadata=nested)
+    )
+
+
+@pytest.mark.parametrize(
+    "detection_time_ms",
+    [
+        True,
+        -1,
+        253_402_300_800_000,
+        10**5_000,
+        -(10**5_000),
+    ],
+    ids=["bool", "negative", "past-utc-domain", "huge-positive", "huge-negative"],
+)
+def test_adapter_rejects_noncanonical_detection_time_with_safe_sentinel(
+    detection_time_ms,
+):
+    adapter = adapter_api()(LiquidityClassificationPolicy())
+    try:
+        rejections = [
+            adapter.adapt(valid_raw(), detection_time_ms=detection_time_ms).rejected
+            for _ in range(2)
+        ]
+        assert all(rejection is not None for rejection in rejections)
+        rejection_bytes = [
+            canonical_json(rejection.to_canonical_dict()).encode("ascii")
+            for rejection in rejections
+        ]
+    except (OverflowError, ValueError) as exc:
+        pytest.fail(
+            "invalid detection time escaped canonical rejection: "
+            f"{type(exc).__name__}"
+        )
+
+    assert all(rejection.detection_time_ms == -1 for rejection in rejections)
+    assert all(
+        rejection.reason_detail == "INVALID_DETECTION_TIME"
+        for rejection in rejections
+    )
+    assert rejection_bytes[0] == rejection_bytes[1]
+
+
+def test_adapter_accepts_maximum_utc_domain_detection_time():
+    result = adapter_api()(LiquidityClassificationPolicy()).adapt(
+        valid_raw(), detection_time_ms=253_402_300_799_999
+    )
+
+    assert result.rejected is None
+    assert result.observation.detection_time_ms == 253_402_300_799_999
 
 
 def test_adapter_object_detection_time_uses_deterministic_integer_sentinel():

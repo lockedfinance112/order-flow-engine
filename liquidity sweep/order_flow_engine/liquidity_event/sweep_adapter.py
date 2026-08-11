@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import math
+import re
 from typing import Any, Mapping
 
 from .models import (
@@ -27,9 +28,23 @@ class _InvalidSweepObservation(ValueError):
         self.detail_code = detail_code
 
 
+_FRACTIONAL_TIME_COMPONENT_PATTERN = re.compile(
+    r"\d{2}:?\d{2}:?\d{2}[.,](\d+)"
+)
+_MAX_UTC_TIMESTAMP_MS = 253_402_300_799_999
+_REJECTION_TIMESTAMP_SENTINEL = -1
+_MAX_CALLBACK_CONTAINER_DEPTH = 64
+
+
 def parse_utc_ms(value: str) -> int:
     if not value:
         raise ValueError("timestamp is missing")
+    fractional_components = _FRACTIONAL_TIME_COMPONENT_PATTERN.findall(value)
+    if any(
+        any(digit != "0" for digit in component[3:])
+        for component in fractional_components
+    ):
+        raise ValueError("timestamp must have millisecond precision")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
         raise ValueError("timestamp must be UTC")
@@ -139,18 +154,52 @@ def _source_row_hash(raw: Mapping[str, Any]) -> str | None:
 
 
 def _source_observation_hash(raw: Mapping[str, Any]) -> str | None:
-    source_file_id = raw.get("source_file_id")
-    if source_file_id not in (None, SweepSource.SWEEPS_MONITOR_CSV.value):
-        return None
     try:
         return canonical_hash(dict(raw))
-    except (TypeError, ValueError):
+    except (OverflowError, RecursionError, TypeError, ValueError):
         return None
+
+
+def _has_unsafe_container_topology(raw: Mapping[str, Any]) -> bool:
+    active_container_ids: set[int] = set()
+    stack: list[tuple[Any, int, bool]] = [(raw, 0, False)]
+    try:
+        while stack:
+            value, depth, exiting = stack.pop()
+            if exiting:
+                active_container_ids.remove(id(value))
+                continue
+            if isinstance(value, Mapping):
+                children = value.values()
+            elif isinstance(value, (list, tuple)):
+                children = value
+            else:
+                continue
+            if depth > _MAX_CALLBACK_CONTAINER_DEPTH:
+                return True
+            container_id = id(value)
+            if container_id in active_container_ids:
+                return True
+            active_container_ids.add(container_id)
+            stack.append((value, depth, True))
+            stack.extend((child, depth + 1, False) for child in children)
+    except (KeyError, RecursionError, RuntimeError, TypeError, ValueError):
+        return True
+    return False
 
 
 def rejected_from(
-    raw: Mapping[str, Any], detection_time_ms: int, reason_detail: str
+    raw: Mapping[str, Any],
+    detection_time_ms: int,
+    reason_detail: str,
+    source_observation_hash: str | None,
 ) -> RejectedSweepInput:
+    supplied_source_file_id = raw.get("source_file_id")
+    if supplied_source_file_id not in (
+        None,
+        SweepSource.SWEEPS_MONITOR_CSV.value,
+    ):
+        source_observation_hash = None
     return RejectedSweepInput(
         source=SweepSource.SWEEPS_MONITOR_CSV,
         detection_time_ms=detection_time_ms,
@@ -158,7 +207,7 @@ def rejected_from(
         reason_detail=reason_detail,
         source_file_id=_sanitized_source_file_id(raw),
         source_row_hash=_sanitized_source_row_hash(raw),
-        source_observation_hash=_source_observation_hash(raw),
+        source_observation_hash=source_observation_hash,
     )
 
 
@@ -175,16 +224,30 @@ class SweepsMonitorAdapter:
     def adapt(
         self, raw: Mapping[str, Any], detection_time_ms: int
     ) -> SweepAdapterResult:
+        detection_time_is_valid = (
+            type(detection_time_ms) is int
+            and 0 <= detection_time_ms <= _MAX_UTC_TIMESTAMP_MS
+        )
         rejection_detection_time_ms = (
             detection_time_ms
-            if isinstance(detection_time_ms, int)
-            and not isinstance(detection_time_ms, bool)
-            else -1
+            if detection_time_is_valid
+            else _REJECTION_TIMESTAMP_SENTINEL
         )
+        if not isinstance(raw, Mapping):
+            raw = {}
+        if _has_unsafe_container_topology(raw):
+            return SweepAdapterResult(
+                observation=None,
+                rejected=rejected_from(
+                    raw,
+                    rejection_detection_time_ms,
+                    "NON_CANONICAL_CALLBACK",
+                    None,
+                ),
+            )
+        source_observation_hash = _source_observation_hash(raw)
         try:
-            if not isinstance(detection_time_ms, int) or isinstance(detection_time_ms, bool):
-                raise _InvalidSweepObservation("INVALID_DETECTION_TIME")
-            if detection_time_ms < 0:
+            if not detection_time_is_valid:
                 raise _InvalidSweepObservation("INVALID_DETECTION_TIME")
 
             direction = _required_text(raw, "type", "INVALID_DIRECTION")
@@ -240,10 +303,7 @@ class SweepsMonitorAdapter:
                     raise _InvalidSweepObservation(
                         "INVALID_SOURCE_SWEEP_PRICE"
                     ) from None
-                if (
-                    source_sweep_price != 0
-                    and Decimal(normalized_source_sweep_price) == 0
-                ):
+                if Decimal(normalized_source_sweep_price) <= 0:
                     raise _InvalidSweepObservation("INVALID_SOURCE_SWEEP_PRICE")
             source_penetration_bps = _optional_float(
                 raw,
@@ -259,10 +319,8 @@ class SweepsMonitorAdapter:
                 )
                 or self.DEFAULT_DETECTOR_VERSION
             )
-            source_observation_hash = _source_observation_hash(raw)
             if source_observation_hash is None:
                 raise _InvalidSweepObservation("NON_CANONICAL_CALLBACK")
-
             event_id = canonical_hash(
                 {
                     "event_time_ms": event_time_ms,
@@ -280,6 +338,7 @@ class SweepsMonitorAdapter:
                     raw,
                     rejection_detection_time_ms,
                     exc.detail_code,
+                    source_observation_hash,
                 ),
             )
 
