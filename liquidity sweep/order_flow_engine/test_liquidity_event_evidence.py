@@ -426,19 +426,91 @@ def test_optional_context_reasons_do_not_alter_confidence_score():
     assert ev.values["volume_expansion_ratio"].value == 2.4
 
 
-def test_conflicting_duplicate_trade_sequence_resolves_canonically_independent_of_feed_order():
+def test_conflicting_duplicate_sequence_resolves_canonically_independent_of_arrival_order():
     # Two records with the same symbol and sequence_id, but conflicting contents
     trade_a = trade(1_000, "BUY", 100, sequence_id=500, price=100.0)
     trade_b = trade(1_000, "SELL", 100, sequence_id=500, price=101.0)
 
-    snap_ab = accumulate([trade_a, trade_b])
-    snap_ba = accumulate([trade_b, trade_a])
+    flow_ab = EventFlowAccumulator(event_time_ms=1_000)
+    flow_ab.on_trade(trade_a)
+    flow_ab.on_trade(trade_b)
 
-    assert snap_ab == snap_ba
-    # Verify the winner is canonically deterministic (min by canonical_key)
+    flow_ba = EventFlowAccumulator(event_time_ms=1_000)
+    flow_ba.on_trade(trade_b)
+    flow_ba.on_trade(trade_a)
+
+    # Prove snapshot(A,B) == snapshot(B,A)
+    assert flow_ab.snapshot() == flow_ba.snapshot()
+    # Prove trades(A,B) == trades(B,A)
+    assert flow_ab.trades() == flow_ba.trades()
+    # Prove exactly one canonical trade survives for the sequence identity
+    assert len(flow_ab.trades()) == 1
+    assert len(flow_ba.trades()) == 1
     canonical_winner = min(trade_a, trade_b, key=lambda t: t.canonical_key)
-    expected_buy = 100.0 if canonical_winner.aggressor_side is AggressorSide.BUY else 0.0
-    assert snap_ab.buy_volume_usdt == expected_buy
+    assert flow_ab.trades()[0] == canonical_winner
+
+
+def test_same_sequence_same_timestamp_content_hash_tie_resolution():
+    # Same symbol, sequence, timestamp, but different price / quantity
+    trade_x = MarketTrade(
+        symbol="BTCUSDT",
+        price=100.0,
+        quantity=1.0,
+        aggressor_side=AggressorSide.BUY,
+        exchange_time_ms=1_000,
+        sequence_id=999,
+    )
+    trade_y = MarketTrade(
+        symbol="BTCUSDT",
+        price=100.5,
+        quantity=1.0,
+        aggressor_side=AggressorSide.BUY,
+        exchange_time_ms=1_000,
+        sequence_id=999,
+    )
+
+    flow_xy = EventFlowAccumulator(event_time_ms=1_000)
+    flow_xy.on_trade(trade_x)
+    flow_xy.on_trade(trade_y)
+
+    flow_yx = EventFlowAccumulator(event_time_ms=1_000)
+    flow_yx.on_trade(trade_y)
+    flow_yx.on_trade(trade_x)
+
+    assert flow_xy.snapshot() == flow_yx.snapshot()
+    assert flow_xy.trades() == flow_yx.trades()
+    assert len(flow_xy.trades()) == 1
+    winner = min(trade_x, trade_y, key=lambda t: t.canonical_key)
+    assert flow_xy.trades()[0] == winner
+
+
+def test_available_zero_context_is_neutral_without_reasons_or_contradictions():
+    builder = LiquidityEvidenceBuilder()
+    evt = LiquidityEvent(observation=sweep_observation())
+
+    rep_zero = EvidenceValue(EvidenceAvailability.AVAILABLE, 0.0, 5_000)
+    sp_zero = EvidenceValue(EvidenceAvailability.AVAILABLE, 0.0, 5_000)
+    abs_zero = EvidenceValue(EvidenceAvailability.AVAILABLE, 0.0, 5_000)
+    depth_zero = EvidenceValue(EvidenceAvailability.AVAILABLE, 0.0, 5_000)
+
+    ev = builder.build(
+        event=evt,
+        outcome_direction=EventClassification.FAILED_BREAKDOWN,
+        as_of_ms=5_000,
+        absorption=abs_zero,
+        depth_weighted_imbalance=depth_zero,
+        replenishment=rep_zero,
+        stacking_pulling=sp_zero,
+    )
+
+    # Zero value is neutral: base confidence 0.60, zero support/contradiction, no extra reasons
+    assert ev.confidence == 0.60
+    assert ev.evidence_strength == 0.60
+    assert ev.contradiction_strength == 0.0
+    assert ev.reasons == ("PRICE_OUTCOME_CONFIRMED",)
+    assert ev.contradictions == ()
+    assert ev.values["wall_replenishment"].value == 0.0
+    assert ev.values["stacking_pulling"].value == 0.0
 
 
 def test_incompatible_context_types_and_strings_become_unavailable():
