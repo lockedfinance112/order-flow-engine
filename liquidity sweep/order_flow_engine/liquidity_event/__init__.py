@@ -47,10 +47,16 @@ from .evidence import (
     LegacyLiquidityContextAdapter,
     LiquidityEvidenceBuilder,
 )
+from .classifier import (
+    CandidateProgress,
+    PriceDecision,
+    PriceOutcomeTracker,
+)
 
 __all__ = [
     "AggressorSide",
     "ArtifactIntegrity",
+    "CandidateProgress",
     "ConfidenceType",
     "DepthObservation",
     "EventFlowAccumulator",
@@ -77,6 +83,8 @@ __all__ = [
     "MarketTrade",
     "OpenEventResult",
     "PersistedIdentity",
+    "PriceDecision",
+    "PriceOutcomeTracker",
     "RejectedSweepInput",
     "SQLiteIdentityAuthority",
     "SweepAdapterResult",
