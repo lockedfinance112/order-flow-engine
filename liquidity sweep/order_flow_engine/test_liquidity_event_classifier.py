@@ -338,3 +338,124 @@ def test_tracker_ignores_trades_from_different_symbols():
     tracker.on_trade(trade(price=100.02, time_ms=1_000, seq=2, symbol="ETHUSDT"))
     assert tracker.has_penetration is False
     assert tracker.reclaim_trade_count == 0
+
+
+# --- 9. Final Hardening Tests (Pre-penetration Gating, Sufficiency Preservation, Expiry Boundaries) ---
+
+def test_pre_penetration_reclaim_progress_is_not_reused():
+    # Sell-side sweep at 100.0:
+    # 3 reclaim trades at 100.02 before any penetration
+    tracker = feed_prices(LiquiditySide.SELL_SIDE, [100.02, 100.02, 100.02], [1_000, 2_000, 4_000])
+    assert tracker.has_penetration is False
+    assert tracker.reclaim_trade_count == 0
+    assert tracker.reclaim_sufficient_time_ms is None
+
+    # Late penetration at 5_000 (neutral trade 99.995 < 100.0)
+    tracker.on_trade(trade(price=99.995, time_ms=5_000, seq=4))
+    assert tracker.has_penetration is True
+    assert tracker.reclaim_trade_count == 0
+    assert tracker.reclaim_sufficient_time_ms is None
+    decision = tracker.decision_at(watermark_ms=6_000, expiry_ms=60_000)
+    assert decision.classification is EventClassification.PENDING_SWEEP
+
+
+def test_pre_penetration_acceptance_progress_is_not_reused():
+    # Buy-side sweep at 100.0:
+    # 3 reclaim trades at 99.98 (< 99.99 reclaim threshold) before any buy-side penetration (> 100.0)
+    tracker = feed_prices(LiquiditySide.BUY_SIDE, [99.98, 99.98, 99.98], [1_000, 2_000, 4_000])
+    assert tracker.has_penetration is False
+    assert tracker.reclaim_trade_count == 0
+    assert tracker.reclaim_sufficient_time_ms is None
+
+    # Late penetration at 5_000 (neutral trade 100.005 > 100.0)
+    tracker.on_trade(trade(price=100.005, time_ms=5_000, seq=4))
+    assert tracker.has_penetration is True
+    assert tracker.reclaim_trade_count == 0
+    assert tracker.reclaim_sufficient_time_ms is None
+    decision = tracker.decision_at(watermark_ms=6_000, expiry_ms=60_000)
+    assert decision.classification is EventClassification.PENDING_SWEEP
+
+
+def test_sufficient_reclaim_survives_opposite_branch_before_watermark():
+    # Sell-side sweep at 100.0:
+    # 1. Penetration at 0
+    # 2. Reclaim reaches sufficiency at 4_000
+    # 3. Acceptance trade arrives at 5_000 before watermark reaches 4_000
+    # 4. Watermark advances to 6_000 -> Earlier reclaim sufficiency must still win!
+    tracker = feed_prices(
+        LiquiditySide.SELL_SIDE,
+        [99.98, 100.02, 100.02, 100.02, 99.98],
+        [0, 1_000, 2_000, 4_000, 5_000],
+    )
+    assert tracker.reclaim_sufficient_time_ms == 4_000
+    # Watermark behind 4_000
+    assert tracker.decision_at(watermark_ms=3_500, expiry_ms=60_000).classification is EventClassification.PENDING_SWEEP
+    # Watermark settles 4_000
+    decision = tracker.decision_at(watermark_ms=6_000, expiry_ms=60_000)
+    assert decision.classification is EventClassification.FAILED_BREAKDOWN
+    assert decision.market_resolution_time_ms == 4_000
+    assert decision.reason_code == "RECLAIM_CONFIRMED"
+
+
+def test_sufficient_acceptance_survives_opposite_branch_before_watermark():
+    # Sell-side sweep at 100.0:
+    # 1. Penetration at 0
+    # 2. Acceptance reaches sufficiency at 4_000
+    # 3. Reclaim trade arrives at 5_000 before watermark reaches 4_000
+    # 4. Watermark advances to 6_000 -> Earlier acceptance sufficiency must still win!
+    tracker = feed_prices(
+        LiquiditySide.SELL_SIDE,
+        [99.98, 99.98, 99.98, 99.98, 100.02],
+        [0, 1_000, 2_000, 4_000, 5_000],
+    )
+    assert tracker.acceptance_sufficient_time_ms == 4_000
+    # Watermark behind 4_000
+    assert tracker.decision_at(watermark_ms=3_500, expiry_ms=60_000).classification is EventClassification.PENDING_SWEEP
+    # Watermark settles 4_000
+    decision = tracker.decision_at(watermark_ms=6_000, expiry_ms=60_000)
+    assert decision.classification is EventClassification.BEARISH_CONTINUATION
+    assert decision.market_resolution_time_ms == 4_000
+    assert decision.reason_code == "ACCEPTANCE_CONFIRMED"
+
+
+def test_post_expiry_reclaim_confirmation_cannot_resolve():
+    # Sell-side sweep with penetration at 0, but reclaim only reaches sufficiency at 63_000 (> expiry 60_000)
+    tracker = feed_prices(
+        LiquiditySide.SELL_SIDE,
+        [99.98, 100.02, 100.02, 100.02],
+        [0, 60_000, 61_000, 63_000],
+    )
+    assert tracker.reclaim_sufficient_time_ms == 63_000
+    decision = tracker.decision_at(watermark_ms=65_000, expiry_ms=60_000)
+    assert decision.classification is EventClassification.INDETERMINATE
+    assert decision.reason_code == "CONFIRMATION_WINDOW_EXPIRED"
+    assert decision.market_resolution_time_ms == 60_000
+
+
+def test_post_expiry_acceptance_confirmation_cannot_resolve():
+    # Sell-side sweep with penetration at 0, but acceptance only reaches sufficiency at 61_000 (> expiry 60_000)
+    tracker = feed_prices(
+        LiquiditySide.SELL_SIDE,
+        [99.98, 99.98, 99.98, 99.98],
+        [0, 60_000, 61_000, 63_000],
+    )
+    assert tracker.acceptance_sufficient_time_ms == 61_000
+    decision = tracker.decision_at(watermark_ms=65_000, expiry_ms=60_000)
+    assert decision.classification is EventClassification.INDETERMINATE
+    assert decision.reason_code == "CONFIRMATION_WINDOW_EXPIRED"
+    assert decision.market_resolution_time_ms == 60_000
+
+
+def test_post_expiry_penetration_remains_penetration_not_confirmed():
+    # Sweep with no penetration until 60_001 (> expiry 60_000)
+    tracker = feed_prices(
+        LiquiditySide.SELL_SIDE,
+        [100.02, 99.98],
+        [1_000, 60_001],
+    )
+    assert tracker.has_penetration is True
+    assert tracker.penetration_time_ms == 60_001
+    decision = tracker.decision_at(watermark_ms=65_000, expiry_ms=60_000)
+    assert decision.classification is EventClassification.INVALID
+    assert decision.reason_code == "PENETRATION_NOT_CONFIRMED"
+    assert decision.market_resolution_time_ms == 60_000

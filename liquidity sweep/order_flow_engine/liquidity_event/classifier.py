@@ -130,31 +130,35 @@ class PriceOutcomeTracker:
 
         p_dec = trade.price if isinstance(trade.price, Decimal) else Decimal(str(trade.price))
 
-        # Check penetration
-        if self.side is LiquiditySide.SELL_SIDE:
-            if p_dec < self._level_dec:
-                if not self._has_penetration:
-                    self._has_penetration = True
-                    self._penetration_time_ms = trade.exchange_time_ms
+        # Check / update penetration
+        if not self._has_penetration:
+            if self.side is LiquiditySide.SELL_SIDE and p_dec < self._level_dec:
+                self._has_penetration = True
+                self._penetration_time_ms = trade.exchange_time_ms
+                self._penetration_price = p_dec
+                pen_diff = self._level_dec - p_dec
+                self._penetration_bps = float(round((pen_diff / self._level_dec) * Decimal("10000"), 4))
+            elif self.side is LiquiditySide.BUY_SIDE and p_dec > self._level_dec:
+                self._has_penetration = True
+                self._penetration_time_ms = trade.exchange_time_ms
+                self._penetration_price = p_dec
+                pen_diff = p_dec - self._level_dec
+                self._penetration_bps = float(round((pen_diff / self._level_dec) * Decimal("10000"), 4))
+        else:
+            if self.side is LiquiditySide.SELL_SIDE:
+                if self._penetration_price is not None and p_dec < self._penetration_price:
                     self._penetration_price = p_dec
                     pen_diff = self._level_dec - p_dec
                     self._penetration_bps = float(round((pen_diff / self._level_dec) * Decimal("10000"), 4))
-                elif self._penetration_price is not None and p_dec < self._penetration_price:
-                    self._penetration_price = p_dec
-                    pen_diff = self._level_dec - p_dec
-                    self._penetration_bps = float(round((pen_diff / self._level_dec) * Decimal("10000"), 4))
-        elif self.side is LiquiditySide.BUY_SIDE:
-            if p_dec > self._level_dec:
-                if not self._has_penetration:
-                    self._has_penetration = True
-                    self._penetration_time_ms = trade.exchange_time_ms
+            elif self.side is LiquiditySide.BUY_SIDE:
+                if self._penetration_price is not None and p_dec > self._penetration_price:
                     self._penetration_price = p_dec
                     pen_diff = p_dec - self._level_dec
                     self._penetration_bps = float(round((pen_diff / self._level_dec) * Decimal("10000"), 4))
-                elif self._penetration_price is not None and p_dec > self._penetration_price:
-                    self._penetration_price = p_dec
-                    pen_diff = p_dec - self._level_dec
-                    self._penetration_bps = float(round((pen_diff / self._level_dec) * Decimal("10000"), 4))
+
+        if not self._has_penetration:
+            # Pre-penetration trades cannot accumulate candidate progress
+            return
 
         # Evaluate threshold qualification
         if self.side is LiquiditySide.SELL_SIDE:
@@ -165,10 +169,10 @@ class PriceOutcomeTracker:
             is_acceptance = p_dec > self._acceptance_threshold
 
         if is_reclaim:
-            self._acceptance_progress = CandidateProgress()
+            self._acceptance_progress = self._reset_candidate(self._acceptance_progress)
             self._reclaim_progress = self._advance_candidate(self._reclaim_progress, trade.exchange_time_ms)
         elif is_acceptance:
-            self._reclaim_progress = CandidateProgress()
+            self._reclaim_progress = self._reset_candidate(self._reclaim_progress)
             self._acceptance_progress = self._advance_candidate(self._acceptance_progress, trade.exchange_time_ms)
         else:
             # Neutral trade (between or exactly on thresholds) pauses current segments
@@ -203,6 +207,16 @@ class PriceOutcomeTracker:
             sufficient_time_ms=suff_time,
         )
 
+    def _reset_candidate(self, progress: CandidateProgress) -> CandidateProgress:
+        """Resets active candidate progress while preserving already-established sufficiency."""
+        return CandidateProgress(
+            accumulated_ms=0,
+            segment_start_ms=None,
+            last_qualifying_ms=None,
+            qualifying_trade_count=0,
+            sufficient_time_ms=progress.sufficient_time_ms,
+        )
+
     def _pause_candidate(self, progress: CandidateProgress) -> CandidateProgress:
         if progress.last_qualifying_ms is None:
             return progress
@@ -215,17 +229,25 @@ class PriceOutcomeTracker:
         )
 
     def decision_at(self, watermark_ms: int, expiry_ms: int) -> PriceDecision:
+        penetration_in_window = (
+            self._has_penetration
+            and self._penetration_time_ms is not None
+            and self._penetration_time_ms <= expiry_ms
+        )
+
         reclaim_suff = self._reclaim_progress.sufficient_time_ms
         reclaim_settled = (
-            self._has_penetration
+            penetration_in_window
             and (reclaim_suff is not None)
+            and (reclaim_suff <= expiry_ms)
             and (reclaim_suff <= watermark_ms)
         )
 
         accept_suff = self._acceptance_progress.sufficient_time_ms
         accept_settled = (
-            self._has_penetration
+            penetration_in_window
             and (accept_suff is not None)
+            and (accept_suff <= expiry_ms)
             and (accept_suff <= watermark_ms)
         )
 
@@ -314,17 +336,17 @@ class PriceOutcomeTracker:
             )
 
         if watermark_ms >= expiry_ms:
-            if not self._has_penetration:
+            if not penetration_in_window:
                 return PriceDecision(
                     classification=EventClassification.INVALID,
                     reason_code="PENETRATION_NOT_CONFIRMED",
                     market_resolution_time_ms=expiry_ms,
                     reclaim_sufficient_time_ms=reclaim_suff,
                     acceptance_sufficient_time_ms=accept_suff,
-                    has_penetration=False,
-                    penetration_price=None,
-                    penetration_bps=None,
-                    penetration_time_ms=None,
+                    has_penetration=self._has_penetration,
+                    penetration_price=self._penetration_price,
+                    penetration_bps=self._penetration_bps,
+                    penetration_time_ms=self._penetration_time_ms,
                 )
             return PriceDecision(
                 classification=EventClassification.INDETERMINATE,
