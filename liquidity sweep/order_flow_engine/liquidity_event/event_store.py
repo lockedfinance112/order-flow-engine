@@ -4,8 +4,13 @@ from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
+import threading
 
-from .identity_authority import IdentityClaimOutcome, IdentityClaimResult
+from .identity_authority import (
+    IdentityClaimOutcome,
+    IdentityClaimResult,
+    SQLiteIdentityAuthority,
+)
 from .models import (
     LiquidityEvent,
     LiquidityEventResult,
@@ -31,6 +36,24 @@ class LiquidityEventStore:
         self._policy = policy
         self._active: dict[str, LiquidityEvent] = {}
         self._recent: dict[str, deque[LiquidityEventResult]] = {}
+        self._lock = threading.RLock()
+
+    def has_capacity(self, symbol: str) -> bool:
+        with self._lock:
+            active_for_symbol = sum(
+                event.observation.symbol == symbol
+                for event in self._active.values()
+            )
+            return active_for_symbol < self._policy.max_active_events_per_symbol
+
+    def active_count(self, symbol: str | None = None) -> int:
+        with self._lock:
+            if symbol is None:
+                return len(self._active)
+            return sum(
+                event.observation.symbol == symbol
+                for event in self._active.values()
+            )
 
     def level_identity(self, observation: LiquiditySweepObservation) -> str:
         if observation.source_level_id is not None:
@@ -46,74 +69,115 @@ class LiquidityEventStore:
             }
         )
 
+    def admit_observation(
+        self,
+        observation: LiquiditySweepObservation,
+        authority: SQLiteIdentityAuthority,
+    ) -> OpenEventResult:
+        with self._lock:
+            if observation.event_id in self._active:
+                claim = authority.claim_observation(observation)
+                return self.open_event(observation, claim)
+
+            existing_record = authority.lookup(observation.event_id)
+            if existing_record is not None:
+                claim = authority.claim_observation(observation)
+                return self.open_event(observation, claim)
+
+            if not self.has_capacity(observation.symbol):
+                return OpenEventResult(
+                    None,
+                    False,
+                    False,
+                    (),
+                    RejectedSweepInput(
+                        source=observation.source,
+                        detection_time_ms=observation.detection_time_ms,
+                        reason_code="EVENT_CAPACITY_REACHED",
+                        reason_detail="maximum active events reached for symbol",
+                        source_file_id=observation.source_file_id,
+                        source_row_hash=observation.source_row_hash,
+                        source_observation_hash=observation.source_observation_hash,
+                    ),
+                )
+
+            claim = authority.claim_observation(observation)
+            return self.open_event(observation, claim)
+
     def open_event(
         self,
         observation: LiquiditySweepObservation,
         identity_claim: IdentityClaimResult,
     ) -> OpenEventResult:
-        if identity_claim.outcome is IdentityClaimOutcome.DUPLICATE_EXISTING:
-            return OpenEventResult(
-                self._active.get(identity_claim.event_id),
-                False,
-                True,
-                (),
-                None,
-            )
+        with self._lock:
+            if identity_claim.outcome is IdentityClaimOutcome.DUPLICATE_EXISTING:
+                return OpenEventResult(
+                    self._active.get(identity_claim.event_id),
+                    False,
+                    True,
+                    (),
+                    None,
+                )
 
-        if identity_claim.outcome is IdentityClaimOutcome.IDENTITY_CONFLICT:
-            return OpenEventResult(
-                None,
-                False,
-                False,
-                (),
-                RejectedSweepInput(
-                    source=observation.source,
-                    detection_time_ms=observation.detection_time_ms,
-                    reason_code="IDENTITY_CONFLICT",
-                    reason_detail=identity_claim.conflict_reason
-                    or "identity authority rejected conflicting event identity",
-                    source_file_id=observation.source_file_id,
-                    source_row_hash=observation.source_row_hash,
-                    source_observation_hash=observation.source_observation_hash,
-                ),
-            )
+            if identity_claim.outcome is IdentityClaimOutcome.IDENTITY_CONFLICT:
+                return OpenEventResult(
+                    None,
+                    False,
+                    False,
+                    (),
+                    RejectedSweepInput(
+                        source=observation.source,
+                        detection_time_ms=observation.detection_time_ms,
+                        reason_code="IDENTITY_CONFLICT",
+                        reason_detail=identity_claim.conflict_reason
+                        or "identity authority rejected conflicting event identity",
+                        source_file_id=observation.source_file_id,
+                        source_row_hash=observation.source_row_hash,
+                        source_observation_hash=observation.source_observation_hash,
+                    ),
+                )
 
-        active_for_symbol = sum(
-            event.observation.symbol == observation.symbol
-            for event in self._active.values()
-        )
-        if active_for_symbol >= self._policy.max_active_events_per_symbol:
-            return OpenEventResult(
-                None,
-                False,
-                False,
-                (),
-                RejectedSweepInput(
-                    source=observation.source,
-                    detection_time_ms=observation.detection_time_ms,
-                    reason_code="EVENT_CAPACITY_REACHED",
-                    reason_detail="maximum active events reached for symbol",
-                    source_file_id=observation.source_file_id,
-                    source_row_hash=observation.source_row_hash,
-                    source_observation_hash=observation.source_observation_hash,
-                ),
+            active_for_symbol = sum(
+                event.observation.symbol == observation.symbol
+                for event in self._active.values()
             )
+            if active_for_symbol >= self._policy.max_active_events_per_symbol:
+                return OpenEventResult(
+                    None,
+                    False,
+                    False,
+                    (),
+                    RejectedSweepInput(
+                        source=observation.source,
+                        detection_time_ms=observation.detection_time_ms,
+                        reason_code="EVENT_CAPACITY_REACHED",
+                        reason_detail="maximum active events reached for symbol",
+                        source_file_id=observation.source_file_id,
+                        source_row_hash=observation.source_row_hash,
+                        source_observation_hash=observation.source_observation_hash,
+                    ),
+                )
 
-        event = LiquidityEvent(observation=observation)
-        self._active[event.event_id] = event
-        collisions = self._collision_event_ids(event)
-        return OpenEventResult(event, True, False, collisions, None)
+            event = LiquidityEvent(observation=observation)
+            self._active[event.event_id] = event
+            collisions = self._collision_event_ids(event)
+            return OpenEventResult(event, True, False, collisions, None)
 
     def finalize(self, result: LiquidityEventResult) -> None:
-        active = self._active.get(result.event_id)
-        if active is None or not self._matches_result(active, result):
-            return
+        with self._lock:
+            active = self._active.get(result.event_id)
+            if active is None:
+                return
+            if not self._matches_result(active, result):
+                raise ValueError(
+                    f"finalization result does not match active event {result.event_id}"
+                )
 
-        del self._active[result.event_id]
-        self._recent.setdefault(
-            result.symbol,
-            deque(maxlen=self._policy.recent_final_events_per_symbol),
-        ).append(result)
+            del self._active[result.event_id]
+            self._recent.setdefault(
+                result.symbol,
+                deque(maxlen=self._policy.recent_final_events_per_symbol),
+            ).append(result)
 
     def active(self, symbol: str | None = None) -> tuple[LiquidityEvent, ...]:
         events = self._active.values()

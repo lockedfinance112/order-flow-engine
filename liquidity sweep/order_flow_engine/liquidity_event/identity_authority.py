@@ -5,6 +5,7 @@ from enum import Enum
 import json
 from pathlib import Path
 import sqlite3
+import threading
 from types import MappingProxyType
 from typing import Any
 
@@ -27,7 +28,7 @@ class IdentityAuthorityUnavailable(RuntimeError):
     pass
 
 
-class IdentityAlreadyExists(RuntimeError):
+class IdentityAlreadyExists(ValueError):
     pass
 
 
@@ -35,11 +36,19 @@ class IdentityAlreadyExists(RuntimeError):
 class PersistedIdentity:
     event_id: str
     identity_hash: str
-    identity_payload: MappingProxyType
-    observation_payload: MappingProxyType
+    identity_payload: dict[str, Any]
+    observation_payload: dict[str, Any]
     source_observation_hash: str
     status: str
     first_detection_time_ms: int
+
+    @property
+    def identity(self) -> MappingProxyType[str, Any]:
+        return MappingProxyType(self.identity_payload)
+
+    @property
+    def observation(self) -> MappingProxyType[str, Any]:
+        return MappingProxyType(self.observation_payload)
 
 
 @dataclass(frozen=True)
@@ -54,14 +63,21 @@ class IdentityClaimResult:
 class ClaimedUnresolvedRecovery:
     emitted_transitions: tuple[LifecycleTransition, ...] = ()
     result: LiquidityEventResult | None = None
+    pending_identity: PersistedIdentity | None = None
 
 
 class SQLiteIdentityAuthority:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, timeout: float = 5.0):
         self.path = Path(path)
+        self._lock = threading.RLock()
         try:
-            self._connection = sqlite3.connect(self.path)
+            self._connection = sqlite3.connect(
+                self.path, timeout=timeout, check_same_thread=False
+            )
             self._connection.isolation_level = None
+            self._execute("PRAGMA foreign_keys = ON;")
+            self._execute("PRAGMA busy_timeout = 5000;")
+            self._execute("PRAGMA synchronous = NORMAL;")
             self._initialize_schema()
         except sqlite3.Error as exc:
             raise IdentityAuthorityUnavailable(
@@ -69,7 +85,8 @@ class SQLiteIdentityAuthority:
             ) from exc
 
     def close(self) -> None:
-        self._connection.close()
+        with self._lock:
+            self._connection.close()
 
     def claim_observation(
         self, observation: LiquiditySweepObservation
@@ -293,15 +310,20 @@ class SQLiteIdentityAuthority:
                 transition_sequence INTEGER NOT NULL,
                 transition_hash TEXT NOT NULL,
                 transition_payload_json TEXT NOT NULL,
-                PRIMARY KEY (event_id, transition_sequence)
+                PRIMARY KEY (event_id, transition_sequence),
+                FOREIGN KEY (event_id) REFERENCES event_identity(event_id)
             );
 
             CREATE TABLE IF NOT EXISTS event_result (
                 event_id TEXT PRIMARY KEY,
                 result_hash TEXT NOT NULL,
                 result_payload_json TEXT NOT NULL,
-                classification_time_ms INTEGER NOT NULL
+                classification_time_ms INTEGER NOT NULL,
+                FOREIGN KEY (event_id) REFERENCES event_identity(event_id)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_event_identity_status
+            ON event_identity (status, first_detection_time_ms, event_id);
             """
         )
 
@@ -309,7 +331,8 @@ class SQLiteIdentityAuthority:
         self._execute("BEGIN IMMEDIATE")
 
     def _execute(self, statement: str, parameters: tuple[Any, ...] = ()):
-        return self._connection.execute(statement, parameters)
+        with self._lock:
+            return self._connection.execute(statement, parameters)
 
     def _require_identity_exists(self, event_id: str) -> None:
         row = self._execute(
@@ -324,10 +347,11 @@ class SQLiteIdentityAuthority:
             raise IdentityAuthorityUnavailable("missing parent identity claim")
 
     def _rollback(self) -> None:
-        try:
-            self._connection.rollback()
-        except sqlite3.Error:
-            pass
+        with self._lock:
+            try:
+                self._connection.rollback()
+            except sqlite3.Error:
+                pass
 
 
 def recover_claimed_unresolved(

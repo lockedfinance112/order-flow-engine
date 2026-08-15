@@ -32,6 +32,14 @@ from .identity_authority import (
     SQLiteIdentityAuthority,
     recover_claimed_unresolved,
 )
+from .event_store import (
+    LiquidityEventStore,
+    OpenEventResult,
+)
+from .sweep_adapter import (
+    SweepAdapterResult,
+    SweepsMonitorAdapter,
+)
 from .policy import LiquidityClassificationPolicy
 
 __all__ = [
@@ -52,14 +60,18 @@ __all__ = [
     "LiquidityClassificationPolicy",
     "LiquidityEvent",
     "LiquidityEventResult",
+    "LiquidityEventStore",
     "LiquidityEvidence",
     "LiquiditySide",
     "LiquiditySweepObservation",
     "MarketTrade",
+    "OpenEventResult",
     "PersistedIdentity",
     "RejectedSweepInput",
     "SQLiteIdentityAuthority",
+    "SweepAdapterResult",
     "SweepSource",
+    "SweepsMonitorAdapter",
     "TradeCoverage",
     "TradeCoverageProvider",
     "canonical_hash",

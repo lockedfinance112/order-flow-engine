@@ -616,7 +616,12 @@ def test_finalize_rejects_each_nonmatching_result_field_without_mutation(field, 
     event = store.open_event(observation(event_id="strict"), new_claim("strict")).event
     valid = final_result(event, market_resolution_time_ms=3_000)
 
-    store.finalize(result_with_mismatch(event, field, value))
+    mismatched = result_with_mismatch(event, field, value)
+    if field == "event_id":
+        store.finalize(mismatched)
+    else:
+        with pytest.raises(ValueError, match="does not match active event"):
+            store.finalize(mismatched)
 
     assert tuple(item.event_id for item in store.active()) == ("strict",)
     assert store.recent() == ()
@@ -635,7 +640,8 @@ def test_finalize_rejects_invalid_model_timing_without_mutation():
         observation(event_id="invalid-timing"), new_claim("invalid-timing")
     ).event
 
-    store.finalize(result_with_invalid_timing(event))
+    with pytest.raises(ValueError, match="does not match active event"):
+        store.finalize(result_with_invalid_timing(event))
 
     assert tuple(item.event_id for item in store.active()) == ("invalid-timing",)
     assert store.recent() == ()
@@ -1311,10 +1317,15 @@ def test_monitor_callback_provenance_is_stable_for_replay_and_live_rows(tmp_path
         monitor.last_position = 0
         monitor.is_running = True
         task = asyncio.create_task(monitor._monitor_loop())
-        while len(callbacks) < 2:
-            await asyncio.sleep(0.01)
-        monitor.is_running = False
-        await task
+        try:
+            async def _wait_for_callbacks():
+                while len(callbacks) < 2:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(_wait_for_callbacks(), timeout=2.0)
+        finally:
+            monitor.is_running = False
+            await task
 
     asyncio.run(exercise_monitor())
 
@@ -1328,3 +1339,144 @@ def test_monitor_callback_provenance_is_stable_for_replay_and_live_rows(tmp_path
     assert callbacks[0]["source_sweep_price"] is None
     assert callbacks[0]["source_penetration_bps"] is None
     assert {"timestamp", "symbol", "type", "sweep_level", "sweep_id"}.issubset(callbacks[0])
+
+
+def test_sqlite_transaction_in_transaction_is_false_after_claims_and_rollback(tmp_path):
+    authority = SQLiteIdentityAuthority(tmp_path / "trans.sqlite3")
+    obs = observation(event_id="tx-test")
+
+    # Initial state
+    assert authority._connection.in_transaction is False
+
+    # Claim observation
+    claim = authority.claim_observation(obs)
+    assert claim.outcome is IdentityClaimOutcome.NEW
+    assert authority._connection.in_transaction is False
+
+    # Claim transition
+    trans = lifecycle_transition(event_id="tx-test", transition_sequence=0)
+    authority.claim_transition(trans)
+    assert authority._connection.in_transaction is False
+
+    # Claim result
+    res = finalized_result(event_id="tx-test")
+    authority.claim_result(res)
+    assert authority._connection.in_transaction is False
+
+    # Forced rollback test
+    try:
+        authority._begin_immediate()
+        assert authority._connection.in_transaction is True
+        authority._execute("INSERT INTO event_identity VALUES ('bad', 'bad', 'bad', 'bad', 'bad', 'bad', 0)")
+        # Force check constraint failure or duplicate
+        authority._execute("INSERT INTO event_identity VALUES ('bad', 'bad', 'bad', 'bad', 'bad', 'bad', 0)")
+    except Exception:
+        authority._rollback()
+
+    assert authority._connection.in_transaction is False
+    # Verify no partial rows remained from failed transaction
+    assert authority.lookup("bad") is None
+
+
+def test_sqlite_foreign_key_constraints_enforced(tmp_path):
+    import sqlite3
+    db_path = tmp_path / "fk.sqlite3"
+    authority = SQLiteIdentityAuthority(db_path)
+
+    # Try inserting orphan transition directly via SQL
+    with pytest.raises(sqlite3.IntegrityError):
+        authority._execute(
+            """
+            INSERT INTO event_transition (event_id, transition_sequence, transition_hash, transition_payload_json)
+            VALUES ('non-existent', 0, 'hash', '{}')
+            """
+        )
+
+    # Try inserting orphan result directly via SQL
+    with pytest.raises(sqlite3.IntegrityError):
+        authority._execute(
+            """
+            INSERT INTO event_result (event_id, result_hash, result_payload_json, classification_time_ms)
+            VALUES ('non-existent', 'hash', '{}', 1000)
+            """
+        )
+    authority.close()
+
+
+def test_capacity_rejection_leaves_no_persistent_identity_and_recovers_cleanly(tmp_path):
+    db_path = tmp_path / "capacity.sqlite3"
+    authority = SQLiteIdentityAuthority(db_path)
+    policy = replace(LiquidityClassificationPolicy(), max_active_events_per_symbol=1)
+    store = store_api()(policy)
+
+    # 1. Admit first event -> admitted and claimed
+    obs1 = observation(event_id="event-1", symbol="BTCUSDT")
+    res1 = store.admit_observation(obs1, authority)
+    assert res1.created is True
+    assert authority.lookup("event-1") is not None
+    assert len(authority.pending_unresolved()) == 1
+
+    # 2. Try admitting second event when capacity=1 is full
+    obs2 = observation(event_id="event-2", symbol="BTCUSDT")
+    res2 = store.admit_observation(obs2, authority)
+    assert res2.created is False
+    assert res2.rejection is not None
+    assert res2.rejection.reason_code == "EVENT_CAPACITY_REACHED"
+
+    # Critical invariant: event-2 was NEVER written to SQLite!
+    assert authority.lookup("event-2") is None
+    assert len(authority.pending_unresolved()) == 1
+    assert authority.pending_unresolved()[0].event_id == "event-1"
+
+    # Restart authority -> verify event-2 is still absent
+    authority.close()
+    restarted = SQLiteIdentityAuthority(db_path)
+    assert restarted.lookup("event-2") is None
+    assert [p.event_id for p in restarted.pending_unresolved()] == ["event-1"]
+
+    # 3. Finalize event-1 -> capacity is now freed
+    final1 = final_result(res1.event, policy=policy)
+    restarted.claim_result(final1)
+    store.finalize(final1)
+    assert store.active_count("BTCUSDT") == 0
+    assert store.has_capacity("BTCUSDT") is True
+
+    # 4. Now event-2 can legitimately claim and open!
+    res2_retry = store.admit_observation(obs2, restarted)
+    assert res2_retry.created is True
+    assert restarted.lookup("event-2") is not None
+    assert restarted.lookup("event-2").status == "CLAIMED_UNRESOLVED"
+    restarted.close()
+
+
+def test_capacity_concurrency_race_free_admission(tmp_path):
+    import concurrent.futures
+    db_path = tmp_path / "concurrent_cap.sqlite3"
+    authority = SQLiteIdentityAuthority(db_path)
+    policy = replace(LiquidityClassificationPolicy(), max_active_events_per_symbol=1)
+    store = store_api()(policy)
+
+    obs_a = observation(event_id="event-a", symbol="BTCUSDT")
+    obs_b = observation(event_id="event-b", symbol="BTCUSDT")
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f_a = executor.submit(store.admit_observation, obs_a, authority)
+        f_b = executor.submit(store.admit_observation, obs_b, authority)
+        results = [f_a.result(), f_b.result()]
+
+    created = [r for r in results if r.created]
+    rejected = [r for r in results if r.rejection is not None and r.rejection.reason_code == "EVENT_CAPACITY_REACHED"]
+
+    assert len(created) == 1
+    assert len(rejected) == 1
+
+    # Exactly one admitted event in SQLite
+    admitted_id = created[0].event.event_id
+    rejected_id = "event-b" if admitted_id == "event-a" else "event-a"
+
+    assert authority.lookup(admitted_id) is not None
+    assert authority.lookup(rejected_id) is None
+    assert len(authority.pending_unresolved()) == 1
+    assert authority.pending_unresolved()[0].event_id == admitted_id
+    authority.close()
