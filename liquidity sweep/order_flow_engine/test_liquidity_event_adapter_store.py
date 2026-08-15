@@ -226,12 +226,11 @@ def test_finalized_identity_survives_eviction_restart_and_conflict_fails_closed(
     policy = replace(LiquidityClassificationPolicy(), recent_final_events_per_symbol=0)
     store = store_api()(policy)
     event = observation(event_id="same", level="117250.00")
-    claim = authority.claim_observation(event)
-    opened = store.open_event(event, claim)
+    opened = store.admit_observation(event, authority)
     final = finalized_result(event_id="same", policy=policy)
     authority.claim_result(final)
     store.finalize(final)
-    assert claim.outcome is IdentityClaimOutcome.NEW
+    assert opened.created is True
     assert opened.event.event_id not in {result.event_id for result in store.recent()}
     authority.close()
 
@@ -316,85 +315,106 @@ def test_authority_failure_prevents_new_event(monkeypatch, tmp_path):
         authority.claim_observation(observation(event_id="same"))
 
 
+def test_event_store_exposes_no_public_open_event_method():
+    LiquidityEventStore = store_api()
+    store = LiquidityEventStore(LiquidityClassificationPolicy())
+    assert not hasattr(store, "open_event")
+    assert hasattr(store, "admit_observation")
+    assert hasattr(store, "_open_event_locked")
+
+
 def test_duplicate_callback_uses_identity_authority_without_reopening_event():
     LiquidityEventStore = store_api()
     policy = LiquidityClassificationPolicy()
     store = LiquidityEventStore(policy)
+    authority = SQLiteIdentityAuthority(":memory:")
     first_observation = observation(event_id="same")
 
-    first = store.open_event(first_observation, new_claim("same"))
-    second = store.open_event(first_observation, duplicate_claim("same"))
+    first = store.admit_observation(first_observation, authority)
+    second = store.admit_observation(first_observation, authority)
 
     assert first.created is True
     assert second.duplicate is True
     assert second.event is first.event
     assert tuple(event.event_id for event in store.active()) == ("same",)
+    authority.close()
 
 
 def test_identity_conflict_claim_fails_closed_without_opening_event():
     LiquidityEventStore = store_api()
     store = LiquidityEventStore(LiquidityClassificationPolicy())
+    authority = SQLiteIdentityAuthority(":memory:")
 
-    result = store.open_event(
-        observation(event_id="conflict"),
-        conflict_claim("conflict"),
+    first = store.admit_observation(
+        observation(event_id="conflict", level="117250.00"), authority
+    )
+    result = store.admit_observation(
+        observation(event_id="conflict", level="117251.00"), authority
     )
 
+    assert first.created is True
     assert result.event is None
     assert result.created is False
     assert result.duplicate is False
     assert result.collision_event_ids == ()
     assert result.rejection.reason_code == "IDENTITY_CONFLICT"
-    assert store.active() == ()
+    assert tuple(event.event_id for event in store.active()) == ("conflict",)
+    authority.close()
 
 
 def test_distinct_levels_and_opposite_sides_remain_separate():
     LiquidityEventStore = store_api()
     store = LiquidityEventStore(LiquidityClassificationPolicy())
+    authority = SQLiteIdentityAuthority(":memory:")
 
-    first = store.open_event(observation(level="117250"), new_claim("same"))
-    second = store.open_event(
-        observation(event_id="two", level="117210"), new_claim("two")
+    first = store.admit_observation(observation(level="117250"), authority)
+    second = store.admit_observation(
+        observation(event_id="two", level="117210"), authority
     )
-    third = store.open_event(
+    third = store.admit_observation(
         observation(event_id="three", side=LiquiditySide.BUY_SIDE),
-        new_claim("three"),
+        authority,
     )
 
     assert first.created and second.created and third.created
     assert tuple(event.event_id for event in store.active()) == ("same", "three", "two")
+    authority.close()
 
 
 def test_close_same_side_levels_report_ambiguous_collision():
     LiquidityEventStore = store_api()
     store = LiquidityEventStore(LiquidityClassificationPolicy())
+    authority = SQLiteIdentityAuthority(":memory:")
 
-    store.open_event(observation(level="117250.00"), new_claim("same"))
-    result = store.open_event(
+    store.admit_observation(observation(level="117250.00"), authority)
+    result = store.admit_observation(
         observation(event_id="two", level="117251.00", event_time_ms=1_500),
-        new_claim("two"),
+        authority,
     )
 
     assert result.created is True
     assert result.collision_event_ids == ("same", "two")
     assert tuple(event.event_id for event in store.active()) == ("same", "two")
+    authority.close()
 
 
 def test_collision_window_boundary_is_inclusive_and_deterministic():
     LiquidityEventStore = store_api()
     policy = LiquidityClassificationPolicy()
     store = LiquidityEventStore(policy)
+    authority = SQLiteIdentityAuthority(":memory:")
 
-    store.open_event(
+    store.admit_observation(
         observation(event_id="later", level="100.004", event_time_ms=3_000),
-        new_claim("later"),
+        authority,
     )
-    result = store.open_event(
+    result = store.admit_observation(
         observation(event_id="earlier", level="100.000", event_time_ms=1_000),
-        new_claim("earlier"),
+        authority,
     )
 
     assert result.collision_event_ids == ("earlier", "later")
+    authority.close()
 
 
 def test_collision_bps_boundary_is_inclusive_and_just_over_is_separate():
@@ -402,30 +422,35 @@ def test_collision_bps_boundary_is_inclusive_and_just_over_is_separate():
     policy = LiquidityClassificationPolicy()
 
     exact_store = LiquidityEventStore(policy)
-    exact_store.open_event(
-        observation(event_id="base", level="100.000"), new_claim("base")
+    exact_auth = SQLiteIdentityAuthority(":memory:")
+    exact_store.admit_observation(
+        observation(event_id="base", level="100.000"), exact_auth
     )
-    exact = exact_store.open_event(
-        observation(event_id="exact", level="100.005"), new_claim("exact")
+    exact = exact_store.admit_observation(
+        observation(event_id="exact", level="100.005"), exact_auth
     )
 
     over_store = LiquidityEventStore(policy)
-    over_store.open_event(
-        observation(event_id="base", level="100.000"), new_claim("base")
+    over_auth = SQLiteIdentityAuthority(":memory:")
+    over_store.admit_observation(
+        observation(event_id="base", level="100.000"), over_auth
     )
-    just_over = over_store.open_event(
+    just_over = over_store.admit_observation(
         observation(event_id="over", level="100.005001"),
-        new_claim("over"),
+        over_auth,
     )
 
     assert exact.collision_event_ids == ("base", "exact")
     assert just_over.collision_event_ids == ()
+    exact_auth.close()
+    over_auth.close()
 
 
 def test_level_identity_preserves_source_and_has_deterministic_fallback():
     LiquidityEventStore = store_api()
     policy = LiquidityClassificationPolicy()
     store = LiquidityEventStore(policy)
+    authority = SQLiteIdentityAuthority(":memory:")
 
     first = observation(event_id="one", level="100.000000004")
     equivalent = observation(event_id="two", level="100.000000003")
@@ -435,49 +460,55 @@ def test_level_identity_preserves_source_and_has_deterministic_fallback():
     assert store.level_identity(first) == store.level_identity(equivalent)
     assert store.level_identity(supplied) == "level-3"
     assert store.level_identity(supplied_other) == "level-4"
-    assert store.open_event(supplied, new_claim("three")).created is True
-    assert store.open_event(supplied_other, new_claim("four")).collision_event_ids == ()
-    assert store.open_event(
-        observation(event_id="five"), new_claim("five")
+    assert store.admit_observation(supplied, authority).created is True
+    assert store.admit_observation(supplied_other, authority).collision_event_ids == ()
+    assert store.admit_observation(
+        observation(event_id="five"), authority
     ).collision_event_ids == ()
+    authority.close()
 
 
 def test_active_capacity_rejects_without_unbounded_growth():
     LiquidityEventStore = store_api()
     policy = replace(LiquidityClassificationPolicy(), max_active_events_per_symbol=1)
     store = LiquidityEventStore(policy)
+    authority = SQLiteIdentityAuthority(":memory:")
 
-    first = store.open_event(observation(), new_claim("same"))
-    rejected = store.open_event(
-        observation(event_id="two", level="118000"), new_claim("two")
+    first = store.admit_observation(observation(), authority)
+    rejected = store.admit_observation(
+        observation(event_id="two", level="118000"), authority
     )
 
     assert first.created is True
     assert rejected.rejection.reason_code == "EVENT_CAPACITY_REACHED"
     assert tuple(event.event_id for event in store.active()) == ("same",)
+    authority.close()
 
 
 def test_active_capacity_is_independent_per_symbol():
     LiquidityEventStore = store_api()
     policy = replace(LiquidityClassificationPolicy(), max_active_events_per_symbol=1)
     store = LiquidityEventStore(policy)
+    authority = SQLiteIdentityAuthority(":memory:")
 
-    btc = store.open_event(observation(event_id="btc"), new_claim("btc"))
-    eth = store.open_event(
+    btc = store.admit_observation(observation(event_id="btc"), authority)
+    eth = store.admit_observation(
         observation(event_id="eth", symbol="ETHUSDT", level="200"),
-        new_claim("eth"),
+        authority,
     )
 
     assert btc.created is True
     assert eth.created is True
     assert tuple(event.event_id for event in store.active("BTCUSDT")) == ("btc",)
     assert tuple(event.event_id for event in store.active("ETHUSDT")) == ("eth",)
+    authority.close()
 
 
 def test_active_returns_defensive_snapshots_for_events_and_transitions():
     LiquidityEventStore = store_api()
     store = LiquidityEventStore(LiquidityClassificationPolicy())
-    store.open_event(observation(event_id="snapshot"), new_claim("snapshot"))
+    authority = SQLiteIdentityAuthority(":memory:")
+    store.admit_observation(observation(event_id="snapshot"), authority)
 
     exposed = store.active()[0]
     exposed.state = EventState.FINALIZED
@@ -488,15 +519,17 @@ def test_active_returns_defensive_snapshots_for_events_and_transitions():
     fresh = store.active()[0]
     assert fresh.state is EventState.OBSERVED
     assert fresh.transitions == []
+    authority.close()
 
 
 def test_finalize_moves_matching_result_once_and_bounds_recent_results():
     LiquidityEventStore = store_api()
     policy = replace(LiquidityClassificationPolicy(), recent_final_events_per_symbol=1)
     store = LiquidityEventStore(policy)
-    first = store.open_event(observation(event_id="one"), new_claim("one")).event
-    second = store.open_event(
-        observation(event_id="two", level="200"), new_claim("two")
+    authority = SQLiteIdentityAuthority(":memory:")
+    first = store.admit_observation(observation(event_id="one"), authority).event
+    second = store.admit_observation(
+        observation(event_id="two", level="200"), authority
     ).event
     first_result = final_result(
         first,
@@ -515,39 +548,49 @@ def test_finalize_moves_matching_result_once_and_bounds_recent_results():
 
     assert tuple(event.event_id for event in store.active()) == ()
     assert store.recent() == (second_result,)
+    authority.close()
 
 
 def test_finalized_duplicate_after_eviction_uses_duplicate_claim_not_tombstone():
     LiquidityEventStore = store_api()
     policy = replace(LiquidityClassificationPolicy(), recent_final_events_per_symbol=0)
     store = LiquidityEventStore(policy)
+    authority = SQLiteIdentityAuthority(":memory:")
     source = observation(event_id="finalized")
-    event = store.open_event(source, new_claim("finalized")).event
+    event = store.admit_observation(source, authority).event
     result = final_result(event, policy=policy)
+    authority.claim_result(result)
 
     store.finalize(result)
-    duplicate = store.open_event(source, duplicate_claim("finalized"))
-    reopened = store.open_event(source, new_claim("finalized"))
+    duplicate = store.admit_observation(source, authority)
 
     assert duplicate.event is None
     assert duplicate.created is False
     assert duplicate.duplicate is True
     assert duplicate.collision_event_ids == ()
     assert duplicate.rejection is None
-    assert reopened.created is True
-    assert tuple(event.event_id for event in store.active()) == ("finalized",)
+    assert tuple(event.event_id for event in store.active()) == ()
     assert store.recent() == ()
+    authority.close()
 
 
 def test_duplicate_claim_wins_over_capacity_without_opening():
     LiquidityEventStore = store_api()
     policy = replace(LiquidityClassificationPolicy(), max_active_events_per_symbol=1)
     store = LiquidityEventStore(policy)
-    active = store.open_event(
-        observation(event_id="active", level="200"), new_claim("active")
+    authority = SQLiteIdentityAuthority(":memory:")
+
+    final_source = observation(event_id="finalized")
+    final_event = store.admit_observation(final_source, authority).event
+    final_res = final_result(final_event, policy=policy)
+    authority.claim_result(final_res)
+    store.finalize(final_res)
+
+    active = store.admit_observation(
+        observation(event_id="active", level="200"), authority
     )
-    duplicate = store.open_event(
-        observation(event_id="finalized"), duplicate_claim("finalized")
+    duplicate = store.admit_observation(
+        final_source, authority
     )
 
     assert active.created is True
@@ -556,44 +599,50 @@ def test_duplicate_claim_wins_over_capacity_without_opening():
     assert duplicate.duplicate is True
     assert duplicate.rejection is None
     assert tuple(event.event_id for event in store.active()) == ("active",)
+    authority.close()
 
 
 def test_volatile_store_does_not_own_finalized_id_tombstones():
     LiquidityEventStore = store_api()
     policy = replace(LiquidityClassificationPolicy(), recent_final_events_per_symbol=1)
     store = LiquidityEventStore(policy)
+    authority = SQLiteIdentityAuthority(":memory:")
     btc_evicted_observation = observation(event_id="btc-evicted")
-    btc_evicted = store.open_event(
-        btc_evicted_observation, new_claim("btc-evicted")
+    btc_evicted = store.admit_observation(
+        btc_evicted_observation, authority
     ).event
-    btc_retained = store.open_event(
+    btc_evicted_res = final_result(btc_evicted, policy=policy)
+    authority.claim_result(btc_evicted_res)
+    store.finalize(btc_evicted_res)
+
+    btc_retained = store.admit_observation(
         observation(event_id="btc-retained", level="200"),
-        new_claim("btc-retained"),
+        authority,
     ).event
-    eth_retained = store.open_event(
+    btc_retained_res = final_result(btc_retained, policy=policy)
+    authority.claim_result(btc_retained_res)
+    store.finalize(btc_retained_res)
+
+    eth_retained = store.admit_observation(
         observation(event_id="eth-retained", symbol="ETHUSDT", level="300"),
-        new_claim("eth-retained"),
+        authority,
     ).event
+    eth_retained_res = final_result(eth_retained, policy=policy)
+    authority.claim_result(eth_retained_res)
+    store.finalize(eth_retained_res)
 
-    store.finalize(final_result(btc_evicted, policy=policy))
-    store.finalize(final_result(eth_retained, policy=policy))
-    store.finalize(final_result(btc_retained, policy=policy))
-
-    evicted = store.open_event(
-        btc_evicted_observation, duplicate_claim("btc-evicted")
-    )
-    retained_new_claim = store.open_event(
-        btc_retained.observation, new_claim("btc-retained")
+    evicted = store.admit_observation(
+        btc_evicted_observation, authority
     )
 
     assert evicted.event is None and evicted.duplicate is True
-    assert retained_new_claim.created is True
     assert tuple(result.event_id for result in store.recent("BTCUSDT")) == (
         "btc-retained",
     )
     assert tuple(result.event_id for result in store.recent("ETHUSDT")) == (
         "eth-retained",
     )
+    authority.close()
 
 
 @pytest.mark.parametrize(
@@ -613,7 +662,8 @@ def test_finalize_rejects_each_nonmatching_result_field_without_mutation(field, 
     LiquidityEventStore = store_api()
     policy = LiquidityClassificationPolicy()
     store = LiquidityEventStore(policy)
-    event = store.open_event(observation(event_id="strict"), new_claim("strict")).event
+    authority = SQLiteIdentityAuthority(":memory:")
+    event = store.admit_observation(observation(event_id="strict"), authority).event
     valid = final_result(event, market_resolution_time_ms=3_000)
 
     mismatched = result_with_mismatch(event, field, value)
@@ -631,13 +681,15 @@ def test_finalize_rejects_each_nonmatching_result_field_without_mutation(field, 
 
     assert store.active() == ()
     assert store.recent() == (valid,)
+    authority.close()
 
 
 def test_finalize_rejects_invalid_model_timing_without_mutation():
     LiquidityEventStore = store_api()
     store = LiquidityEventStore(LiquidityClassificationPolicy())
-    event = store.open_event(
-        observation(event_id="invalid-timing"), new_claim("invalid-timing")
+    authority = SQLiteIdentityAuthority(":memory:")
+    event = store.admit_observation(
+        observation(event_id="invalid-timing"), authority
     ).event
 
     with pytest.raises(ValueError, match="does not match active event"):
@@ -645,21 +697,23 @@ def test_finalize_rejects_invalid_model_timing_without_mutation():
 
     assert tuple(item.event_id for item in store.active()) == ("invalid-timing",)
     assert store.recent() == ()
+    authority.close()
 
 
 def test_recent_retention_eviction_is_independent_per_symbol():
     LiquidityEventStore = store_api()
     policy = replace(LiquidityClassificationPolicy(), recent_final_events_per_symbol=1)
     store = LiquidityEventStore(policy)
-    btc_old = store.open_event(
-        observation(event_id="btc-old"), new_claim("btc-old")
+    authority = SQLiteIdentityAuthority(":memory:")
+    btc_old = store.admit_observation(
+        observation(event_id="btc-old"), authority
     ).event
-    btc_new = store.open_event(
-        observation(event_id="btc-new", level="200"), new_claim("btc-new")
+    btc_new = store.admit_observation(
+        observation(event_id="btc-new", level="200"), authority
     ).event
-    eth = store.open_event(
+    eth = store.admit_observation(
         observation(event_id="eth", symbol="ETHUSDT", level="300"),
-        new_claim("eth"),
+        authority,
     ).event
     btc_old_result = final_result(
         btc_old,
@@ -683,22 +737,24 @@ def test_recent_retention_eviction_is_independent_per_symbol():
 
     assert store.recent("BTCUSDT") == (btc_new_result,)
     assert store.recent("ETHUSDT") == (eth_result,)
+    authority.close()
 
 
 def test_recent_symbol_filtering_returns_multiple_results_in_canonical_order():
     LiquidityEventStore = store_api()
     store = LiquidityEventStore(LiquidityClassificationPolicy())
-    later = store.open_event(
+    authority = SQLiteIdentityAuthority(":memory:")
+    later = store.admit_observation(
         observation(event_id="later", event_time_ms=2_000),
-        new_claim("later"),
+        authority,
     ).event
-    earlier = store.open_event(
+    earlier = store.admit_observation(
         observation(event_id="earlier", event_time_ms=1_000, level="200"),
-        new_claim("earlier"),
+        authority,
     ).event
-    eth = store.open_event(
+    eth = store.admit_observation(
         observation(event_id="eth", symbol="ETHUSDT", level="300"),
-        new_claim("eth"),
+        authority,
     ).event
     later_result = final_result(later, market_resolution_time_ms=5_000)
     earlier_result = final_result(earlier, market_resolution_time_ms=3_000)
@@ -710,17 +766,19 @@ def test_recent_symbol_filtering_returns_multiple_results_in_canonical_order():
 
     assert store.recent("BTCUSDT") == (earlier_result, later_result)
     assert store.recent() == (earlier_result, later_result, eth_result)
+    authority.close()
 
 
 def test_unknown_finalization_is_inert_and_symbol_reads_are_sorted():
     LiquidityEventStore = store_api()
     store = LiquidityEventStore(LiquidityClassificationPolicy())
-    btc = store.open_event(
-        observation(event_id="btc", event_time_ms=2_000), new_claim("btc")
+    authority = SQLiteIdentityAuthority(":memory:")
+    btc = store.admit_observation(
+        observation(event_id="btc", event_time_ms=2_000), authority
     ).event
-    eth = store.open_event(
+    eth = store.admit_observation(
         observation(event_id="eth", symbol="ETHUSDT", event_time_ms=1_000),
-        new_claim("eth"),
+        authority,
     ).event
     unknown = final_result(replace(btc, observation=observation(event_id="unknown")))
 
@@ -730,6 +788,7 @@ def test_unknown_finalization_is_inert_and_symbol_reads_are_sorted():
     assert tuple(event.event_id for event in store.active("BTCUSDT")) == ("btc",)
     assert store.recent("BTCUSDT") == ()
     assert eth.event_id == "eth"
+    authority.close()
 
 
 def test_bullish_and_bearish_legacy_directions_map_only_in_adapter():

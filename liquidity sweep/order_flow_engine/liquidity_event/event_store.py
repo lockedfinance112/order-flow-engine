@@ -163,13 +163,6 @@ class LiquidityEventStore:
             collisions = self._collision_event_ids(event)
             return OpenEventResult(event, True, False, collisions, None)
 
-    def open_event(
-        self,
-        observation: LiquiditySweepObservation,
-        identity_claim: IdentityClaimResult,
-    ) -> OpenEventResult:
-        return self._open_event_locked(observation, identity_claim)
-
     def finalize(self, result: LiquidityEventResult) -> None:
         with self._lock:
             active = self._active.get(result.event_id)

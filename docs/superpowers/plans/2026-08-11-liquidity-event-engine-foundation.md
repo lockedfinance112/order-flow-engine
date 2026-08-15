@@ -459,9 +459,9 @@ git commit -m "feat: add persistent liquidity identity authority"
 - Modify: `liquidity sweep/order_flow_engine/test_liquidity_event_adapter_store.py`
 
 **Interfaces:**
-- Consumes: `LiquiditySweepObservation`, `LiquidityClassificationPolicy`, `LiquidityEvent`, `LiquidityEventResult`, and `IdentityClaimResult`.
+- Consumes: `LiquiditySweepObservation`, `LiquidityClassificationPolicy`, `LiquidityEvent`, `LiquidityEventResult`, `SQLiteIdentityAuthority`, and `IdentityClaimResult`.
 - Produces: `OpenEventResult(event, created, duplicate, collision_event_ids, rejection)`.
-- Produces: `LiquidityEventStore.open_event(observation, identity_claim)`, `finalize(result)`, `active(symbol=None)`, and `recent(symbol=None)`.
+- Produces: `LiquidityEventStore.admit_observation(observation, authority)`, `finalize(result)`, `active(symbol=None)`, and `recent(symbol=None)`. Internal: `_open_event_locked(observation, identity_claim)`.
 
 The store is bounded volatile working state only. It does not own lifetime identity, finalized duplicate suppression, restart semantics, or tombstones.
 
@@ -470,36 +470,35 @@ The store is bounded volatile working state only. It does not own lifetime ident
 ```python
 def test_duplicate_callback_uses_identity_authority_without_reopening_event():
     store = LiquidityEventStore(policy)
-    first_claim = IdentityClaimResult(IdentityClaimOutcome.NEW, "same", None, None)
-    duplicate_claim = IdentityClaimResult(IdentityClaimOutcome.DUPLICATE_EXISTING, "same", existing_identity(), None)
-    first = store.open_event(observation(event_id="same"), first_claim)
-    second = store.open_event(observation(event_id="same"), duplicate_claim)
+    authority = SQLiteIdentityAuthority(":memory:")
+    first = store.admit_observation(observation(event_id="same"), authority)
+    second = store.admit_observation(observation(event_id="same"), authority)
     assert first.created is True
     assert second.duplicate is True
     assert second.event is first.event
 
 def test_distinct_levels_and_opposite_sides_remain_separate():
-    assert store.open_event(observation(level="117250"), new_claim("same")).created
-    assert store.open_event(observation(event_id="two", level="117210"), new_claim("two")).created
-    assert store.open_event(observation(event_id="three", side=LiquiditySide.BUY_SIDE), new_claim("three")).created
+    assert store.admit_observation(observation(level="117250"), authority).created
+    assert store.admit_observation(observation(event_id="two", level="117210"), authority).created
+    assert store.admit_observation(observation(event_id="three", side=LiquiditySide.BUY_SIDE), authority).created
 
 def test_close_same_side_levels_report_ambiguous_collision():
-    store.open_event(observation(level="117250.00"), new_claim("same"))
-    result = store.open_event(observation(event_id="two", level="117251.00", event_time_ms=1_500), new_claim("two"))
+    store.admit_observation(observation(level="117250.00"), authority)
+    result = store.admit_observation(observation(event_id="two", level="117251.00", event_time_ms=1_500), authority)
     assert result.collision_event_ids == ("same", "two")
 
 def test_active_capacity_rejects_without_unbounded_growth():
     tiny = replace(policy, max_active_events_per_symbol=1)
     store = LiquidityEventStore(tiny)
-    store.open_event(observation(), new_claim("same"))
-    assert store.open_event(observation(event_id="two", level="118000"), new_claim("two")).rejection.reason_code == "EVENT_CAPACITY_REACHED"
+    store.admit_observation(observation(), authority)
+    assert store.admit_observation(observation(event_id="two", level="118000"), authority).rejection.reason_code == "EVENT_CAPACITY_REACHED"
 ```
 
 - [ ] **Step 2: Run store tests and verify RED**
 
 Run: `python -m pytest test_liquidity_event_adapter_store.py -k "store or duplicate or collision or capacity" -q`
 
-Expected: import or attribute failure for `LiquidityEventStore` or its identity-claim-aware `open_event` signature.
+Expected: import or attribute failure for `LiquidityEventStore` or its `admit_observation` signature.
 
 - [ ] **Step 3: Implement bounded volatile storage**
 
