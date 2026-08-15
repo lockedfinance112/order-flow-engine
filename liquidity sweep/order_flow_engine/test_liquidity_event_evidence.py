@@ -426,6 +426,88 @@ def test_optional_context_reasons_do_not_alter_confidence_score():
     assert ev.values["volume_expansion_ratio"].value == 2.4
 
 
+def test_conflicting_duplicate_trade_sequence_resolves_canonically_independent_of_feed_order():
+    # Two records with the same symbol and sequence_id, but conflicting contents
+    trade_a = trade(1_000, "BUY", 100, sequence_id=500, price=100.0)
+    trade_b = trade(1_000, "SELL", 100, sequence_id=500, price=101.0)
+
+    snap_ab = accumulate([trade_a, trade_b])
+    snap_ba = accumulate([trade_b, trade_a])
+
+    assert snap_ab == snap_ba
+    # Verify the winner is canonically deterministic (min by canonical_key)
+    canonical_winner = min(trade_a, trade_b, key=lambda t: t.canonical_key)
+    expected_buy = 100.0 if canonical_winner.aggressor_side is AggressorSide.BUY else 0.0
+    assert snap_ab.buy_volume_usdt == expected_buy
+
+
+def test_incompatible_context_types_and_strings_become_unavailable():
+    adapter = LegacyLiquidityContextAdapter()
+    incompatible_inputs = [
+        {"value": "not-a-number"},
+        {"value": float("nan")},
+        {"value": float("inf")},
+        {"score": "invalid_string"},
+        "not_a_mapping",
+        12345,
+        None,
+    ]
+
+    for raw in incompatible_inputs:
+        abs_val = adapter.absorption(raw, as_of_ms=2_000)
+        rep_val = adapter.replenishment(raw, as_of_ms=2_000)
+        sp_val = adapter.stacking_pulling(raw, as_of_ms=2_000)
+
+        assert abs_val.availability is EvidenceAvailability.UNAVAILABLE
+        assert abs_val.value is None
+        assert abs_val.as_of_ms is None
+
+        assert rep_val.availability is EvidenceAvailability.UNAVAILABLE
+        assert rep_val.value is None
+        assert rep_val.as_of_ms is None
+
+        assert sp_val.availability is EvidenceAvailability.UNAVAILABLE
+        assert sp_val.value is None
+        assert sp_val.as_of_ms is None
+
+
+def test_optional_context_availability_preserved_on_all_outcomes_including_indeterminate_and_invalid():
+    builder = LiquidityEvidenceBuilder()
+    evt = LiquidityEvent(observation=sweep_observation())
+
+    rep_unsafe = EvidenceValue(EvidenceAvailability.UNSAFE, None, 5_000)
+    sp_available = EvidenceValue(EvidenceAvailability.AVAILABLE, 1.0, 5_000)
+    abs_available = EvidenceValue(EvidenceAvailability.AVAILABLE, -1.0, 5_000)
+    depth_unavail = EvidenceValue(EvidenceAvailability.UNAVAILABLE, None, None)
+
+    for outcome in (EventClassification.INDETERMINATE, EventClassification.INVALID):
+        ev = builder.build(
+            event=evt,
+            outcome_direction=outcome,
+            as_of_ms=5_000,
+            absorption=abs_available,
+            depth_weighted_imbalance=depth_unavail,
+            replenishment=rep_unsafe,
+            stacking_pulling=sp_available,
+            displacement_bps=15.0,
+            volume_expansion_ratio=1.8,
+        )
+
+        # Confidence and evidence strength strictly 0.0 for unconfirmed outcomes
+        assert ev.confidence == 0.0
+        assert ev.evidence_strength == 0.0
+        assert ev.contradiction_strength == 0.0
+        assert "OUTCOME_UNCONFIRMED" in ev.reasons
+
+        # Availability and raw values are preserved in values dictionary
+        assert ev.values["wall_replenishment"] == rep_unsafe
+        assert ev.values["stacking_pulling"] == sp_available
+        assert ev.values["bid_ask_absorption"] == abs_available
+        assert ev.values["depth_weighted_imbalance"] == depth_unavail
+        assert ev.values["displacement_bps"].value == 15.0
+        assert ev.values["volume_expansion_ratio"].value == 1.8
+
+
 def test_no_flow_metrics_imported_in_liquidity_event():
     import sys
     import liquidity_event.evidence
