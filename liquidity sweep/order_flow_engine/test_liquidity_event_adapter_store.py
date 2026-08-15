@@ -1403,6 +1403,25 @@ def test_sqlite_foreign_key_constraints_enforced(tmp_path):
     authority.close()
 
 
+def test_sqlite_pragmas_and_runtime_state_configured_for_maximum_durability(tmp_path):
+    db_path = tmp_path / "pragmas.sqlite3"
+    authority = SQLiteIdentityAuthority(db_path)
+
+    sync_row = authority._execute("PRAGMA synchronous;").fetchone()
+    assert sync_row is not None and sync_row[0] == 2  # 2 == FULL
+
+    fk_row = authority._execute("PRAGMA foreign_keys;").fetchone()
+    assert fk_row is not None and fk_row[0] == 1  # 1 == ON
+
+    timeout_row = authority._execute("PRAGMA busy_timeout;").fetchone()
+    assert timeout_row is not None and timeout_row[0] == 5000
+
+    journal_row = authority._execute("PRAGMA journal_mode;").fetchone()
+    assert journal_row is not None and journal_row[0] in ("delete", "wal")
+
+    authority.close()
+
+
 def test_capacity_rejection_leaves_no_persistent_identity_and_recovers_cleanly(tmp_path):
     db_path = tmp_path / "capacity.sqlite3"
     authority = SQLiteIdentityAuthority(db_path)

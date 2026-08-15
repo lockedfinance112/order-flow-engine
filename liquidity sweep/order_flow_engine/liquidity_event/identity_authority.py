@@ -77,7 +77,7 @@ class SQLiteIdentityAuthority:
             self._connection.isolation_level = None
             self._execute("PRAGMA foreign_keys = ON;")
             self._execute("PRAGMA busy_timeout = 5000;")
-            self._execute("PRAGMA synchronous = NORMAL;")
+            self._execute("PRAGMA synchronous = FULL;")
             self._initialize_schema()
         except sqlite3.Error as exc:
             raise IdentityAuthorityUnavailable(
