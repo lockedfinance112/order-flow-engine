@@ -180,6 +180,9 @@ class PriceOutcomeTracker:
             self._acceptance_progress = self._pause_candidate(self._acceptance_progress)
 
     def _advance_candidate(self, progress: CandidateProgress, t_ms: int) -> CandidateProgress:
+        if progress.sufficient_time_ms is not None:
+            return progress
+
         trade_count = progress.qualifying_trade_count + 1
         if progress.last_qualifying_ms is None:
             seg_start = t_ms
@@ -208,17 +211,13 @@ class PriceOutcomeTracker:
         )
 
     def _reset_candidate(self, progress: CandidateProgress) -> CandidateProgress:
-        """Resets active candidate progress while preserving already-established sufficiency."""
-        return CandidateProgress(
-            accumulated_ms=0,
-            segment_start_ms=None,
-            last_qualifying_ms=None,
-            qualifying_trade_count=0,
-            sufficient_time_ms=progress.sufficient_time_ms,
-        )
+        """Resets unsatisfied candidate progress; preserves immutable sufficient witness."""
+        if progress.sufficient_time_ms is not None:
+            return progress
+        return CandidateProgress()
 
     def _pause_candidate(self, progress: CandidateProgress) -> CandidateProgress:
-        if progress.last_qualifying_ms is None:
+        if progress.sufficient_time_ms is not None or progress.last_qualifying_ms is None:
             return progress
         return CandidateProgress(
             accumulated_ms=progress.accumulated_ms,

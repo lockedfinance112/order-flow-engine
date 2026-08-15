@@ -459,3 +459,77 @@ def test_post_expiry_penetration_remains_penetration_not_confirmed():
     assert decision.classification is EventClassification.INVALID
     assert decision.reason_code == "PENETRATION_NOT_CONFIRMED"
     assert decision.market_resolution_time_ms == 60_000
+
+
+def test_sufficient_reclaim_preserves_confirming_witness_after_opposite_trade():
+    # Penetration at 0
+    # Reclaim reaches exactly 3000ms / 3 trades at 4_000
+    tracker = feed_prices(
+        LiquiditySide.SELL_SIDE,
+        [99.98, 100.02, 100.02, 100.02],
+        [0, 1_000, 2_000, 4_000],
+    )
+    assert tracker.reclaim_sufficient_time_ms == 4_000
+    assert tracker.reclaim_qualifying_duration_ms == 3_000
+    assert tracker.reclaim_trade_count == 3
+
+    # Feed opposite branch trade before watermark settlement
+    tracker.on_trade(trade(price=99.98, time_ms=5_000, seq=5))
+
+    # Reclaim confirming witness remains intact (not zeroed out)
+    assert tracker.reclaim_sufficient_time_ms == 4_000
+    assert tracker.reclaim_qualifying_duration_ms == 3_000
+    assert tracker.reclaim_trade_count == 3
+
+    # After watermark settlement resolves correctly
+    decision = tracker.decision_at(watermark_ms=6_000, expiry_ms=60_000)
+    assert decision.classification is EventClassification.FAILED_BREAKDOWN
+    assert decision.market_resolution_time_ms == 4_000
+
+
+def test_sufficient_acceptance_preserves_confirming_witness_after_opposite_trade():
+    # Symmetric case for acceptance (penetration at 0, acceptance from 1,000 to 4,000 = 3,000ms)
+    tracker = feed_prices(
+        LiquiditySide.SELL_SIDE,
+        [99.995, 99.98, 99.98, 99.98],
+        [0, 1_000, 2_000, 4_000],
+    )
+    assert tracker.acceptance_sufficient_time_ms == 4_000
+    assert tracker.acceptance_qualifying_duration_ms == 3_000
+    assert tracker.acceptance_trade_count == 3
+
+    # Feed opposite branch trade before watermark settlement
+    tracker.on_trade(trade(price=100.02, time_ms=5_000, seq=5))
+
+    assert tracker.acceptance_sufficient_time_ms == 4_000
+    assert tracker.acceptance_qualifying_duration_ms == 3_000
+    assert tracker.acceptance_trade_count == 3
+
+    decision = tracker.decision_at(watermark_ms=6_000, expiry_ms=60_000)
+    assert decision.classification is EventClassification.BEARISH_CONTINUATION
+    assert decision.market_resolution_time_ms == 4_000
+
+
+def test_sufficient_candidate_is_immutable_under_later_same_branch_trades():
+    tracker = feed_prices(
+        LiquiditySide.SELL_SIDE,
+        [99.98, 100.02, 100.02, 100.02],
+        [0, 1_000, 2_000, 4_000],
+    )
+    before = (
+        tracker.reclaim_sufficient_time_ms,
+        tracker.reclaim_qualifying_duration_ms,
+        tracker.reclaim_trade_count,
+    )
+    assert before == (4_000, 3_000, 3)
+
+    # Feed additional qualifying reclaim trades
+    tracker.on_trade(trade(price=100.02, time_ms=5_000, seq=5))
+    tracker.on_trade(trade(price=100.02, time_ms=8_000, seq=6))
+
+    after = (
+        tracker.reclaim_sufficient_time_ms,
+        tracker.reclaim_qualifying_duration_ms,
+        tracker.reclaim_trade_count,
+    )
+    assert after == before
