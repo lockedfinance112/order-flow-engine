@@ -77,12 +77,12 @@ class LiquidityEventStore:
         with self._lock:
             if observation.event_id in self._active:
                 claim = authority.claim_observation(observation)
-                return self.open_event(observation, claim)
+                return self._open_event_locked(observation, claim)
 
             existing_record = authority.lookup(observation.event_id)
             if existing_record is not None:
                 claim = authority.claim_observation(observation)
-                return self.open_event(observation, claim)
+                return self._open_event_locked(observation, claim)
 
             if not self.has_capacity(observation.symbol):
                 return OpenEventResult(
@@ -102,9 +102,9 @@ class LiquidityEventStore:
                 )
 
             claim = authority.claim_observation(observation)
-            return self.open_event(observation, claim)
+            return self._open_event_locked(observation, claim)
 
-    def open_event(
+    def _open_event_locked(
         self,
         observation: LiquiditySweepObservation,
         identity_claim: IdentityClaimResult,
@@ -162,6 +162,13 @@ class LiquidityEventStore:
             self._active[event.event_id] = event
             collisions = self._collision_event_ids(event)
             return OpenEventResult(event, True, False, collisions, None)
+
+    def open_event(
+        self,
+        observation: LiquiditySweepObservation,
+        identity_claim: IdentityClaimResult,
+    ) -> OpenEventResult:
+        return self._open_event_locked(observation, identity_claim)
 
     def finalize(self, result: LiquidityEventResult) -> None:
         with self._lock:

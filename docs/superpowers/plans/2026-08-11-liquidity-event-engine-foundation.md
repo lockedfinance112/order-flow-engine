@@ -740,9 +740,13 @@ On engine startup, query `SQLiteIdentityAuthority.pending_unresolved()`. For eac
 `on_sweep` must:
 
 ```python
-1. atomically claim identity in `SQLiteIdentityAuthority`
-2. open/deduplicate bounded working state in `LiquidityEventStore`
-3. reject capacity, duplicate existing identities, identity conflicts, or ambiguous collisions
+1. call `LiquidityEventStore.admit_observation(observation, identity_authority)`
+2. admission atomically coordinates:
+   - symbol capacity eligibility
+   - persistent identity lookup/claim
+   - duplicate/conflict handling
+   - volatile store opening
+3. if admission.created is False: return early (rejecting capacity/conflict or returning duplicate)
 4. prove retained interval and TradeCoverage validity
 5. replay buffered trades from event_time_ms in canonical order
 6. validate strict penetration

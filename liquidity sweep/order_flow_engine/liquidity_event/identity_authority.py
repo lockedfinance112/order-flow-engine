@@ -108,201 +108,207 @@ class SQLiteIdentityAuthority:
         observation_payload = observation.to_canonical_dict()
         observation_payload_json = canonical_json(observation_payload)
 
-        try:
-            self._begin_immediate()
-            row = self._execute(
-                """
-                SELECT event_id, identity_hash, identity_payload_json,
-                       observation_payload_json, source_observation_hash, status,
-                       first_detection_time_ms
-                FROM event_identity
-                WHERE event_id = ?
-                """,
-                (observation.event_id,),
-            ).fetchone()
-            if row is None:
-                self._execute(
+        with self._lock:
+            try:
+                self._begin_immediate()
+                row = self._execute(
                     """
-                    INSERT INTO event_identity (
-                        event_id, identity_hash, identity_payload_json,
-                        observation_payload_json, source_observation_hash, status,
-                        first_detection_time_ms
-                    )
-                    VALUES (?, ?, ?, ?, ?, 'CLAIMED_UNRESOLVED', ?)
+                    SELECT event_id, identity_hash, identity_payload_json,
+                           observation_payload_json, source_observation_hash, status,
+                           first_detection_time_ms
+                    FROM event_identity
+                    WHERE event_id = ?
                     """,
-                    (
+                    (observation.event_id,),
+                ).fetchone()
+                if row is None:
+                    self._execute(
+                        """
+                        INSERT INTO event_identity (
+                            event_id, identity_hash, identity_payload_json,
+                            observation_payload_json, source_observation_hash, status,
+                            first_detection_time_ms
+                        )
+                        VALUES (?, ?, ?, ?, ?, 'CLAIMED_UNRESOLVED', ?)
+                        """,
+                        (
+                            observation.event_id,
+                            identity_hash,
+                            canonical_json(identity_payload),
+                            observation_payload_json,
+                            observation.source_observation_hash,
+                            observation.detection_time_ms,
+                        ),
+                    )
+                    self._connection.commit()
+                    return IdentityClaimResult(
+                        IdentityClaimOutcome.NEW,
                         observation.event_id,
-                        identity_hash,
-                        canonical_json(identity_payload),
-                        observation_payload_json,
-                        observation.source_observation_hash,
-                        observation.detection_time_ms,
-                    ),
-                )
-                self._connection.commit()
-                return IdentityClaimResult(
-                    IdentityClaimOutcome.NEW,
-                    observation.event_id,
-                )
+                    )
 
-            existing = _record_from_row(row)
-            self._connection.commit()
-            if (
-                existing.identity_hash == identity_hash
-                and existing.source_observation_hash
-                == observation.source_observation_hash
-            ):
+                existing = _record_from_row(row)
+                self._connection.commit()
+                if (
+                    existing.identity_hash == identity_hash
+                    and existing.source_observation_hash
+                    == observation.source_observation_hash
+                ):
+                    return IdentityClaimResult(
+                        IdentityClaimOutcome.DUPLICATE_EXISTING,
+                        observation.event_id,
+                        existing_identity=existing,
+                    )
                 return IdentityClaimResult(
-                    IdentityClaimOutcome.DUPLICATE_EXISTING,
+                    IdentityClaimOutcome.IDENTITY_CONFLICT,
                     observation.event_id,
                     existing_identity=existing,
+                    conflict_reason=(
+                        "same event_id has different immutable identity or provenance hash"
+                    ),
                 )
-            return IdentityClaimResult(
-                IdentityClaimOutcome.IDENTITY_CONFLICT,
-                observation.event_id,
-                existing_identity=existing,
-                conflict_reason=(
-                    "same event_id has different immutable identity or provenance hash"
-                ),
-            )
-        except Exception as exc:
-            self._rollback()
-            if isinstance(exc, (IdentityAlreadyExists, IdentityAuthorityUnavailable)):
-                raise
-            raise IdentityAuthorityUnavailable(
-                "identity authority unavailable while claiming observation"
-            ) from exc
+            except Exception as exc:
+                self._rollback()
+                if isinstance(exc, (IdentityAlreadyExists, IdentityAuthorityUnavailable)):
+                    raise
+                raise IdentityAuthorityUnavailable(
+                    "identity authority unavailable while claiming observation"
+                ) from exc
 
     def claim_transition(self, transition: LifecycleTransition) -> None:
         payload_json = canonical_json(transition.to_canonical_dict())
-        try:
-            self._begin_immediate()
-            self._require_identity_exists(transition.event_id)
-            self._execute(
-                """
-                INSERT INTO event_transition (
-                    event_id, transition_sequence, transition_hash,
-                    transition_payload_json
+        with self._lock:
+            try:
+                self._begin_immediate()
+                self._require_identity_exists(transition.event_id)
+                self._execute(
+                    """
+                    INSERT INTO event_transition (
+                        event_id, transition_sequence, transition_hash,
+                        transition_payload_json
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        transition.event_id,
+                        transition.transition_sequence,
+                        canonical_hash(transition),
+                        payload_json,
+                    ),
                 )
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    transition.event_id,
-                    transition.transition_sequence,
-                    canonical_hash(transition),
-                    payload_json,
-                ),
-            )
-            self._connection.commit()
-        except sqlite3.IntegrityError as exc:
-            self._rollback()
-            raise IdentityAlreadyExists(
-                "transition identity already exists"
-            ) from exc
-        except Exception as exc:
-            self._rollback()
-            if isinstance(exc, IdentityAlreadyExists):
-                raise
-            raise IdentityAuthorityUnavailable(
-                "identity authority unavailable while claiming transition"
-            ) from exc
+                self._connection.commit()
+            except sqlite3.IntegrityError as exc:
+                self._rollback()
+                raise IdentityAlreadyExists(
+                    "transition identity already exists"
+                ) from exc
+            except Exception as exc:
+                self._rollback()
+                if isinstance(exc, IdentityAlreadyExists):
+                    raise
+                raise IdentityAuthorityUnavailable(
+                    "identity authority unavailable while claiming transition"
+                ) from exc
 
     def claim_result(self, result: LiquidityEventResult) -> None:
         payload_json = canonical_json(result.to_canonical_dict())
-        try:
-            self._begin_immediate()
-            self._require_identity_exists(result.event_id)
-            self._execute(
-                """
-                INSERT INTO event_result (
-                    event_id, result_hash, result_payload_json,
-                    classification_time_ms
+        with self._lock:
+            try:
+                self._begin_immediate()
+                self._require_identity_exists(result.event_id)
+                self._execute(
+                    """
+                    INSERT INTO event_result (
+                        event_id, result_hash, result_payload_json,
+                        classification_time_ms
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        result.event_id,
+                        canonical_hash(result),
+                        payload_json,
+                        result.classification_time_ms,
+                    ),
                 )
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    result.event_id,
-                    canonical_hash(result),
-                    payload_json,
-                    result.classification_time_ms,
-                ),
-            )
-            status_update = self._execute(
-                """
-                UPDATE event_identity
-                SET status = 'FINALIZED'
-                WHERE event_id = ?
-                """,
-                (result.event_id,),
-            )
-            if status_update.rowcount != 1:
+                status_update = self._execute(
+                    """
+                    UPDATE event_identity
+                    SET status = 'FINALIZED'
+                    WHERE event_id = ?
+                    """,
+                    (result.event_id,),
+                )
+                if status_update.rowcount != 1:
+                    raise IdentityAuthorityUnavailable(
+                        "result claim missing parent identity"
+                    )
+                self._connection.commit()
+            except sqlite3.IntegrityError as exc:
+                self._rollback()
+                raise IdentityAlreadyExists("result identity already exists") from exc
+            except Exception as exc:
+                self._rollback()
+                if isinstance(exc, IdentityAlreadyExists):
+                    raise
                 raise IdentityAuthorityUnavailable(
-                    "result claim missing parent identity"
-                )
-            self._connection.commit()
-        except sqlite3.IntegrityError as exc:
-            self._rollback()
-            raise IdentityAlreadyExists("result identity already exists") from exc
-        except Exception as exc:
-            self._rollback()
-            if isinstance(exc, IdentityAlreadyExists):
-                raise
-            raise IdentityAuthorityUnavailable(
-                "identity authority unavailable while claiming result"
-            ) from exc
+                    "identity authority unavailable while claiming result"
+                ) from exc
 
     def lookup(self, event_id: str) -> PersistedIdentity | None:
-        try:
-            row = self._execute(
-                """
-                SELECT event_id, identity_hash, identity_payload_json,
-                       observation_payload_json, source_observation_hash, status,
-                       first_detection_time_ms
-                FROM event_identity
-                WHERE event_id = ?
-                """,
-                (event_id,),
-            ).fetchone()
-        except Exception as exc:
-            raise IdentityAuthorityUnavailable(
-                "identity authority unavailable during lookup"
-            ) from exc
-        return None if row is None else _record_from_row(row)
+        with self._lock:
+            try:
+                row = self._execute(
+                    """
+                    SELECT event_id, identity_hash, identity_payload_json,
+                           observation_payload_json, source_observation_hash, status,
+                           first_detection_time_ms
+                    FROM event_identity
+                    WHERE event_id = ?
+                    """,
+                    (event_id,),
+                ).fetchone()
+            except Exception as exc:
+                raise IdentityAuthorityUnavailable(
+                    "identity authority unavailable during lookup"
+                ) from exc
+            return None if row is None else _record_from_row(row)
 
     def pending_unresolved(self) -> tuple[PersistedIdentity, ...]:
-        try:
-            rows = self._execute(
-                """
-                SELECT event_id, identity_hash, identity_payload_json,
-                       observation_payload_json, source_observation_hash, status,
-                       first_detection_time_ms
-                FROM event_identity
-                WHERE status = 'CLAIMED_UNRESOLVED'
-                ORDER BY first_detection_time_ms, event_id
-                """
-            ).fetchall()
-        except Exception as exc:
-            raise IdentityAuthorityUnavailable(
-                "identity authority unavailable while reading pending identities"
-            ) from exc
-        return tuple(_record_from_row(row) for row in rows)
+        with self._lock:
+            try:
+                rows = self._execute(
+                    """
+                    SELECT event_id, identity_hash, identity_payload_json,
+                           observation_payload_json, source_observation_hash, status,
+                           first_detection_time_ms
+                    FROM event_identity
+                    WHERE status = 'CLAIMED_UNRESOLVED'
+                    ORDER BY first_detection_time_ms, event_id
+                    """
+                ).fetchall()
+            except Exception as exc:
+                raise IdentityAuthorityUnavailable(
+                    "identity authority unavailable while reading pending identities"
+                ) from exc
+            return tuple(_record_from_row(row) for row in rows)
 
     def persisted_transition_sequences(self, event_id: str) -> set[int]:
-        try:
-            rows = self._execute(
-                """
-                SELECT transition_sequence
-                FROM event_transition
-                WHERE event_id = ?
-                ORDER BY transition_sequence
-                """,
-                (event_id,),
-            ).fetchall()
-        except Exception as exc:
-            raise IdentityAuthorityUnavailable(
-                "identity authority unavailable while reading transitions"
-            ) from exc
-        return {int(row[0]) for row in rows}
+        with self._lock:
+            try:
+                rows = self._execute(
+                    """
+                    SELECT transition_sequence
+                    FROM event_transition
+                    WHERE event_id = ?
+                    ORDER BY transition_sequence
+                    """,
+                    (event_id,),
+                ).fetchall()
+            except Exception as exc:
+                raise IdentityAuthorityUnavailable(
+                    "identity authority unavailable while reading transitions"
+                ) from exc
+            return {int(row[0]) for row in rows}
 
     def _initialize_schema(self) -> None:
         self._connection.executescript(

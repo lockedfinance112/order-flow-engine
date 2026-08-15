@@ -1499,3 +1499,47 @@ def test_capacity_concurrency_race_free_admission(tmp_path):
     assert len(authority.pending_unresolved()) == 1
     assert authority.pending_unresolved()[0].event_id == admitted_id
     authority.close()
+
+
+def test_sqlite_concurrent_independent_claims_across_multiple_threads(tmp_path):
+    import concurrent.futures
+    db_path = tmp_path / "concurrent_claims.sqlite3"
+    authority = SQLiteIdentityAuthority(db_path)
+
+    def worker_lifecycle(index: int) -> None:
+        eid = f"event-worker-{index}"
+        obs = observation(event_id=eid, level=f"{100000 + index}.00")
+        claim = authority.claim_observation(obs)
+        assert claim.outcome is IdentityClaimOutcome.NEW
+
+        # Claim two ordered transitions
+        t0 = lifecycle_transition(event_id=eid, transition_sequence=0)
+        t1 = lifecycle_transition(event_id=eid, transition_sequence=1)
+        authority.claim_transition(t0)
+        authority.claim_transition(t1)
+
+        # Claim final result
+        res = finalized_result(event_id=eid)
+        authority.claim_result(res)
+
+        # Verify lookup and transitions under concurrency
+        persisted = authority.lookup(eid)
+        assert persisted is not None
+        assert persisted.status == "FINALIZED"
+        assert authority.persisted_transition_sequences(eid) == {0, 1}
+
+    num_events = 24
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(worker_lifecycle, i) for i in range(num_events)]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()  # Will re-raise if any thread failed with transaction/concurrency errors
+
+    # Post-concurrency global integrity check
+    assert len(authority.pending_unresolved()) == 0
+    for i in range(num_events):
+        eid = f"event-worker-{i}"
+        assert authority.lookup(eid) is not None
+        assert authority.lookup(eid).status == "FINALIZED"
+        assert authority.persisted_transition_sequences(eid) == {0, 1}
+
+    authority.close()
