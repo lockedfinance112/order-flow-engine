@@ -9,6 +9,7 @@ import threading
 from .identity_authority import (
     IdentityClaimOutcome,
     IdentityClaimResult,
+    PersistedIdentity,
     SQLiteIdentityAuthority,
 )
 from .models import (
@@ -103,6 +104,53 @@ class LiquidityEventStore:
 
             claim = authority.claim_observation(observation)
             return self._open_event_locked(observation, claim)
+
+    def restore_claimed_unresolved(
+        self,
+        observation: LiquiditySweepObservation,
+        persisted_identity: PersistedIdentity,
+    ) -> OpenEventResult:
+        """Restores a CLAIMED_UNRESOLVED event directly into volatile storage during restart recovery without re-claiming."""
+        if persisted_identity.status != "CLAIMED_UNRESOLVED":
+            raise ValueError(
+                f"cannot restore identity with status '{persisted_identity.status}'; expected 'CLAIMED_UNRESOLVED'"
+            )
+        if observation.event_id != persisted_identity.event_id:
+            raise ValueError(
+                f"observation event_id '{observation.event_id}' does not match persisted_identity event_id '{persisted_identity.event_id}'"
+            )
+        with self._lock:
+            existing = self._active.get(observation.event_id)
+            if existing is not None:
+                return OpenEventResult(
+                    existing,
+                    False,
+                    True,
+                    (),
+                    None,
+                )
+
+            if not self.has_capacity(observation.symbol):
+                return OpenEventResult(
+                    None,
+                    False,
+                    False,
+                    (),
+                    RejectedSweepInput(
+                        source=observation.source,
+                        detection_time_ms=observation.detection_time_ms,
+                        reason_code="EVENT_CAPACITY_REACHED",
+                        reason_detail="maximum active events reached for symbol",
+                        source_file_id=observation.source_file_id,
+                        source_row_hash=observation.source_row_hash,
+                        source_observation_hash=observation.source_observation_hash,
+                    ),
+                )
+
+            event = LiquidityEvent(observation=observation)
+            self._active[event.event_id] = event
+            collisions = self._collision_event_ids(event)
+            return OpenEventResult(event, True, False, collisions, None)
 
     def _open_event_locked(
         self,

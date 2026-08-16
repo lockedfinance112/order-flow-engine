@@ -52,13 +52,23 @@ from .classifier import (
     PriceDecision,
     PriceOutcomeTracker,
 )
+from .engine import (
+    CoverageSegment,
+    EngineSnapshot,
+    EngineTelemetry,
+    LiquidityEventEngine,
+    SymbolRuntime,
+)
 
 __all__ = [
     "AggressorSide",
     "ArtifactIntegrity",
     "CandidateProgress",
     "ConfidenceType",
+    "CoverageSegment",
     "DepthObservation",
+    "EngineSnapshot",
+    "EngineTelemetry",
     "EventFlowAccumulator",
     "EventFlowSnapshot",
     "EvidenceAvailability",
@@ -74,6 +84,7 @@ __all__ = [
     "LifecycleTransition",
     "LiquidityClassificationPolicy",
     "LiquidityEvent",
+    "LiquidityEventEngine",
     "LiquidityEvidenceBuilder",
     "LiquidityEventResult",
     "LiquidityEventStore",
@@ -90,6 +101,7 @@ __all__ = [
     "SweepAdapterResult",
     "SweepSource",
     "SweepsMonitorAdapter",
+    "SymbolRuntime",
     "TradeCoverage",
     "TradeCoverageProvider",
     "canonical_hash",

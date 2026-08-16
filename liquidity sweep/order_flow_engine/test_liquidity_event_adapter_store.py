@@ -1602,3 +1602,103 @@ def test_sqlite_concurrent_independent_claims_across_multiple_threads(tmp_path):
         assert authority.persisted_transition_sequences(eid) == {0, 1}
 
     authority.close()
+
+
+# --- Task 6 Extension: restore_claimed_unresolved Tests ---
+
+def test_restore_claimed_unresolved_uses_persisted_identity_without_new_claim():
+    LiquidityEventStore = store_api()
+    store = LiquidityEventStore(LiquidityClassificationPolicy())
+    authority = SQLiteIdentityAuthority(":memory:")
+
+    obs = observation(event_id="restore-1", level="100.0")
+    claim = authority.claim_observation(obs)
+    assert claim.outcome is IdentityClaimOutcome.NEW
+
+    persisted = authority.lookup("restore-1")
+    assert persisted is not None
+    assert persisted.status == "CLAIMED_UNRESOLVED"
+
+    # Store is empty before restore
+    assert store.active_count() == 0
+
+    # Restore into volatile store
+    res = store.restore_claimed_unresolved(obs, persisted)
+    assert res.created is True
+    assert res.duplicate is False
+    assert res.event is not None
+    assert res.event.event_id == "restore-1"
+    assert store.active_count() == 1
+
+    authority.close()
+
+
+def test_restore_claimed_unresolved_rejects_finalized_status():
+    import pytest
+    LiquidityEventStore = store_api()
+    store = LiquidityEventStore(LiquidityClassificationPolicy())
+    authority = SQLiteIdentityAuthority(":memory:")
+
+    obs = observation(event_id="restore-fin", level="100.0")
+    authority.claim_observation(obs)
+    res_obj = finalized_result(event_id="restore-fin")
+    authority.claim_result(res_obj)
+
+    persisted = authority.lookup("restore-fin")
+    assert persisted is not None
+    assert persisted.status == "FINALIZED"
+
+    with pytest.raises(ValueError, match="expected 'CLAIMED_UNRESOLVED'"):
+        store.restore_claimed_unresolved(obs, persisted)
+
+    assert store.active_count() == 0
+    authority.close()
+
+
+def test_restore_claimed_unresolved_is_idempotent_duplicate():
+    LiquidityEventStore = store_api()
+    store = LiquidityEventStore(LiquidityClassificationPolicy())
+    authority = SQLiteIdentityAuthority(":memory:")
+
+    obs = observation(event_id="restore-dup", level="100.0")
+    authority.claim_observation(obs)
+    persisted = authority.lookup("restore-dup")
+
+    res1 = store.restore_claimed_unresolved(obs, persisted)
+    assert res1.created is True
+
+    # Second restore returns duplicate safely
+    res2 = store.restore_claimed_unresolved(obs, persisted)
+    assert res2.created is False
+    assert res2.duplicate is True
+    assert res2.event is not None
+    assert res2.event.event_id == "restore-dup"
+    assert store.active_count() == 1
+    authority.close()
+
+
+def test_restore_claimed_unresolved_enforces_capacity():
+    LiquidityEventStore = store_api()
+    policy = LiquidityClassificationPolicy(max_active_events_per_symbol=1)
+    store = LiquidityEventStore(policy)
+    authority = SQLiteIdentityAuthority(":memory:")
+
+    obs1 = observation(event_id="event-1", symbol="BTCUSDT")
+    obs2 = observation(event_id="event-2", symbol="BTCUSDT")
+
+    authority.claim_observation(obs1)
+    authority.claim_observation(obs2)
+
+    p1 = authority.lookup("event-1")
+    p2 = authority.lookup("event-2")
+
+    res1 = store.restore_claimed_unresolved(obs1, p1)
+    assert res1.created is True
+
+    # Capacity reached (max 1) -> rejection
+    res2 = store.restore_claimed_unresolved(obs2, p2)
+    assert res2.created is False
+    assert res2.rejection is not None
+    assert res2.rejection.reason_code == "EVENT_CAPACITY_REACHED"
+    assert store.active_count() == 1
+    authority.close()
