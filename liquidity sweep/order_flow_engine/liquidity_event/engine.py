@@ -30,6 +30,7 @@ from .models import (
     LiquiditySweepObservation,
     MarketTrade,
     RejectedSweepInput,
+    SweepSource,
     TradeCoverage,
     TradeCoverageProvider,
     canonical_hash,
@@ -76,6 +77,7 @@ class SymbolRuntime:
         self._depth_index: dict[tuple[str, int | str], DepthObservation] = {}
         self.coverage_ledger: list[CoverageSegment] = []
         self.max_seen_exchange_time_ms: int | None = None
+        self.max_seen_trade_time_ms: int | None = None
         self.active_trackers: dict[str, EventTrackerContext] = {}
 
     @property
@@ -84,13 +86,19 @@ class SymbolRuntime:
             return self.max_seen_exchange_time_ms - self.policy.reorder_tolerance_ms
         return None
 
+    @property
+    def settled_trade_watermark_ms(self) -> int | None:
+        """Effective settled watermark bounded strictly by proven trade data time."""
+        if self.max_seen_trade_time_ms is None:
+            return None
+        return self.max_seen_trade_time_ms - self.policy.reorder_tolerance_ms
+
     def record_coverage(self, start_ms: int, end_ms: int, coverage: TradeCoverage) -> None:
         self.coverage_ledger.append(CoverageSegment(start_ms=start_ms, end_ms=end_ms, coverage=coverage))
 
     def check_interval_coverage(self, start_ms: int, end_ms: int) -> tuple[bool, str | None]:
         """Evaluates all coverage ledger segments overlapping [start_ms, end_ms] monotonically without last-write-wins."""
         for seg in self.coverage_ledger:
-            # Overlap check: max(start_ms, seg.start_ms) <= min(end_ms, seg.end_ms)
             if max(start_ms, seg.start_ms) <= min(end_ms, seg.end_ms):
                 cov = seg.coverage
                 if not cov.feed_safe:
@@ -106,25 +114,32 @@ class SymbolRuntime:
             existing = self._trade_index[key]
             if existing == trade or existing.content_hash == trade.content_hash:
                 return False
-            # Conflicting duplicate while provisional: keep canonical minimum
             winner = min(existing, trade, key=lambda t: t.canonical_key)
             if winner == existing:
                 return False
-            # Replace existing in buffer
             self._trade_index[key] = winner
             self.trade_buffer = [t if (t.symbol, t.sequence_id) != key else winner for t in self.trade_buffer]
             self.trade_buffer.sort(key=lambda t: t.canonical_key)
             return True
 
         self._trade_index[key] = trade
-        # Bisect insertion maintaining canonical order
         bisect.insort(self.trade_buffer, trade, key=lambda t: t.canonical_key)
         return True
 
     def insert_depth(self, depth: DepthObservation) -> bool:
         key = (depth.symbol, depth.sequence_id)
         if key in self._depth_index:
-            return False
+            existing = self._depth_index[key]
+            if existing == depth or existing.content_hash == depth.content_hash:
+                return False
+            winner = min(existing, depth, key=lambda d: d.canonical_key)
+            if winner == existing:
+                return False
+            self._depth_index[key] = winner
+            self.depth_buffer = [d if (d.symbol, d.sequence_id) != key else winner for d in self.depth_buffer]
+            self.depth_buffer.sort(key=lambda d: d.canonical_key)
+            return True
+
         self._depth_index[key] = depth
         bisect.insort(self.depth_buffer, depth, key=lambda d: d.canonical_key)
         return True
@@ -136,7 +151,6 @@ class SymbolRuntime:
         if cutoff <= 0:
             return
 
-        # Prune trade buffer and index
         retained_trades = []
         for t in self.trade_buffer:
             if t.exchange_time_ms >= cutoff:
@@ -145,7 +159,6 @@ class SymbolRuntime:
                 self._trade_index.pop((t.symbol, t.sequence_id), None)
         self.trade_buffer = retained_trades
 
-        # Prune depth buffer and index
         retained_depth = []
         for d in self.depth_buffer:
             if d.exchange_time_ms >= cutoff:
@@ -154,7 +167,6 @@ class SymbolRuntime:
                 self._depth_index.pop((d.symbol, d.sequence_id), None)
         self.depth_buffer = retained_depth
 
-        # Prune coverage ledger
         self.coverage_ledger = [seg for seg in self.coverage_ledger if seg.end_ms >= cutoff]
 
 
@@ -199,33 +211,38 @@ class LiquidityEventEngine:
 
     def on_trade(self, trade: MarketTrade, coverage: TradeCoverage) -> None:
         runtime = self.symbol_runtime(trade.symbol)
-        runtime.record_coverage(start_ms=trade.exchange_time_ms, end_ms=trade.exchange_time_ms, coverage=coverage)
-
         prev_wm = runtime.watermark_ms
-        # Check against previous settled watermark
+
+        # 1. Late quarantine check BEFORE recording coverage or mutating buffers
         if prev_wm is not None and trade.exchange_time_ms <= prev_wm:
             self.telemetry.late_data_count += 1
             self.telemetry.quarantined_trade_count += 1
             return
 
+        # 2. Record coverage and insert trade
+        runtime.record_coverage(start_ms=trade.exchange_time_ms, end_ms=trade.exchange_time_ms, coverage=coverage)
         inserted = runtime.insert_trade(trade)
         if not inserted:
             return
 
-        # Advance symbol max seen
         runtime.max_seen_exchange_time_ms = max(
             runtime.max_seen_exchange_time_ms or 0,
             trade.exchange_time_ms,
         )
+        runtime.max_seen_trade_time_ms = max(
+            runtime.max_seen_trade_time_ms or 0,
+            trade.exchange_time_ms,
+        )
         new_wm = runtime.watermark_ms
 
-        # Process newly settled trades across active events
         self._process_settled_records(runtime, prev_wm, new_wm)
         runtime.prune()
 
     def on_depth(self, depth: DepthObservation) -> None:
         runtime = self.symbol_runtime(depth.symbol)
         prev_wm = runtime.watermark_ms
+
+        # Late quarantine check BEFORE buffer mutation
         if prev_wm is not None and depth.exchange_time_ms <= prev_wm:
             self.telemetry.late_data_count += 1
             self.telemetry.quarantined_depth_count += 1
@@ -237,7 +254,8 @@ class LiquidityEventEngine:
             depth.exchange_time_ms,
         )
         new_wm = runtime.watermark_ms
-        # Process newly settled trades without independent coverage advancement
+
+        # Depth alone does not advance trade watermark; evaluate any settled trade records
         self._process_settled_records(runtime, prev_wm, new_wm)
         runtime.prune()
 
@@ -333,12 +351,13 @@ class LiquidityEventEngine:
         runtime.active_trackers[event.event_id] = ctx
 
         # Emit initial lifecycle start transition
-        self._transition_event(
+        if not self._transition_event(
             ctx,
             EventState.PENETRATION_VALIDATING,
             "START_VALIDATION",
             transition_time_ms=observation.event_time_ms,
-        )
+        ):
+            return None
 
         # 7. Check if clock can advance toward detection_time_ms
         if observation.detection_time_ms > (runtime.max_seen_exchange_time_ms or 0):
@@ -353,24 +372,37 @@ class LiquidityEventEngine:
                 coverage=cov_clock,
             )
             if cov_clock.valid:
+                prev_clock_wm = runtime.watermark_ms
                 runtime.max_seen_exchange_time_ms = max(
                     runtime.max_seen_exchange_time_ms or 0,
                     observation.detection_time_ms,
                 )
+                runtime.max_seen_trade_time_ms = max(
+                    runtime.max_seen_trade_time_ms or 0,
+                    observation.detection_time_ms,
+                )
+                new_clock_wm = runtime.watermark_ms
+                # Progress all active events on clock advancement
+                settled_res = self._process_settled_records(runtime, prev_clock_wm, new_clock_wm)
+                for res in settled_res:
+                    if res.event_id == event.event_id:
+                        return res
 
-        # 8. Replay SETTLED canonical trades
-        wm = runtime.watermark_ms
-        settled_cutoff = min(wm if wm is not None else -1, expiry_ms)
-        for t in runtime.trade_buffer:
-            if observation.event_time_ms <= t.exchange_time_ms <= settled_cutoff:
-                if t.canonical_key not in ctx.fed_trade_keys:
-                    ctx.fed_trade_keys.add(t.canonical_key)
-                    ctx.classifier.on_trade(t)
-                    ctx.flow_accumulator.on_trade(t)
+        if event.event_id not in runtime.active_trackers:
+            for r in self.store.recent(symbol):
+                if r.event_id == event.event_id:
+                    return r
+            return None
 
-        # 9. Evaluate decision
-        if wm is not None:
-            decision = ctx.classifier.decision_at(watermark_ms=wm, expiry_ms=expiry_ms)
+        # 8. Replay SETTLED canonical trades trade-by-trade
+        settled_wm = runtime.settled_trade_watermark_ms
+        if settled_wm is not None:
+            ok, _ = self._feed_trades_and_progress_lifecycle(runtime, ctx, settled_wm)
+            if not ok:
+                return None
+
+            # 9. Evaluate decision at settled watermark
+            decision = ctx.classifier.decision_at(watermark_ms=settled_wm, expiry_ms=expiry_ms)
             if decision.classification is not EventClassification.PENDING_SWEEP:
                 return self._finalize_from_decision(runtime, ctx, decision)
 
@@ -392,16 +424,20 @@ class LiquidityEventEngine:
             runtime.max_seen_exchange_time_ms or 0,
             as_of_exchange_time_ms,
         )
+        runtime.max_seen_trade_time_ms = max(
+            runtime.max_seen_trade_time_ms or 0,
+            as_of_exchange_time_ms,
+        )
         new_wm = runtime.watermark_ms
 
         results = self._process_settled_records(runtime, prev_wm, new_wm)
 
-        # If terminal input is declared and events remain unresolved
-        if terminal_input and new_wm is not None:
+        settled_wm = runtime.settled_trade_watermark_ms
+        if terminal_input and settled_wm is not None:
             unresolved = list(runtime.active_trackers.values())
             for ctx in unresolved:
                 if ctx.event.event_id in runtime.active_trackers:
-                    if new_wm < ctx.expiry_ms:
+                    if settled_wm < ctx.expiry_ms:
                         res = self._finalize_direct(
                             runtime,
                             ctx.event,
@@ -433,7 +469,6 @@ class LiquidityEventEngine:
                 continue
 
             obs_data = dict(p.observation_payload)
-            # Reconstruct LiquiditySweepObservation
             obs = LiquiditySweepObservation(
                 event_id=obs_data["event_id"],
                 source_event_id=obs_data.get("source_event_id"),
@@ -445,7 +480,7 @@ class LiquidityEventEngine:
                 detection_time_ms=obs_data["detection_time_ms"],
                 source_sweep_price=obs_data.get("source_sweep_price"),
                 source_penetration_bps=obs_data.get("source_penetration_bps"),
-                source=obs_data.get("source", "SWEEPS_MONITOR_CSV"),
+                source=SweepSource(obs_data.get("source", "SWEEPS_MONITOR_CSV")),
                 source_file_id=obs_data.get("source_file_id", "sweeps.csv"),
                 source_row_hash=obs_data.get("source_row_hash"),
                 source_observation_hash=obs_data["source_observation_hash"],
@@ -465,6 +500,11 @@ class LiquidityEventEngine:
             event = open_res.event
             expiry_ms = obs.event_time_ms + self.policy.confirmation_window_ms
             cov_event = coverage_provider.coverage(obs.symbol, obs.event_time_ms, min(obs.detection_time_ms, expiry_ms))
+            runtime.record_coverage(
+                start_ms=obs.event_time_ms,
+                end_ms=min(obs.detection_time_ms, expiry_ms),
+                coverage=cov_event,
+            )
 
             if not cov_event.interval_retained:
                 res = self._finalize_direct(
@@ -478,9 +518,40 @@ class LiquidityEventEngine:
                     results.append(res)
                 continue
 
-            # Check already persisted transitions
-            persisted_seqs = self.authority.persisted_transition_sequences(obs.event_id)
-            max_seq = max(persisted_seqs) if persisted_seqs else -1
+            if not cov_event.valid:
+                reason = "MARKET_DATA_UNSAFE" if not cov_event.feed_safe else "MARKET_DATA_INTEGRITY_COMPROMISED"
+                res = self._finalize_direct(
+                    runtime,
+                    event,
+                    EventClassification.INVALID,
+                    reason,
+                    market_resolution_time_ms=obs.event_time_ms,
+                )
+                if res:
+                    results.append(res)
+                continue
+
+            # Clock advancement split for detection time during recovery
+            if obs.detection_time_ms > (runtime.max_seen_exchange_time_ms or 0):
+                cov_clock = coverage_provider.coverage(
+                    obs.symbol,
+                    runtime.max_seen_exchange_time_ms or obs.event_time_ms,
+                    obs.detection_time_ms,
+                )
+                runtime.record_coverage(
+                    start_ms=runtime.max_seen_exchange_time_ms or obs.event_time_ms,
+                    end_ms=obs.detection_time_ms,
+                    coverage=cov_clock,
+                )
+                if cov_clock.valid:
+                    runtime.max_seen_exchange_time_ms = max(
+                        runtime.max_seen_exchange_time_ms or 0,
+                        obs.detection_time_ms,
+                    )
+                    runtime.max_seen_trade_time_ms = max(
+                        runtime.max_seen_trade_time_ms or 0,
+                        obs.detection_time_ms,
+                    )
 
             ctx = EventTrackerContext(
                 event=event,
@@ -492,23 +563,27 @@ class LiquidityEventEngine:
                 ),
                 flow_accumulator=EventFlowAccumulator(event_time_ms=obs.event_time_ms),
                 expiry_ms=expiry_ms,
-                last_transition_sequence=max_seq,
             )
             runtime.active_trackers[obs.event_id] = ctx
             self.telemetry.recovered_events_count += 1
 
-            # Replay settled trades
-            wm = runtime.watermark_ms
-            settled_cutoff = min(wm if wm is not None else -1, expiry_ms)
-            for t in runtime.trade_buffer:
-                if obs.event_time_ms <= t.exchange_time_ms <= settled_cutoff:
-                    if t.canonical_key not in ctx.fed_trade_keys:
-                        ctx.fed_trade_keys.add(t.canonical_key)
-                        ctx.classifier.on_trade(t)
-                        ctx.flow_accumulator.on_trade(t)
+            # Emit initial lifecycle start transition
+            if not self._transition_event(
+                ctx,
+                EventState.PENETRATION_VALIDATING,
+                "START_VALIDATION",
+                transition_time_ms=obs.event_time_ms,
+            ):
+                continue
 
-            if wm is not None:
-                decision = ctx.classifier.decision_at(watermark_ms=wm, expiry_ms=expiry_ms)
+            # Replay settled trades trade-by-trade
+            settled_wm = runtime.settled_trade_watermark_ms
+            if settled_wm is not None:
+                ok, _ = self._feed_trades_and_progress_lifecycle(runtime, ctx, settled_wm)
+                if not ok:
+                    continue
+
+                decision = ctx.classifier.decision_at(watermark_ms=settled_wm, expiry_ms=expiry_ms)
                 if decision.classification is not EventClassification.PENDING_SWEEP:
                     res = self._finalize_from_decision(runtime, ctx, decision)
                     if res:
@@ -533,22 +608,21 @@ class LiquidityEventEngine:
         prev_wm: int | None,
         new_wm: int | None,
     ) -> list[LiquidityEventResult]:
-        if new_wm is None:
+        settled_wm = runtime.settled_trade_watermark_ms
+        if settled_wm is None:
             return []
 
         results: list[LiquidityEventResult] = []
-        # Find active events
         active_list = list(runtime.active_trackers.values())
         for ctx in active_list:
             if ctx.event.event_id not in runtime.active_trackers:
                 continue
 
-            event_id = ctx.event.event_id
             obs = ctx.event.observation
             expiry = ctx.expiry_ms
 
-            # 1. Coverage check for event-required interval seen so far
-            cov_check_end = min(runtime.max_seen_exchange_time_ms if runtime.max_seen_exchange_time_ms is not None else new_wm, expiry)
+            # 1. Coverage check strictly for the settled interval [event_time_ms, min(settled_wm, expiry)]
+            cov_check_end = min(settled_wm, expiry)
             cov_ok, cov_reason = runtime.check_interval_coverage(
                 obs.event_time_ms,
                 cov_check_end,
@@ -566,32 +640,51 @@ class LiquidityEventEngine:
                     results.append(res)
                 continue
 
-            # 2. Feed newly settled trades in canonical_key order
-            for t in runtime.trade_buffer:
-                if obs.event_time_ms <= t.exchange_time_ms <= min(new_wm, expiry):
-                    if t.canonical_key not in ctx.fed_trade_keys:
-                        ctx.fed_trade_keys.add(t.canonical_key)
-                        ctx.classifier.on_trade(t)
-                        ctx.flow_accumulator.on_trade(t)
+            # 2. Feed newly settled trades trade-by-trade and progress lifecycle
+            ok, _ = self._feed_trades_and_progress_lifecycle(runtime, ctx, settled_wm)
+            if not ok:
+                continue
 
-            # 3. Lifecycle progression based on classifier state
-            if ctx.classifier.has_penetration and ctx.last_state == EventState.PENETRATION_VALIDATING:
-                pen_t = ctx.classifier.penetration_time_ms or obs.event_time_ms
-                self._transition_event(ctx, EventState.SWEEP_DETECTED, "PENETRATION_CONFIRMED", pen_t)
-
-            if ctx.classifier.reclaim_trade_count > 0 and ctx.last_state in (EventState.PENETRATION_VALIDATING, EventState.SWEEP_DETECTED):
-                self._transition_event(ctx, EventState.RECLAIMING, "RECLAIM_PROGRESS", new_wm)
-            elif ctx.classifier.acceptance_trade_count > 0 and ctx.last_state in (EventState.PENETRATION_VALIDATING, EventState.SWEEP_DETECTED):
-                self._transition_event(ctx, EventState.ACCEPTING, "ACCEPTANCE_PROGRESS", new_wm)
-
-            # 4. Evaluate decision at watermark
-            decision = ctx.classifier.decision_at(watermark_ms=new_wm, expiry_ms=expiry)
+            # 3. Evaluate decision at settled watermark
+            decision = ctx.classifier.decision_at(watermark_ms=settled_wm, expiry_ms=expiry)
             if decision.classification is not EventClassification.PENDING_SWEEP:
                 res = self._finalize_from_decision(runtime, ctx, decision)
                 if res is not None:
                     results.append(res)
 
         return results
+
+    def _feed_trades_and_progress_lifecycle(
+        self,
+        runtime: SymbolRuntime,
+        ctx: EventTrackerContext,
+        watermark_ms: int,
+    ) -> tuple[bool, str | None]:
+        """Feeds newly settled trades in canonical_key order, progressing lifecycle state trade-by-trade."""
+        obs = ctx.event.observation
+        expiry = ctx.expiry_ms
+
+        for t in runtime.trade_buffer:
+            if obs.event_time_ms <= t.exchange_time_ms <= min(watermark_ms, expiry):
+                if t.canonical_key not in ctx.fed_trade_keys:
+                    ctx.fed_trade_keys.add(t.canonical_key)
+                    ctx.classifier.on_trade(t)
+                    ctx.flow_accumulator.on_trade(t)
+
+                    # Check intermediate lifecycle transitions
+                    if ctx.classifier.has_penetration and ctx.last_state == EventState.PENETRATION_VALIDATING:
+                        pen_t = ctx.classifier.penetration_time_ms or t.exchange_time_ms
+                        if not self._transition_event(ctx, EventState.SWEEP_DETECTED, "PENETRATION_CONFIRMED", pen_t):
+                            return False, "AUTHORITY_FAILURE"
+
+                    if ctx.classifier.reclaim_trade_count > 0 and ctx.last_state != EventState.RECLAIMING:
+                        if not self._transition_event(ctx, EventState.RECLAIMING, "RECLAIM_PROGRESS", t.exchange_time_ms):
+                            return False, "AUTHORITY_FAILURE"
+                    elif ctx.classifier.acceptance_trade_count > 0 and ctx.last_state != EventState.ACCEPTING:
+                        if not self._transition_event(ctx, EventState.ACCEPTING, "ACCEPTANCE_PROGRESS", t.exchange_time_ms):
+                            return False, "AUTHORITY_FAILURE"
+
+        return True, None
 
     def _transition_event(
         self,
@@ -614,6 +707,11 @@ class LiquidityEventEngine:
             persisted_seqs = self.authority.persisted_transition_sequences(ctx.event.event_id)
             if next_seq not in persisted_seqs:
                 self.authority.claim_transition(transition)
+                if self.on_transition:
+                    try:
+                        self.on_transition(transition)
+                    except Exception as e:
+                        logger.error("on_transition callback error: %s", e)
         except Exception as e:
             self.telemetry.authority_failures_count += 1
             logger.error("authority claim transition failed: %s", e)
@@ -623,12 +721,6 @@ class LiquidityEventEngine:
         ctx.event.transitions.append(transition)
         ctx.last_transition_sequence = next_seq
         ctx.last_state = to_state
-
-        if self.on_transition:
-            try:
-                self.on_transition(transition)
-            except Exception as e:
-                logger.error("on_transition callback error: %s", e)
 
         return True
 
@@ -640,13 +732,15 @@ class LiquidityEventEngine:
     ) -> LiquidityEventResult | None:
         target_state = EventState.FINALIZED
         if decision.classification is EventClassification.INVALID:
-            self._transition_event(ctx, EventState.INVALID, decision.reason_code or "INVALID_OUTCOME", decision.market_resolution_time_ms)
+            if not self._transition_event(ctx, EventState.INVALID, decision.reason_code or "INVALID_OUTCOME", decision.market_resolution_time_ms):
+                return None
         elif decision.classification is EventClassification.INDETERMINATE:
-            self._transition_event(ctx, EventState.UNRESOLVED, decision.reason_code or "UNRESOLVED_OUTCOME", decision.market_resolution_time_ms)
+            if not self._transition_event(ctx, EventState.UNRESOLVED, decision.reason_code or "UNRESOLVED_OUTCOME", decision.market_resolution_time_ms):
+                return None
 
-        self._transition_event(ctx, target_state, decision.reason_code or "FINALIZED", decision.market_resolution_time_ms)
+        if not self._transition_event(ctx, target_state, decision.reason_code or "FINALIZED", decision.market_resolution_time_ms):
+            return None
 
-        # Snapshot point-in-time flow evidence
         flow_snap = ctx.flow_accumulator.snapshot(as_of_ms=decision.market_resolution_time_ms)
         evidence = self.evidence_builder.build(
             event=ctx.event,
@@ -655,7 +749,6 @@ class LiquidityEventEngine:
             flow_snapshot=flow_snap,
         )
 
-        # Enrich evidence with price witness fields
         evidence_dict = dict(evidence.values)
         if decision.penetration_price is not None:
             evidence_dict["price.penetration_price"] = EvidenceValue(
@@ -732,7 +825,6 @@ class LiquidityEventEngine:
             model_version=self.policy.model_version,
         )
 
-        # Atomic authority persistence BEFORE volatile store finalization and external callbacks
         try:
             self.authority.claim_result(result)
         except Exception as e:
@@ -769,8 +861,10 @@ class LiquidityEventEngine:
                 expiry_ms=obs.event_time_ms + self.policy.confirmation_window_ms,
             )
 
-        self._transition_event(ctx, EventState.INVALID, reason_code, market_resolution_time_ms)
-        self._transition_event(ctx, EventState.FINALIZED, reason_code, market_resolution_time_ms)
+        if not self._transition_event(ctx, EventState.INVALID, reason_code, market_resolution_time_ms):
+            return None
+        if not self._transition_event(ctx, EventState.FINALIZED, reason_code, market_resolution_time_ms):
+            return None
 
         flow_snap = ctx.flow_accumulator.snapshot(as_of_ms=market_resolution_time_ms)
         evidence = self.evidence_builder.build(

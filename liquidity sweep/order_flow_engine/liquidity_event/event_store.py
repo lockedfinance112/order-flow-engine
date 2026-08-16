@@ -119,6 +119,8 @@ class LiquidityEventStore:
             raise ValueError(
                 f"observation event_id '{observation.event_id}' does not match persisted_identity event_id '{persisted_identity.event_id}'"
             )
+        if observation.to_canonical_dict() != persisted_identity.observation_payload:
+            raise ValueError("persisted recovery observation mismatch")
         with self._lock:
             existing = self._active.get(observation.event_id)
             if existing is not None:

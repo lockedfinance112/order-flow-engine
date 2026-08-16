@@ -1702,3 +1702,83 @@ def test_restore_claimed_unresolved_enforces_capacity():
     assert res2.rejection.reason_code == "EVENT_CAPACITY_REACHED"
     assert store.active_count() == 1
     authority.close()
+
+
+def test_restore_claimed_unresolved_rejects_modified_swept_level():
+    import pytest
+    from dataclasses import replace
+    LiquidityEventStore = store_api()
+    store = LiquidityEventStore(LiquidityClassificationPolicy())
+    authority = SQLiteIdentityAuthority(":memory:")
+
+    obs = observation(event_id="tamper-level", level="100.0")
+    authority.claim_observation(obs)
+    persisted = authority.lookup("tamper-level")
+    assert persisted is not None
+
+    tampered_obs = replace(obs, swept_level=Decimal("105.0"))
+    with pytest.raises(ValueError, match="persisted recovery observation mismatch"):
+        store.restore_claimed_unresolved(tampered_obs, persisted)
+
+    assert store.active_count() == 0
+    authority.close()
+
+
+def test_restore_claimed_unresolved_rejects_modified_liquidity_side():
+    import pytest
+    from dataclasses import replace
+    LiquidityEventStore = store_api()
+    store = LiquidityEventStore(LiquidityClassificationPolicy())
+    authority = SQLiteIdentityAuthority(":memory:")
+
+    obs = observation(event_id="tamper-side", side=LiquiditySide.SELL_SIDE)
+    authority.claim_observation(obs)
+    persisted = authority.lookup("tamper-side")
+    assert persisted is not None
+
+    tampered_obs = replace(obs, liquidity_side=LiquiditySide.BUY_SIDE)
+    with pytest.raises(ValueError, match="persisted recovery observation mismatch"):
+        store.restore_claimed_unresolved(tampered_obs, persisted)
+
+    assert store.active_count() == 0
+    authority.close()
+
+
+def test_restore_claimed_unresolved_rejects_modified_event_time():
+    import pytest
+    from dataclasses import replace
+    LiquidityEventStore = store_api()
+    store = LiquidityEventStore(LiquidityClassificationPolicy())
+    authority = SQLiteIdentityAuthority(":memory:")
+
+    obs = observation(event_id="tamper-time", event_time_ms=1_000)
+    authority.claim_observation(obs)
+    persisted = authority.lookup("tamper-time")
+    assert persisted is not None
+
+    tampered_obs = replace(obs, event_time_ms=2_000)
+    with pytest.raises(ValueError, match="persisted recovery observation mismatch"):
+        store.restore_claimed_unresolved(tampered_obs, persisted)
+
+    assert store.active_count() == 0
+    authority.close()
+
+
+def test_restore_claimed_unresolved_rejects_modified_observation_hash():
+    import pytest
+    from dataclasses import replace
+    LiquidityEventStore = store_api()
+    store = LiquidityEventStore(LiquidityClassificationPolicy())
+    authority = SQLiteIdentityAuthority(":memory:")
+
+    obs = observation(event_id="tamper-hash")
+    authority.claim_observation(obs)
+    persisted = authority.lookup("tamper-hash")
+    assert persisted is not None
+
+    tampered_obs = replace(obs, source_observation_hash="tampered_hash_value")
+    with pytest.raises(ValueError, match="persisted recovery observation mismatch"):
+        store.restore_claimed_unresolved(tampered_obs, persisted)
+
+    assert store.active_count() == 0
+    authority.close()
