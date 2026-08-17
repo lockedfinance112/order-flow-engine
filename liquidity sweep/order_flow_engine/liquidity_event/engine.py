@@ -45,6 +45,7 @@ class CoverageSegment:
     start_ms: int
     end_ms: int
     coverage: TradeCoverage
+    purpose: str = "TRADE_FEED"  # "TRADE_FEED" | "EVENT_INTEGRITY" | "CLOCK_ADVANCEMENT"
 
 
 @dataclass
@@ -77,7 +78,7 @@ class SymbolRuntime:
         self._depth_index: dict[tuple[str, int | str], DepthObservation] = {}
         self.coverage_ledger: list[CoverageSegment] = []
         self.max_seen_exchange_time_ms: int | None = None
-        self.max_seen_trade_time_ms: int | None = None
+        self.proven_trade_coverage_time_ms: int | None = None
         self.active_trackers: dict[str, EventTrackerContext] = {}
 
     @property
@@ -88,17 +89,33 @@ class SymbolRuntime:
 
     @property
     def settled_trade_watermark_ms(self) -> int | None:
-        """Effective settled watermark bounded strictly by proven trade data time."""
-        if self.max_seen_trade_time_ms is None:
+        """Effective settled watermark bounded strictly by proven contiguous trade data coverage."""
+        if self.proven_trade_coverage_time_ms is None:
             return None
-        return self.max_seen_trade_time_ms - self.policy.reorder_tolerance_ms
+        return self.proven_trade_coverage_time_ms - self.policy.reorder_tolerance_ms
 
-    def record_coverage(self, start_ms: int, end_ms: int, coverage: TradeCoverage) -> None:
-        self.coverage_ledger.append(CoverageSegment(start_ms=start_ms, end_ms=end_ms, coverage=coverage))
+    def record_coverage(
+        self,
+        start_ms: int,
+        end_ms: int,
+        coverage: TradeCoverage,
+        purpose: str = "TRADE_FEED",
+    ) -> None:
+        self.coverage_ledger.append(
+            CoverageSegment(start_ms=start_ms, end_ms=end_ms, coverage=coverage, purpose=purpose)
+        )
+        if coverage.valid:
+            if purpose == "TRADE_FEED":
+                self.proven_trade_coverage_time_ms = max(self.proven_trade_coverage_time_ms or 0, end_ms)
+            elif purpose == "CLOCK_ADVANCEMENT":
+                if self.proven_trade_coverage_time_ms is None or start_ms <= self.proven_trade_coverage_time_ms:
+                    self.proven_trade_coverage_time_ms = max(self.proven_trade_coverage_time_ms or 0, end_ms)
 
     def check_interval_coverage(self, start_ms: int, end_ms: int) -> tuple[bool, str | None]:
-        """Evaluates all coverage ledger segments overlapping [start_ms, end_ms] monotonically without last-write-wins."""
+        """Evaluates all TRADE_FEED and EVENT_INTEGRITY coverage segments overlapping [start_ms, end_ms] monotonically without last-write-wins."""
         for seg in self.coverage_ledger:
+            if seg.purpose == "CLOCK_ADVANCEMENT":
+                continue
             if max(start_ms, seg.start_ms) <= min(end_ms, seg.end_ms):
                 cov = seg.coverage
                 if not cov.feed_safe:
@@ -197,6 +214,7 @@ class LiquidityEventEngine:
         self.on_result = on_result
         self.on_rejected = on_rejected
         self.telemetry = EngineTelemetry()
+        self._authority_degraded: bool = False
         self._runtimes: dict[str, SymbolRuntime] = {}
 
     def symbol_runtime(self, symbol: str) -> SymbolRuntime:
@@ -210,6 +228,9 @@ class LiquidityEventEngine:
         return self._runtimes[symbol].watermark_ms
 
     def on_trade(self, trade: MarketTrade, coverage: TradeCoverage) -> None:
+        if self._authority_degraded:
+            return
+
         runtime = self.symbol_runtime(trade.symbol)
         prev_wm = runtime.watermark_ms
 
@@ -220,7 +241,12 @@ class LiquidityEventEngine:
             return
 
         # 2. Record coverage and insert trade
-        runtime.record_coverage(start_ms=trade.exchange_time_ms, end_ms=trade.exchange_time_ms, coverage=coverage)
+        runtime.record_coverage(
+            start_ms=trade.exchange_time_ms,
+            end_ms=trade.exchange_time_ms,
+            coverage=coverage,
+            purpose="TRADE_FEED",
+        )
         inserted = runtime.insert_trade(trade)
         if not inserted:
             return
@@ -229,16 +255,15 @@ class LiquidityEventEngine:
             runtime.max_seen_exchange_time_ms or 0,
             trade.exchange_time_ms,
         )
-        runtime.max_seen_trade_time_ms = max(
-            runtime.max_seen_trade_time_ms or 0,
-            trade.exchange_time_ms,
-        )
         new_wm = runtime.watermark_ms
 
         self._process_settled_records(runtime, prev_wm, new_wm)
         runtime.prune()
 
     def on_depth(self, depth: DepthObservation) -> None:
+        if self._authority_degraded:
+            return
+
         runtime = self.symbol_runtime(depth.symbol)
         prev_wm = runtime.watermark_ms
 
@@ -264,9 +289,13 @@ class LiquidityEventEngine:
         observation: LiquiditySweepObservation,
         coverage_provider: TradeCoverageProvider,
     ) -> LiquidityEventResult | RejectedSweepInput | LiquidityEvent | None:
+        if self._authority_degraded:
+            return None
+
         symbol = observation.symbol
         runtime = self.symbol_runtime(symbol)
         expiry_ms = observation.event_time_ms + self.policy.confirmation_window_ms
+        trade_horizon_before = runtime.proven_trade_coverage_time_ms or 0
 
         # 1. Obtain event-integrity coverage
         cov_event = coverage_provider.coverage(
@@ -278,12 +307,14 @@ class LiquidityEventEngine:
             start_ms=observation.event_time_ms,
             end_ms=min(observation.detection_time_ms, expiry_ms),
             coverage=cov_event,
+            purpose="EVENT_INTEGRITY",
         )
 
         # 2. Admit observation
         try:
             admission = self.store.admit_observation(observation, self.authority)
         except Exception as e:
+            self._authority_degraded = True
             self.telemetry.authority_failures_count += 1
             logger.error("authority failure during admission: %s", e)
             return None
@@ -357,28 +388,26 @@ class LiquidityEventEngine:
             "START_VALIDATION",
             transition_time_ms=observation.event_time_ms,
         ):
+            runtime.active_trackers.pop(event.event_id, None)
             return None
 
-        # 7. Check if clock can advance toward detection_time_ms
-        if observation.detection_time_ms > (runtime.max_seen_exchange_time_ms or 0):
+        # 7. Check if clock can advance toward detection_time_ms from proven trade coverage horizon
+        if observation.detection_time_ms > trade_horizon_before:
             cov_clock = coverage_provider.coverage(
                 symbol,
-                runtime.max_seen_exchange_time_ms or observation.event_time_ms,
+                trade_horizon_before,
                 observation.detection_time_ms,
             )
             runtime.record_coverage(
-                start_ms=runtime.max_seen_exchange_time_ms or observation.event_time_ms,
+                start_ms=trade_horizon_before,
                 end_ms=observation.detection_time_ms,
                 coverage=cov_clock,
+                purpose="CLOCK_ADVANCEMENT",
             )
             if cov_clock.valid:
                 prev_clock_wm = runtime.watermark_ms
                 runtime.max_seen_exchange_time_ms = max(
                     runtime.max_seen_exchange_time_ms or 0,
-                    observation.detection_time_ms,
-                )
-                runtime.max_seen_trade_time_ms = max(
-                    runtime.max_seen_trade_time_ms or 0,
                     observation.detection_time_ms,
                 )
                 new_clock_wm = runtime.watermark_ms
@@ -415,17 +444,21 @@ class LiquidityEventEngine:
         coverage: TradeCoverage,
         terminal_input: bool = False,
     ) -> tuple[LiquidityEventResult, ...]:
+        if self._authority_degraded:
+            return ()
+
         runtime = self.symbol_runtime(symbol)
-        start_ms = runtime.max_seen_exchange_time_ms or as_of_exchange_time_ms
-        runtime.record_coverage(start_ms=start_ms, end_ms=as_of_exchange_time_ms, coverage=coverage)
+        start_ms = runtime.proven_trade_coverage_time_ms or as_of_exchange_time_ms
+        runtime.record_coverage(
+            start_ms=start_ms,
+            end_ms=as_of_exchange_time_ms,
+            coverage=coverage,
+            purpose="TRADE_FEED",
+        )
 
         prev_wm = runtime.watermark_ms
         runtime.max_seen_exchange_time_ms = max(
             runtime.max_seen_exchange_time_ms or 0,
-            as_of_exchange_time_ms,
-        )
-        runtime.max_seen_trade_time_ms = max(
-            runtime.max_seen_trade_time_ms or 0,
             as_of_exchange_time_ms,
         )
         new_wm = runtime.watermark_ms
@@ -456,9 +489,13 @@ class LiquidityEventEngine:
         self,
         coverage_provider: TradeCoverageProvider,
     ) -> tuple[LiquidityEventResult, ...]:
+        if self._authority_degraded:
+            return ()
+
         try:
             pending = self.authority.pending_unresolved()
         except Exception as e:
+            self._authority_degraded = True
             self.telemetry.authority_failures_count += 1
             logger.error("authority lookup pending failed: %s", e)
             return ()
@@ -494,6 +531,13 @@ class LiquidityEventEngine:
                 logger.error("error restoring unresolved event %s: %s", obs.event_id, e)
                 continue
 
+            # Handle collision sets discovered during restart restoration
+            if open_res.collision_event_ids:
+                col_res = self._handle_collisions(runtime, open_res.collision_event_ids, obs.detection_time_ms)
+                if col_res:
+                    results.append(col_res)
+                continue
+
             if not open_res.created or open_res.event is None:
                 continue
 
@@ -504,6 +548,7 @@ class LiquidityEventEngine:
                 start_ms=obs.event_time_ms,
                 end_ms=min(obs.detection_time_ms, expiry_ms),
                 coverage=cov_event,
+                purpose="EVENT_INTEGRITY",
             )
 
             if not cov_event.interval_retained:
@@ -532,24 +577,22 @@ class LiquidityEventEngine:
                 continue
 
             # Clock advancement split for detection time during recovery
-            if obs.detection_time_ms > (runtime.max_seen_exchange_time_ms or 0):
+            trade_horizon = runtime.proven_trade_coverage_time_ms or obs.event_time_ms
+            if obs.detection_time_ms > trade_horizon:
                 cov_clock = coverage_provider.coverage(
                     obs.symbol,
-                    runtime.max_seen_exchange_time_ms or obs.event_time_ms,
+                    trade_horizon,
                     obs.detection_time_ms,
                 )
                 runtime.record_coverage(
-                    start_ms=runtime.max_seen_exchange_time_ms or obs.event_time_ms,
+                    start_ms=trade_horizon,
                     end_ms=obs.detection_time_ms,
                     coverage=cov_clock,
+                    purpose="CLOCK_ADVANCEMENT",
                 )
                 if cov_clock.valid:
                     runtime.max_seen_exchange_time_ms = max(
                         runtime.max_seen_exchange_time_ms or 0,
-                        obs.detection_time_ms,
-                    )
-                    runtime.max_seen_trade_time_ms = max(
-                        runtime.max_seen_trade_time_ms or 0,
                         obs.detection_time_ms,
                     )
 
@@ -574,6 +617,7 @@ class LiquidityEventEngine:
                 "START_VALIDATION",
                 transition_time_ms=obs.event_time_ms,
             ):
+                runtime.active_trackers.pop(obs.event_id, None)
                 continue
 
             # Replay settled trades trade-by-trade
@@ -609,7 +653,7 @@ class LiquidityEventEngine:
         new_wm: int | None,
     ) -> list[LiquidityEventResult]:
         settled_wm = runtime.settled_trade_watermark_ms
-        if settled_wm is None:
+        if settled_wm is None or self._authority_degraded:
             return []
 
         results: list[LiquidityEventResult] = []
@@ -661,6 +705,9 @@ class LiquidityEventEngine:
         watermark_ms: int,
     ) -> tuple[bool, str | None]:
         """Feeds newly settled trades in canonical_key order, progressing lifecycle state trade-by-trade."""
+        if self._authority_degraded:
+            return False, "AUTHORITY_DEGRADED"
+
         obs = ctx.event.observation
         expiry = ctx.expiry_ms
 
@@ -693,6 +740,9 @@ class LiquidityEventEngine:
         reason_code: str,
         transition_time_ms: int,
     ) -> bool:
+        if self._authority_degraded:
+            return False
+
         next_seq = ctx.last_transition_sequence + 1
         transition = LifecycleTransition(
             event_id=ctx.event.event_id,
@@ -713,6 +763,7 @@ class LiquidityEventEngine:
                     except Exception as e:
                         logger.error("on_transition callback error: %s", e)
         except Exception as e:
+            self._authority_degraded = True
             self.telemetry.authority_failures_count += 1
             logger.error("authority claim transition failed: %s", e)
             return False
@@ -730,6 +781,9 @@ class LiquidityEventEngine:
         ctx: EventTrackerContext,
         decision: PriceDecision,
     ) -> LiquidityEventResult | None:
+        if self._authority_degraded:
+            return None
+
         target_state = EventState.FINALIZED
         if decision.classification is EventClassification.INVALID:
             if not self._transition_event(ctx, EventState.INVALID, decision.reason_code or "INVALID_OUTCOME", decision.market_resolution_time_ms):
@@ -750,6 +804,12 @@ class LiquidityEventEngine:
         )
 
         evidence_dict = dict(evidence.values)
+        if decision.penetration_time_ms is not None:
+            evidence_dict["price.penetration_time_ms"] = EvidenceValue(
+                availability=EvidenceAvailability.AVAILABLE,
+                value=float(decision.penetration_time_ms),
+                as_of_ms=decision.penetration_time_ms,
+            )
         if decision.penetration_price is not None:
             evidence_dict["price.penetration_price"] = EvidenceValue(
                 availability=EvidenceAvailability.AVAILABLE,
@@ -828,6 +888,7 @@ class LiquidityEventEngine:
         try:
             self.authority.claim_result(result)
         except Exception as e:
+            self._authority_degraded = True
             self.telemetry.authority_failures_count += 1
             logger.error("authority claim result failed: %s", e)
             return None
@@ -852,6 +913,9 @@ class LiquidityEventEngine:
         market_resolution_time_ms: int,
         ctx: EventTrackerContext | None = None,
     ) -> LiquidityEventResult | None:
+        if self._authority_degraded:
+            return None
+
         obs = event.observation
         if ctx is None:
             ctx = EventTrackerContext(
@@ -860,6 +924,11 @@ class LiquidityEventEngine:
                 flow_accumulator=EventFlowAccumulator(event_time_ms=obs.event_time_ms),
                 expiry_ms=obs.event_time_ms + self.policy.confirmation_window_ms,
             )
+
+        # Admitted events must progress canonical lifecycle: OBSERVED -> PENETRATION_VALIDATING -> INVALID -> FINALIZED
+        if ctx.last_state == EventState.OBSERVED:
+            if not self._transition_event(ctx, EventState.PENETRATION_VALIDATING, "START_VALIDATION", obs.event_time_ms):
+                return None
 
         if not self._transition_event(ctx, EventState.INVALID, reason_code, market_resolution_time_ms):
             return None
@@ -894,6 +963,7 @@ class LiquidityEventEngine:
         try:
             self.authority.claim_result(result)
         except Exception as e:
+            self._authority_degraded = True
             self.telemetry.authority_failures_count += 1
             logger.error("authority claim result failed: %s", e)
             return None

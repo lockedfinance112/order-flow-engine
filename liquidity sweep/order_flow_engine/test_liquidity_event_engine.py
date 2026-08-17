@@ -1256,3 +1256,267 @@ def test_restart_recovery_fills_missing_transition_key_without_duplicates(tmp_pa
     assert [t.transition_sequence for t in transitions_emitted] == [1, 2, 3]
     assert auth2.persisted_transition_sequences(obs.event_id) == {0, 1, 2, 3}
     auth2.close()
+
+
+def test_post_expiry_unsafe_clock_probe_does_not_poison_event_integrity():
+    engine, store, authority = setup_engine()
+    obs = make_obs(side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=0, detection_time_ms=90_000)
+
+    class ClockGapProvider:
+        def coverage(self, symbol: str, start_ms: int, end_ms: int) -> TradeCoverage:
+            # Event interval [0, 60,000] is safe; clock probe [0, 90,000] has gap at 75k..80k
+            if end_ms > 60_000:
+                return TradeCoverage(feed_safe=True, known_gap=True, buffer_overflow=False, unresolved_sequence=False, interval_retained=True)
+            return safe_cov()
+
+    engine.on_sweep(obs, ClockGapProvider())
+
+    # Feed trades with reclaim inside [0, 4,000]
+    engine.on_trade(make_trade(price=99.98, time_ms=0, seq=1), safe_cov())
+    engine.on_trade(make_trade(price=100.02, time_ms=1_000, seq=2), safe_cov())
+    engine.on_trade(make_trade(price=100.02, time_ms=2_000, seq=3), safe_cov())
+    engine.on_trade(make_trade(price=100.02, time_ms=4_000, seq=4), safe_cov())
+    engine.advance_time("BTCUSDT", 6_000, safe_cov())
+
+    # The event must resolve cleanly to FAILED_BREAKDOWN and NOT be poisoned by the unsafe clock probe!
+    recent = store.recent("BTCUSDT")
+    assert len(recent) == 1
+    assert recent[0].classification is EventClassification.FAILED_BREAKDOWN
+    assert recent[0].reason_code == "RECLAIM_CONFIRMED"
+    authority.close()
+
+
+def test_depth_clock_cannot_skip_unproven_trade_coverage_before_sweep_advance():
+    engine, store, authority = setup_engine()
+    # Event 1 at 0..60,000
+    obs1 = make_obs(event_id="ev-1", side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=0, detection_time_ms=1_000)
+    engine.on_sweep(obs1, StaticTradeCoverageProvider(safe_cov()))
+
+    # Trade coverage only proven through 1,000
+    engine.on_trade(make_trade(price=99.98, time_ms=1_000, seq=1), safe_cov())
+
+    # Depth arrives at 50,000 (no trade coverage)
+    depth = DepthObservation(
+        symbol="BTCUSDT",
+        bids=((Decimal("99.98"), Decimal("1.0")),),
+        asks=((Decimal("100.02"), Decimal("1.0")),),
+        exchange_time_ms=50_000,
+        sequence_id=1,
+    )
+    engine.on_depth(depth)
+
+    # Now sweep 2 arrives at detection 62,000. Coverage query must check from trade horizon (1,000), not depth (50,000)
+    queried_intervals = []
+    class RecordingCoverageProvider:
+        def coverage(self, symbol: str, start_ms: int, end_ms: int) -> TradeCoverage:
+            queried_intervals.append((start_ms, end_ms))
+            return safe_cov()
+
+    obs2 = make_obs(event_id="ev-2", side=LiquiditySide.BUY_SIDE, level=100.0, event_time_ms=61_000, detection_time_ms=62_000)
+    engine.on_sweep(obs2, RecordingCoverageProvider())
+
+    # Verify clock advancement queried from trade horizon 1,000
+    clock_queries = [q for q in queried_intervals if q[1] == 62_000]
+    assert any(q[0] <= 1_000 for q in clock_queries)
+    authority.close()
+
+
+def test_transient_authority_transition_failure_fails_closed_engine():
+    policy = LiquidityClassificationPolicy()
+    authority = SQLiteIdentityAuthority(":memory:")
+    store = LiquidityEventStore(policy)
+    engine = LiquidityEventEngine(policy, store, authority)
+
+    obs = make_obs(side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=0)
+    engine.on_sweep(obs, StaticTradeCoverageProvider(safe_cov()))
+
+    # Temporarily break authority by injecting an exception into claim_transition
+    original_claim_transition = authority.claim_transition
+    def failing_claim(t):
+        raise IdentityAuthorityUnavailable("transient db error")
+    authority.claim_transition = failing_claim
+
+    # Trade triggers penetration transition, which fails
+    engine.on_trade(make_trade(price=99.98, time_ms=0, seq=1), safe_cov())
+    engine.advance_time("BTCUSDT", 2_000, safe_cov())
+
+    # Engine is degraded fail-closed
+    assert engine._authority_degraded is True
+    assert store.active_count("BTCUSDT") == 1
+    assert len(store.recent("BTCUSDT")) == 0
+
+    # Restore authority availability
+    authority.claim_transition = original_claim_transition
+
+    # New trades on degraded engine MUST NOT produce classifications
+    engine.on_trade(make_trade(price=100.02, time_ms=3_000, seq=2), safe_cov())
+    engine.advance_time("BTCUSDT", 6_000, safe_cov())
+
+    assert len(store.recent("BTCUSDT")) == 0
+    authority.close()
+
+
+def test_restart_recovery_preserves_ambiguous_collision_semantics(tmp_path):
+    db_path = tmp_path / "rec_col.sqlite3"
+    auth1 = SQLiteIdentityAuthority(db_path)
+    policy = LiquidityClassificationPolicy()
+
+    # Claim two colliding observations
+    obs1 = make_obs(event_id="col-a", side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=1_000, detection_time_ms=1_500)
+    obs2 = make_obs(event_id="col-b", side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=1_200, detection_time_ms=1_500)
+
+    auth1.claim_observation(obs1)
+    auth1.claim_observation(obs2)
+    auth1.close()
+
+    # Restart and recover
+    auth2 = SQLiteIdentityAuthority(db_path)
+    store2 = LiquidityEventStore(policy)
+    engine2 = LiquidityEventEngine(policy, store2, auth2)
+
+    results = engine2.recover_claimed_unresolved(StaticTradeCoverageProvider(safe_cov()))
+
+    # Both colliding events must be finalized as INVALID / AMBIGUOUS_EVENT_COLLISION
+    recent = store2.recent("BTCUSDT")
+    assert len(recent) == 2
+    assert all(r.classification is EventClassification.INVALID for r in recent)
+    assert all(r.reason_code == "AMBIGUOUS_EVENT_COLLISION" for r in recent)
+    auth2.close()
+
+
+def test_immediate_coverage_invalid_event_has_canonical_lifecycle():
+    engine, store, authority = setup_engine()
+    transitions: list[LifecycleTransition] = []
+    engine.on_transition = transitions.append
+
+    obs = make_obs(side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=0)
+    unsafe = TradeCoverage(feed_safe=False, known_gap=False, buffer_overflow=False, unresolved_sequence=False, interval_retained=True)
+
+    # Sweep has unsafe coverage immediately
+    res = engine.on_sweep(obs, StaticTradeCoverageProvider(unsafe))
+    assert res is not None
+
+    # Canonical lifecycle: OBSERVED -> PENETRATION_VALIDATING -> INVALID -> FINALIZED
+    states = [(t.transition_sequence, t.previous_state, t.next_state) for t in transitions]
+    assert states == [
+        (0, EventState.OBSERVED, EventState.PENETRATION_VALIDATING),
+        (1, EventState.PENETRATION_VALIDATING, EventState.INVALID),
+        (2, EventState.INVALID, EventState.FINALIZED),
+    ]
+    authority.close()
+
+
+def test_penetration_time_ms_in_evidence():
+    engine, store, authority = setup_engine()
+    obs = make_obs(side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=0)
+    engine.on_sweep(obs, StaticTradeCoverageProvider(safe_cov()))
+
+    engine.on_trade(make_trade(price=99.98, time_ms=500, seq=1), safe_cov())
+    engine.on_trade(make_trade(price=100.02, time_ms=1_000, seq=2), safe_cov())
+    engine.on_trade(make_trade(price=100.02, time_ms=2_000, seq=3), safe_cov())
+    engine.on_trade(make_trade(price=100.02, time_ms=4_000, seq=4), safe_cov())
+    engine.advance_time("BTCUSDT", 6_000, safe_cov())
+
+    recent = store.recent("BTCUSDT")[0]
+    assert "price.penetration_time_ms" in recent.evidence.values
+    assert recent.evidence.values["price.penetration_time_ms"].value == 500.0
+    authority.close()
+
+
+def test_restart_post_expiry_unsafe_clock_probe_does_not_poison_event_integrity(tmp_path):
+    db_path = tmp_path / "rec_clock_probe.sqlite3"
+    auth1 = SQLiteIdentityAuthority(db_path)
+    obs = make_obs(side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=0, detection_time_ms=90_000)
+    auth1.claim_observation(obs)
+    auth1.close()
+
+    auth2 = SQLiteIdentityAuthority(db_path)
+    store2 = LiquidityEventStore(LiquidityClassificationPolicy())
+    engine2 = LiquidityEventEngine(LiquidityClassificationPolicy(), store2, auth2)
+
+    class ClockGapProvider:
+        def coverage(self, symbol: str, start_ms: int, end_ms: int) -> TradeCoverage:
+            if end_ms > 60_000:
+                return TradeCoverage(feed_safe=True, known_gap=True, buffer_overflow=False, unresolved_sequence=False, interval_retained=True)
+            return safe_cov()
+
+    # Replay trades with reclaim inside [0, 4,000]
+    engine2.on_trade(make_trade(price=99.98, time_ms=0, seq=1), safe_cov())
+    engine2.on_trade(make_trade(price=100.02, time_ms=1_000, seq=2), safe_cov())
+    engine2.on_trade(make_trade(price=100.02, time_ms=2_000, seq=3), safe_cov())
+    engine2.on_trade(make_trade(price=100.02, time_ms=4_000, seq=4), safe_cov())
+    engine2.advance_time("BTCUSDT", 6_000, safe_cov())
+
+    results = engine2.recover_claimed_unresolved(ClockGapProvider())
+    assert len(results) == 1
+    assert results[0].classification is EventClassification.FAILED_BREAKDOWN
+    assert results[0].reason_code == "RECLAIM_CONFIRMED"
+    auth2.close()
+
+
+def test_advance_time_after_depth_proves_from_trade_horizon_not_depth_horizon():
+    engine, store, authority = setup_engine()
+    # Trade coverage only at 1,000
+    engine.on_trade(make_trade(price=99.98, time_ms=1_000, seq=1), safe_cov())
+
+    # Depth at 50,000
+    depth = DepthObservation(
+        symbol="BTCUSDT",
+        bids=((Decimal("99.98"), Decimal("1.0")),),
+        asks=((Decimal("100.02"), Decimal("1.0")),),
+        exchange_time_ms=50_000,
+        sequence_id=1,
+    )
+    engine.on_depth(depth)
+
+    # advance_time to 60,000
+    engine.advance_time("BTCUSDT", 60_000, safe_cov())
+
+    runtime = engine.symbol_runtime("BTCUSDT")
+    assert runtime.proven_trade_coverage_time_ms == 60_000
+    authority.close()
+
+
+def test_existing_event_cannot_timeout_across_depth_created_trade_coverage_hole():
+    engine, store, authority = setup_engine()
+    # Event 1 at 0..60,000
+    obs1 = make_obs(event_id="ev-1", side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=0, detection_time_ms=1_000)
+    engine.on_sweep(obs1, StaticTradeCoverageProvider(safe_cov()))
+
+    # Trade at 1,000
+    engine.on_trade(make_trade(price=99.98, time_ms=1_000, seq=1), safe_cov())
+
+    # Depth arrives at 70,000 (past event expiry 60,000)
+    depth = DepthObservation(
+        symbol="BTCUSDT",
+        bids=((Decimal("99.98"), Decimal("1.0")),),
+        asks=((Decimal("100.02"), Decimal("1.0")),),
+        exchange_time_ms=70_000,
+        sequence_id=1,
+    )
+    engine.on_depth(depth)
+
+    # Depth alone cannot time out Event 1 because trade watermark is still 1,000 - 2,000 = -1,000
+    assert store.active_count("BTCUSDT") == 1
+    assert len(store.recent("BTCUSDT")) == 0
+    authority.close()
+
+
+def test_insufficient_replay_history_has_canonical_lifecycle():
+    engine, store, authority = setup_engine()
+    transitions: list[LifecycleTransition] = []
+    engine.on_transition = transitions.append
+
+    obs = make_obs(side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=0)
+    no_history = TradeCoverage(feed_safe=True, known_gap=False, buffer_overflow=False, unresolved_sequence=False, interval_retained=False)
+
+    res = engine.on_sweep(obs, StaticTradeCoverageProvider(no_history))
+    assert res is not None
+
+    states = [(t.transition_sequence, t.previous_state, t.next_state) for t in transitions]
+    assert states == [
+        (0, EventState.OBSERVED, EventState.PENETRATION_VALIDATING),
+        (1, EventState.PENETRATION_VALIDATING, EventState.INVALID),
+        (2, EventState.INVALID, EventState.FINALIZED),
+    ]
+    authority.close()
