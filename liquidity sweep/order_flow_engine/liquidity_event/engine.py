@@ -104,12 +104,12 @@ class SymbolRuntime:
         self.coverage_ledger.append(
             CoverageSegment(start_ms=start_ms, end_ms=end_ms, coverage=coverage, purpose=purpose)
         )
-        if coverage.valid:
-            if purpose == "TRADE_FEED":
-                self.proven_trade_coverage_time_ms = max(self.proven_trade_coverage_time_ms or 0, end_ms)
-            elif purpose == "CLOCK_ADVANCEMENT":
-                if self.proven_trade_coverage_time_ms is None or start_ms <= self.proven_trade_coverage_time_ms:
-                    self.proven_trade_coverage_time_ms = max(self.proven_trade_coverage_time_ms or 0, end_ms)
+        if coverage.valid and purpose in ("TRADE_FEED", "CLOCK_ADVANCEMENT"):
+            current = self.proven_trade_coverage_time_ms
+            if current is None:
+                self.proven_trade_coverage_time_ms = end_ms
+            elif start_ms <= current:
+                self.proven_trade_coverage_time_ms = max(current, end_ms)
 
     def check_interval_coverage(self, start_ms: int, end_ms: int) -> tuple[bool, str | None]:
         """Evaluates all TRADE_FEED and EVENT_INTEGRITY coverage segments overlapping [start_ms, end_ms] monotonically without last-write-wins."""
@@ -241,8 +241,13 @@ class LiquidityEventEngine:
             return
 
         # 2. Record coverage and insert trade
+        coverage_start = (
+            runtime.proven_trade_coverage_time_ms
+            if runtime.proven_trade_coverage_time_ms is not None
+            else trade.exchange_time_ms
+        )
         runtime.record_coverage(
-            start_ms=trade.exchange_time_ms,
+            start_ms=coverage_start,
             end_ms=trade.exchange_time_ms,
             coverage=coverage,
             purpose="TRADE_FEED",
@@ -295,7 +300,11 @@ class LiquidityEventEngine:
         symbol = observation.symbol
         runtime = self.symbol_runtime(symbol)
         expiry_ms = observation.event_time_ms + self.policy.confirmation_window_ms
-        trade_horizon_before = runtime.proven_trade_coverage_time_ms or 0
+        trade_horizon_before = (
+            runtime.proven_trade_coverage_time_ms
+            if runtime.proven_trade_coverage_time_ms is not None
+            else observation.event_time_ms
+        )
 
         # 1. Obtain event-integrity coverage
         cov_event = coverage_provider.coverage(
@@ -577,7 +586,11 @@ class LiquidityEventEngine:
                 continue
 
             # Clock advancement split for detection time during recovery
-            trade_horizon = runtime.proven_trade_coverage_time_ms or obs.event_time_ms
+            trade_horizon = (
+                runtime.proven_trade_coverage_time_ms
+                if runtime.proven_trade_coverage_time_ms is not None
+                else obs.event_time_ms
+            )
             if obs.detection_time_ms > trade_horizon:
                 cov_clock = coverage_provider.coverage(
                     obs.symbol,
@@ -753,25 +766,30 @@ class LiquidityEventEngine:
             reason_code=reason_code,
         )
 
+        should_emit = False
         try:
             persisted_seqs = self.authority.persisted_transition_sequences(ctx.event.event_id)
             if next_seq not in persisted_seqs:
                 self.authority.claim_transition(transition)
-                if self.on_transition:
-                    try:
-                        self.on_transition(transition)
-                    except Exception as e:
-                        logger.error("on_transition callback error: %s", e)
+                should_emit = True
         except Exception as e:
             self._authority_degraded = True
             self.telemetry.authority_failures_count += 1
             logger.error("authority claim transition failed: %s", e)
             return False
 
+        # Canonical volatile state mutation AFTER persistence
         ctx.event.state = to_state
         ctx.event.transitions.append(transition)
         ctx.last_transition_sequence = next_seq
         ctx.last_state = to_state
+
+        # External callback LAST
+        if should_emit and self.on_transition:
+            try:
+                self.on_transition(transition)
+            except Exception as e:
+                logger.error("on_transition callback error: %s", e)
 
         return True
 
