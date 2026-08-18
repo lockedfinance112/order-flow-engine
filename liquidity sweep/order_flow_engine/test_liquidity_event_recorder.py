@@ -203,16 +203,17 @@ def test_recorder_failure_preserves_result_but_invalidates_research(tmp_path: Pa
 
 
 def test_certification_reports_missing_rows(tmp_path: Path):
-    recorder = LiquidityEventRecorder("replay", tmp_path / "rep_cert")
     t0 = make_test_transition(event_id="evt-1", seq=0)
     res = make_test_result(event_id="evt-1")
-    recorder.enqueue(CanonicalRecord("TRANSITION", t0))
-    recorder.enqueue(CanonicalRecord("EVENT", res))
-    recorder.flush_replay()
 
     # Missing event row
+    rec1 = LiquidityEventRecorder("replay", tmp_path / "rep_cert1")
+    rec1.enqueue(CanonicalRecord("TRANSITION", t0))
+    rec1.enqueue(CanonicalRecord("EVENT", res))
+    rec1.flush_replay()
+
     assert (
-        recorder.certify(
+        rec1.certify(
             expected_event_ids={"evt-1", "evt-missing"},
             expected_transition_keys={("evt-1", 0)},
         )
@@ -220,8 +221,13 @@ def test_certification_reports_missing_rows(tmp_path: Path):
     )
 
     # Missing transition row
+    rec2 = LiquidityEventRecorder("replay", tmp_path / "rep_cert2")
+    rec2.enqueue(CanonicalRecord("TRANSITION", t0))
+    rec2.enqueue(CanonicalRecord("EVENT", res))
+    rec2.flush_replay()
+
     assert (
-        recorder.certify(
+        rec2.certify(
             expected_event_ids={"evt-1"},
             expected_transition_keys={("evt-1", 0), ("evt-1", 1)},
         )
@@ -229,8 +235,13 @@ def test_certification_reports_missing_rows(tmp_path: Path):
     )
 
     # Complete certification
+    rec3 = LiquidityEventRecorder("replay", tmp_path / "rep_cert3")
+    rec3.enqueue(CanonicalRecord("TRANSITION", t0))
+    rec3.enqueue(CanonicalRecord("EVENT", res))
+    rec3.flush_replay()
+
     assert (
-        recorder.certify(
+        rec3.certify(
             expected_event_ids={"evt-1"},
             expected_transition_keys={("evt-1", 0)},
         )
@@ -332,3 +343,122 @@ def test_optional_empty_fields_serialize_as_empty_strings(tmp_path: Path):
     assert r_rows[1][4] == ""  # source_file_id
     assert r_rows[1][5] == ""  # source_row_hash
     assert r_rows[1][6] == ""  # source_observation_hash
+
+
+def test_certify_before_flush_reports_missing_rows(tmp_path: Path):
+    recorder = LiquidityEventRecorder("replay", tmp_path / "cert_preflush")
+    t0 = make_test_transition(event_id="evt-1", seq=0)
+    res = make_test_result(event_id="evt-1")
+
+    recorder.enqueue(t0)
+    recorder.enqueue(res)
+
+    # Before flush, physical rows are NOT emitted
+    assert (
+        recorder.certify(
+            expected_event_ids={"evt-1"},
+            expected_transition_keys={("evt-1", 0)},
+        )
+        is ArtifactIntegrity.MISSING_EVENT_ROW
+    )
+    assert recorder.telemetry.status == "DEGRADED"
+
+
+def test_unexpected_or_duplicate_event_fails_certification(tmp_path: Path):
+    # Unexpected event
+    rec1 = LiquidityEventRecorder("replay", tmp_path / "unexpected_evt")
+    rec1.enqueue(make_test_result(event_id="evt-1"))
+    rec1.enqueue(make_test_result(event_id="evt-unexpected"))
+    rec1.flush_replay()
+
+    assert rec1.certify(expected_event_ids={"evt-1"}) is ArtifactIntegrity.RECORDER_FAILURE
+    assert rec1.telemetry.status == "DEGRADED"
+
+    # Duplicate event
+    rec2 = LiquidityEventRecorder("live", tmp_path / "dup_evt", auto_flush=True)
+    res = make_test_result(event_id="evt-1")
+    rec2.enqueue(res)
+    rec2.enqueue(res)  # Duplicate write to CSV
+
+    assert rec2.certify(expected_event_ids={"evt-1"}) is ArtifactIntegrity.RECORDER_FAILURE
+    assert rec2.telemetry.status == "DEGRADED"
+
+
+def test_unexpected_or_duplicate_transition_fails_certification(tmp_path: Path):
+    # Unexpected transition
+    rec1 = LiquidityEventRecorder("replay", tmp_path / "unexpected_trans")
+    t0 = make_test_transition(event_id="evt-1", seq=0)
+    t_unexp = make_test_transition(event_id="evt-1", seq=99)
+    res = make_test_result(event_id="evt-1")
+    rec1.enqueue(t0)
+    rec1.enqueue(t_unexp)
+    rec1.enqueue(res)
+    rec1.flush_replay()
+
+    assert (
+        rec1.certify(
+            expected_event_ids={"evt-1"},
+            expected_transition_keys={("evt-1", 0)},
+        )
+        is ArtifactIntegrity.RECORDER_FAILURE
+    )
+    assert rec1.telemetry.status == "DEGRADED"
+
+    # Duplicate transition
+    rec2 = LiquidityEventRecorder("live", tmp_path / "dup_trans", auto_flush=True)
+    rec2.enqueue(t0)
+    rec2.enqueue(t0)
+    rec2.enqueue(res)
+
+    assert (
+        rec2.certify(
+            expected_event_ids={"evt-1"},
+            expected_transition_keys={("evt-1", 0)},
+        )
+        is ArtifactIntegrity.RECORDER_FAILURE
+    )
+    assert rec2.telemetry.status == "DEGRADED"
+
+
+def test_canonical_record_validates_payload_and_record_type():
+    t = make_test_transition(event_id="evt-1", seq=0)
+    res = make_test_result(event_id="evt-1")
+    rej = make_test_rejected()
+
+    # Valid creations
+    c_t = CanonicalRecord("TRANSITION", t)
+    assert c_t.record_type_rank == 0
+    c_e = CanonicalRecord("EVENT", res)
+    assert c_e.record_type_rank == 1
+    c_r = CanonicalRecord("REJECTED_INPUT", rej)
+    assert c_r.record_type_rank == 2
+
+    # Mismatched creations raise ValueError
+    with pytest.raises(ValueError, match="mismatched"):
+        CanonicalRecord("TRANSITION", res)
+
+    with pytest.raises(ValueError, match="mismatched"):
+        CanonicalRecord("EVENT", t)
+
+    with pytest.raises(ValueError, match="mismatched"):
+        CanonicalRecord("REJECTED_INPUT", res)
+
+    # Unknown record type raises ValueError
+    with pytest.raises(ValueError, match="Unknown record_type"):
+        CanonicalRecord("UNKNOWN", res)  # type: ignore
+
+
+def test_telemetry_status_degraded_and_sticky_integrity(tmp_path: Path):
+    recorder = LiquidityEventRecorder("live", tmp_path / "sticky_test", queue_max_items=1)
+    res1 = make_test_result(event_id="evt-1")
+    res2 = make_test_result(event_id="evt-2")
+
+    recorder.enqueue(res1)
+    recorder.enqueue(res2)  # Causes QUEUE_OVERFLOW
+
+    assert recorder.telemetry.status == "DEGRADED"
+    assert recorder.artifact_integrity is ArtifactIntegrity.QUEUE_OVERFLOW
+
+    # Re-certifying must NEVER reset back to COMPLETE
+    assert recorder.certify(expected_event_ids={"evt-1"}) is ArtifactIntegrity.QUEUE_OVERFLOW
+    assert recorder.telemetry.status == "DEGRADED"

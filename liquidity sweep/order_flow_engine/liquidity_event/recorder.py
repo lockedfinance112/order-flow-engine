@@ -70,13 +70,34 @@ class CanonicalRecord:
     record_type: str  # "TRANSITION" | "EVENT" | "REJECTED_INPUT"
     payload: LifecycleTransition | LiquidityEventResult | RejectedSweepInput
 
+    def __post_init__(self) -> None:
+        if self.record_type == "TRANSITION":
+            if not isinstance(self.payload, LifecycleTransition):
+                raise ValueError(
+                    f"mismatched record_type 'TRANSITION' with payload {type(self.payload).__name__}"
+                )
+        elif self.record_type == "EVENT":
+            if not isinstance(self.payload, LiquidityEventResult):
+                raise ValueError(
+                    f"mismatched record_type 'EVENT' with payload {type(self.payload).__name__}"
+                )
+        elif self.record_type == "REJECTED_INPUT":
+            if not isinstance(self.payload, RejectedSweepInput):
+                raise ValueError(
+                    f"mismatched record_type 'REJECTED_INPUT' with payload {type(self.payload).__name__}"
+                )
+        else:
+            raise ValueError(f"Unknown record_type: {self.record_type}")
+
     @property
     def record_type_rank(self) -> int:
-        if self.record_type == "TRANSITION" or isinstance(self.payload, LifecycleTransition):
+        if self.record_type == "TRANSITION":
             return 0
-        if self.record_type == "EVENT" or isinstance(self.payload, LiquidityEventResult):
+        if self.record_type == "EVENT":
             return 1
-        return 2
+        if self.record_type == "REJECTED_INPUT":
+            return 2
+        raise ValueError(f"Unknown record_type: {self.record_type}")
 
     @property
     def canonical_record_time_ms(self) -> int:
@@ -215,8 +236,8 @@ class LiquidityEventRecorder:
         self._artifact_integrity: ArtifactIntegrity = ArtifactIntegrity.COMPLETE
         self._queue: deque[CanonicalRecord] = deque()
         self._records: list[CanonicalRecord] = []
-        self._written_event_ids: set[str] = set()
-        self._written_transition_keys: set[tuple[str, int]] = set()
+        self._written_event_ids: list[str] = []
+        self._written_transition_keys: list[tuple[str, int]] = []
 
     @property
     def artifact_integrity(self) -> ArtifactIntegrity:
@@ -228,6 +249,7 @@ class LiquidityEventRecorder:
     ) -> bool:
         if self._artifact_integrity is ArtifactIntegrity.QUEUE_OVERFLOW:
             self.telemetry.failure_count += 1
+            self.telemetry.status = "DEGRADED"
             return False
 
         if not isinstance(record, CanonicalRecord):
@@ -246,29 +268,63 @@ class LiquidityEventRecorder:
         if current_count >= self.queue_max_items:
             self.telemetry.failure_count += 1
             self.telemetry.last_error = "queue overflow"
+            self.telemetry.status = "DEGRADED"
             self._artifact_integrity = ArtifactIntegrity.QUEUE_OVERFLOW
             return False
 
         if self.mode == "replay":
             self._records.append(rec)
             self.telemetry.pending_write_count = len(self._records)
-            if isinstance(rec.payload, LiquidityEventResult):
-                self._written_event_ids.add(rec.payload.event_id)
-            elif isinstance(rec.payload, LifecycleTransition):
-                self._written_transition_keys.add((rec.payload.event_id, rec.payload.transition_sequence))
             return True
 
         # Live mode
         self._queue.append(rec)
         self.telemetry.pending_write_count = len(self._queue)
-        if isinstance(rec.payload, LiquidityEventResult):
-            self._written_event_ids.add(rec.payload.event_id)
-        elif isinstance(rec.payload, LifecycleTransition):
-            self._written_transition_keys.add((rec.payload.event_id, rec.payload.transition_sequence))
 
         if self.auto_flush:
             self.flush()
         return True
+
+    def _write_live_record(self, rec: CanonicalRecord) -> bool:
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            if isinstance(rec.payload, LiquidityEventResult):
+                filepath = self.output_dir / EVENTS_FILENAME
+                is_new = not filepath.exists() or filepath.stat().st_size == 0
+                with open(filepath, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f, lineterminator="\n")
+                    if is_new:
+                        writer.writerow(EVENT_COLUMNS)
+                    writer.writerow(_serialize_event_row(rec.payload))
+                self.telemetry.written_event_count += 1
+                self._written_event_ids.append(rec.payload.event_id)
+            elif isinstance(rec.payload, LifecycleTransition):
+                filepath = self.output_dir / TRANSITIONS_FILENAME
+                is_new = not filepath.exists() or filepath.stat().st_size == 0
+                with open(filepath, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f, lineterminator="\n")
+                    if is_new:
+                        writer.writerow(TRANSITION_COLUMNS)
+                    writer.writerow(_serialize_transition_row(rec.payload))
+                self.telemetry.written_transition_count += 1
+                self._written_transition_keys.append((rec.payload.event_id, rec.payload.transition_sequence))
+            elif isinstance(rec.payload, RejectedSweepInput):
+                filepath = self.output_dir / REJECTED_FILENAME
+                is_new = not filepath.exists() or filepath.stat().st_size == 0
+                with open(filepath, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f, lineterminator="\n")
+                    if is_new:
+                        writer.writerow(REJECTED_COLUMNS)
+                    writer.writerow(_serialize_rejected_row(rec.payload))
+                self.telemetry.written_rejected_count += 1
+            return True
+        except Exception as e:
+            self.telemetry.failure_count += 1
+            self.telemetry.last_error = str(e)
+            self.telemetry.status = "DEGRADED"
+            self._artifact_integrity = ArtifactIntegrity.RECORDER_FAILURE
+            logger.error("recorder write error: %s", e)
+            return False
 
     def flush_replay(self) -> None:
         try:
@@ -282,10 +338,10 @@ class LiquidityEventRecorder:
             for rec in sorted_records:
                 if isinstance(rec.payload, LiquidityEventResult):
                     events_rows.append(_serialize_event_row(rec.payload))
-                    self._written_event_ids.add(rec.payload.event_id)
+                    self._written_event_ids.append(rec.payload.event_id)
                 elif isinstance(rec.payload, LifecycleTransition):
                     transitions_rows.append(_serialize_transition_row(rec.payload))
-                    self._written_transition_keys.add((rec.payload.event_id, rec.payload.transition_sequence))
+                    self._written_transition_keys.append((rec.payload.event_id, rec.payload.transition_sequence))
                 elif isinstance(rec.payload, RejectedSweepInput):
                     rejected_rows.append(_serialize_rejected_row(rec.payload))
 
@@ -314,6 +370,7 @@ class LiquidityEventRecorder:
         except Exception as e:
             self.telemetry.failure_count += 1
             self.telemetry.last_error = str(e)
+            self.telemetry.status = "DEGRADED"
             self._artifact_integrity = ArtifactIntegrity.RECORDER_FAILURE
             logger.error("flush_replay error: %s", e)
 
@@ -322,45 +379,13 @@ class LiquidityEventRecorder:
             self.flush_replay()
             return
 
-        try:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            while self._queue:
-                rec = self._queue[0]
-                if isinstance(rec.payload, LiquidityEventResult):
-                    filepath = self.output_dir / EVENTS_FILENAME
-                    is_new = not filepath.exists() or filepath.stat().st_size == 0
-                    with open(filepath, "a", newline="", encoding="utf-8") as f:
-                        writer = csv.writer(f, lineterminator="\n")
-                        if is_new:
-                            writer.writerow(EVENT_COLUMNS)
-                        writer.writerow(_serialize_event_row(rec.payload))
-                    self.telemetry.written_event_count += 1
-                elif isinstance(rec.payload, LifecycleTransition):
-                    filepath = self.output_dir / TRANSITIONS_FILENAME
-                    is_new = not filepath.exists() or filepath.stat().st_size == 0
-                    with open(filepath, "a", newline="", encoding="utf-8") as f:
-                        writer = csv.writer(f, lineterminator="\n")
-                        if is_new:
-                            writer.writerow(TRANSITION_COLUMNS)
-                        writer.writerow(_serialize_transition_row(rec.payload))
-                    self.telemetry.written_transition_count += 1
-                elif isinstance(rec.payload, RejectedSweepInput):
-                    filepath = self.output_dir / REJECTED_FILENAME
-                    is_new = not filepath.exists() or filepath.stat().st_size == 0
-                    with open(filepath, "a", newline="", encoding="utf-8") as f:
-                        writer = csv.writer(f, lineterminator="\n")
-                        if is_new:
-                            writer.writerow(REJECTED_COLUMNS)
-                        writer.writerow(_serialize_rejected_row(rec.payload))
-                    self.telemetry.written_rejected_count += 1
-
+        while self._queue:
+            rec = self._queue[0]
+            if self._write_live_record(rec):
                 self._queue.popleft()
                 self.telemetry.pending_write_count = len(self._queue)
-        except Exception as e:
-            self.telemetry.failure_count += 1
-            self.telemetry.last_error = str(e)
-            self._artifact_integrity = ArtifactIntegrity.RECORDER_FAILURE
-            logger.error("flush error: %s", e)
+            else:
+                break
 
     def certify(
         self,
@@ -371,18 +396,47 @@ class LiquidityEventRecorder:
             return self._artifact_integrity
 
         exp_events = set(expected_event_ids)
-        if exp_events and not exp_events.issubset(self._written_event_ids):
-            return ArtifactIntegrity.MISSING_EVENT_ROW
+        written_events_set = set(self._written_event_ids)
+
+        # Check for missing expected events
+        missing_events = exp_events - written_events_set
+        if missing_events:
+            self._artifact_integrity = ArtifactIntegrity.MISSING_EVENT_ROW
+            self.telemetry.status = "DEGRADED"
+            return self._artifact_integrity
+
+        # Check for unexpected events or duplicate written event rows
+        unexpected_events = written_events_set - exp_events
+        if unexpected_events or len(self._written_event_ids) != len(exp_events):
+            self._artifact_integrity = ArtifactIntegrity.RECORDER_FAILURE
+            self.telemetry.status = "DEGRADED"
+            return self._artifact_integrity
 
         exp_trans = set(expected_transition_keys)
-        if exp_trans and not exp_trans.issubset(self._written_transition_keys):
-            return ArtifactIntegrity.MISSING_TRANSITION_ROW
+        written_trans_set = set(self._written_transition_keys)
+
+        # Check for missing expected transitions
+        missing_trans = exp_trans - written_trans_set
+        if missing_trans:
+            self._artifact_integrity = ArtifactIntegrity.MISSING_TRANSITION_ROW
+            self.telemetry.status = "DEGRADED"
+            return self._artifact_integrity
+
+        # Check for unexpected transitions or duplicate written transition rows
+        unexpected_trans = written_trans_set - exp_trans
+        if unexpected_trans or len(self._written_transition_keys) != len(exp_trans):
+            self._artifact_integrity = ArtifactIntegrity.RECORDER_FAILURE
+            self.telemetry.status = "DEGRADED"
+            return self._artifact_integrity
 
         return ArtifactIntegrity.COMPLETE
 
     def close(self) -> None:
         self.flush()
-        self.telemetry.status = "STOPPED"
+        if self._artifact_integrity == ArtifactIntegrity.COMPLETE:
+            self.telemetry.status = "STOPPED"
+        else:
+            self.telemetry.status = "DEGRADED"
 
 
 def render_records(
