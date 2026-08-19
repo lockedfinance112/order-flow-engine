@@ -1598,6 +1598,28 @@ class OrderFlowDashboard:
                 </div>
             </div>
 
+            <!-- LIQUIDITY EVENTS (SHADOW) PANEL -->
+            <div class="panel liquidity-events-panel" style="margin-top: 16px;">
+                <div class="panel-header-flex">
+                    <div class="panel-title" style="margin-bottom: 0;">Liquidity Events (Shadow)</div>
+                    <div style="font-size: 11px; color: var(--text-muted); background: var(--bg-base); padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border);">
+                        Observational shadow evaluation &bull; Uncalibrated score &bull; No trade execution
+                    </div>
+                </div>
+                <div id="liquidity-events-container" style="margin-top: 12px;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                        <div>
+                            <div style="font-size: 12px; font-weight: bold; color: var(--text-muted); margin-bottom: 6px;">ACTIVE TRACKERS</div>
+                            <div id="liquidity-active-events" style="font-size: 12px; color: var(--text-muted); min-height: 40px;">No active liquidity event trackers.</div>
+                        </div>
+                        <div>
+                            <div style="font-size: 12px; font-weight: bold; color: var(--text-muted); margin-bottom: 6px;">RECENT RESOLVED EVENTS</div>
+                            <div id="liquidity-recent-events" style="font-size: 12px; color: var(--text-muted); min-height: 40px;">No resolved events in current session.</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- PAPER TRADING PORTFOLIO & TERMINAL -->
             <div class="panel paper-trading-panel" style="margin-top: 16px;">
                 <div class="panel-header-flex">

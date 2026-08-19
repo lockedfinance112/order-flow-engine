@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import json
+from decimal import Decimal
 from typing import Dict, Tuple, Optional, List, Any
 from datetime import datetime, timezone
 from rich.live import Live
@@ -39,6 +40,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("OrderFlow.Main")
 
+class LiveTradeCoverageProvider:
+    """Live trade coverage provider forwarding Guardian stream safety to the liquidity engine."""
+    def __init__(self, metrics: FlowMetrics):
+        self._metrics = metrics
+
+    def coverage(self, symbol: str, start_ms: int, end_ms: int):
+        from liquidity_event import TradeCoverage
+        now = time.time()
+        safety_obj = self._metrics.get_market_data_safety(symbol, now)
+        t_status = safety_obj.get("trade_status", "HEALTHY")
+        feed_safe = safety_obj.get("safe", True) and t_status == "HEALTHY"
+        return TradeCoverage(
+            feed_safe=feed_safe,
+            known_gap=(t_status == "UNSAFE"),
+            buffer_overflow=False,
+            unresolved_sequence=False,
+            interval_retained=True,
+        )
+
 class OrderFlowEngine:
     def __init__(self):
         self.metrics = FlowMetrics()
@@ -72,6 +92,100 @@ class OrderFlowEngine:
             liquidity_provider=get_liquidity_data,
             config=vars(cfg)
         )
+
+        # Instantiate LiquidityEventEngine (TICS Phase 1C.1 - Shadow Mode)
+        if getattr(config, "LIQUIDITY_EVENT_ENGINE_ENABLED", False):
+            from liquidity_event import (
+                AggressorSide,
+                DepthObservation,
+                LegacyLiquidityContextAdapter,
+                LifecycleTransition,
+                LiquidityClassificationPolicy,
+                LiquidityEventEngine,
+                LiquidityEventResult,
+                LiquidityEventStore,
+                LiquidityEvidenceBuilder,
+                MarketTrade,
+                RejectedSweepInput,
+                SQLiteIdentityAuthority,
+                SweepsMonitorAdapter,
+                TradeCoverage,
+            )
+            from liquidity_event.recorder import LiquidityEventRecorder
+
+            os.makedirs(config.LIQUIDITY_EVENT_OUTPUT_DIR, exist_ok=True)
+            db_path = os.path.join(config.LIQUIDITY_EVENT_OUTPUT_DIR, "liquidity_identity.sqlite3")
+            self.liquidity_policy = LiquidityClassificationPolicy()
+            self.liquidity_identity_authority = SQLiteIdentityAuthority(db_path)
+            self.liquidity_store = LiquidityEventStore(self.liquidity_policy)
+            self.liquidity_evidence_builder = LiquidityEvidenceBuilder()
+            self.liquidity_recorder = LiquidityEventRecorder(
+                mode="live",
+                output_dir=config.LIQUIDITY_EVENT_OUTPUT_DIR,
+                queue_max_items=self.liquidity_policy.recorder_queue_max_items,
+            )
+            self.liquidity_adapter = SweepsMonitorAdapter(self.liquidity_policy)
+            self.liquidity_context_adapter = LegacyLiquidityContextAdapter()
+            self.context_adapter = self.liquidity_context_adapter
+            self.liquidity_coverage_provider = LiveTradeCoverageProvider(self.metrics)
+            self.recent_liquidity_results: list[dict] = []
+            self.active_liquidity_events: dict[str, dict] = {}
+            self.rejected_input_count = 0
+
+            def on_transition(t: LifecycleTransition) -> None:
+                if self.liquidity_recorder:
+                    self.liquidity_recorder.enqueue(t)
+
+            def on_result(r: LiquidityEventResult) -> None:
+                if self.liquidity_recorder:
+                    self.liquidity_recorder.enqueue(r)
+                res_dict = {
+                    "event_id": r.event_id,
+                    "symbol": r.symbol,
+                    "side": r.liquidity_side.value,
+                    "classification": r.classification.value,
+                    "reason_code": r.reason_code,
+                    "event_time_ms": r.event_time_ms,
+                    "detection_time_ms": r.detection_time_ms,
+                    "market_resolution_time_ms": r.market_resolution_time_ms,
+                    "classification_time_ms": r.classification_time_ms,
+                    "confidence": r.evidence.confidence,
+                    "confidence_type": r.evidence.confidence_type.value,
+                    "reasons": list(r.evidence.reasons),
+                    "contradictions": list(r.evidence.contradictions),
+                    "context_coverage": r.evidence.context_coverage,
+                }
+                self.recent_liquidity_results.append(res_dict)
+                if len(self.recent_liquidity_results) > 100:
+                    self.recent_liquidity_results.pop(0)
+                self.active_liquidity_events.pop(r.event_id, None)
+
+            def on_rejected(rej: RejectedSweepInput) -> None:
+                self.rejected_input_count += 1
+                if self.liquidity_recorder:
+                    self.liquidity_recorder.enqueue(rej)
+
+            self.liquidity_engine = LiquidityEventEngine(
+                policy=self.liquidity_policy,
+                store=self.liquidity_store,
+                authority=self.liquidity_identity_authority,
+                evidence_builder=self.liquidity_evidence_builder,
+                on_transition=on_transition,
+                on_result=on_result,
+                on_rejected=on_rejected,
+            )
+        else:
+            self.liquidity_engine = None
+            self.liquidity_recorder = None
+            self.liquidity_identity_authority = None
+            self.liquidity_store = None
+            self.liquidity_adapter = None
+            self.liquidity_context_adapter = None
+            self.context_adapter = None
+            self.liquidity_coverage_provider = None
+            self.recent_liquidity_results = []
+            self.active_liquidity_events = {}
+            self.rejected_input_count = 0
         
         # Event Recorders per symbol (v2.9)
         from data.recorder import StreamRecorder
@@ -214,6 +328,28 @@ class OrderFlowEngine:
             if rec:
                 await rec.record(f"{symbol.lower()}@depth", depth_data, now)
 
+        # Feed depth to TICS Liquidity Event Engine (Phase 1C.1 - Shadow Mode)
+        if self.liquidity_engine:
+            try:
+                from liquidity_event import DepthObservation
+                bids_raw = depth_data.get("bids", depth_data.get("b", []))
+                asks_raw = depth_data.get("asks", depth_data.get("a", []))
+                bids = tuple((Decimal(str(p)), Decimal(str(q))) for p, q in bids_raw)
+                asks = tuple((Decimal(str(p)), Decimal(str(q))) for p, q in asks_raw)
+                depth_time = int(depth_data.get("exchange_time_ms") or depth_data.get("E") or depth_data.get("T") or int(now * 1000))
+                seq_id = depth_data.get("last_update_id") or depth_data.get("u") or 0
+
+                d_obs = DepthObservation(
+                    symbol=symbol.upper(),
+                    bids=bids,
+                    asks=asks,
+                    exchange_time_ms=depth_time,
+                    sequence_id=seq_id,
+                )
+                self.liquidity_engine.on_depth(d_obs)
+            except Exception as e:
+                logger.error(f"Error forwarding depth to liquidity engine: {e}", exc_info=True)
+
     async def _handle_sweep(self, sweep: dict):
         """Triggered when SweepsMonitor detects a new liquidity sweep event."""
         sweep_id = sweep["sweep_id"]
@@ -260,6 +396,28 @@ class OrderFlowEngine:
             order_book_imbalance_at_score=ob_imbalance,
             depth_snapshot_age_ms=depth_age
         )
+
+        # Feed sweep to TICS Liquidity Event Engine (Phase 1C.1 - Shadow Mode)
+        if self.liquidity_engine:
+            try:
+                det_time_raw = sweep.get("detection_time_ms")
+                detection_time_ms = int(det_time_raw if det_time_raw is not None else int(time.time() * 1000))
+                adapted = self.liquidity_adapter.adapt(sweep, detection_time_ms)
+                if adapted.observation is not None:
+                    self.liquidity_engine.on_sweep(adapted.observation, self.liquidity_coverage_provider)
+                    self.active_liquidity_events[adapted.observation.event_id] = {
+                        "event_id": adapted.observation.event_id,
+                        "symbol": adapted.observation.symbol,
+                        "level": float(adapted.observation.swept_level),
+                        "side": adapted.observation.liquidity_side.value,
+                        "event_time_ms": adapted.observation.event_time_ms,
+                        "detection_time_ms": adapted.observation.detection_time_ms,
+                    }
+                elif adapted.rejected is not None:
+                    if self.liquidity_recorder:
+                        self.liquidity_recorder.enqueue(adapted.rejected)
+            except Exception as e:
+                logger.error(f"Error forwarding sweep to liquidity engine: {e}", exc_info=True)
 
     def _build_current_symbol_data(self) -> dict:
         """Helper to build a unified dictionary snapshot of current metrics for all symbols."""
@@ -533,6 +691,9 @@ class OrderFlowEngine:
                     response = self._json_response(self.binance_context.get_context())
                 elif path == "/api/binance/status":
                     response = self._json_response(self.binance_context.get_status())
+                elif path == "/api/liquidity-events":
+                    payload = self._build_liquidity_events_payload()
+                    response = self._json_response(payload)
                 elif path == "/api/status":
                     now_time = time.time()
                     guardian_status = "HEALTHY"
@@ -706,6 +867,74 @@ class OrderFlowEngine:
             except Exception:
                 pass
 
+    def _build_liquidity_events_payload(self) -> dict:
+        if not self.liquidity_engine:
+            return {
+                "active": [],
+                "recent": [],
+                "engine": {
+                    "enabled": False,
+                    "enforcement_enabled": False,
+                    "active_event_count": 0,
+                    "rejected_input_count": 0,
+                    "late_data_count": 0,
+                    "recorder_status": "DISABLED",
+                    "recorder_failure_count": 0,
+                    "pending_write_count": 0,
+                    "policy_version": "NONE",
+                    "policy_hash": "NONE",
+                },
+            }
+
+        active_events = []
+        total_active = 0
+        now_ms = int(time.time() * 1000)
+        for sym, runtime in self.liquidity_engine._runtimes.items():
+            for event_id, ctx in runtime.active_trackers.items():
+                total_active += 1
+                obs = ctx.event.observation
+                active_events.append({
+                    "event_id": event_id,
+                    "symbol": obs.symbol,
+                    "side": obs.liquidity_side.value,
+                    "level": float(obs.swept_level),
+                    "event_time_ms": obs.event_time_ms,
+                    "detection_time_ms": obs.detection_time_ms,
+                    "state": ctx.last_state.value,
+                    "age_ms": max(0, now_ms - obs.event_time_ms),
+                })
+
+        rec_telemetry = self.liquidity_recorder.telemetry if self.liquidity_recorder else None
+
+        return {
+            "active": active_events,
+            "recent": list(self.recent_liquidity_results),
+            "engine": {
+                "enabled": True,
+                "enforcement_enabled": False,
+                "active_event_count": total_active,
+                "rejected_input_count": self.rejected_input_count,
+                "late_data_count": self.liquidity_engine.telemetry.late_data_count,
+                "recorder_status": rec_telemetry.status if rec_telemetry else "UNKNOWN",
+                "recorder_failure_count": rec_telemetry.failure_count if rec_telemetry else 0,
+                "pending_write_count": rec_telemetry.pending_write_count if rec_telemetry else 0,
+                "policy_version": self.liquidity_policy.model_version,
+                "policy_hash": self.liquidity_policy.policy_hash,
+            },
+        }
+
+    async def _shutdown_liquidity_event_engine(self):
+        try:
+            if self.liquidity_recorder:
+                self.liquidity_recorder.flush()
+        except Exception as e:
+            logger.error(f"Error flushing liquidity recorder on shutdown: {e}", exc_info=True)
+        try:
+            if self.liquidity_identity_authority:
+                self.liquidity_identity_authority.close()
+        except Exception as e:
+            logger.error(f"Error closing liquidity identity authority on shutdown: {e}", exc_info=True)
+
     async def run(self):
         logger.info(f"Starting Order Flow Engine V2.5 (Radar Universe: {len(SYMBOLS)} symbols)...")
 
@@ -744,6 +973,9 @@ class OrderFlowEngine:
         except asyncio.CancelledError:
             logger.info("Order Flow Engine stopped.")
         finally:
+            # Stop TICS Liquidity Event Engine
+            await self._shutdown_liquidity_event_engine()
+
             # Stop TICS Regime Engine
             if self.regime_engine.enabled:
                 await self.regime_engine.stop()
@@ -769,6 +1001,42 @@ class OrderFlowEngine:
                 
                 # Feed trade to TICS Regime Engine
                 self.regime_engine.on_trade(symbol, trade)
+
+                # Feed trade to TICS Liquidity Event Engine (Phase 1C.1 - Shadow Mode)
+                if self.liquidity_engine:
+                    try:
+                        from liquidity_event import AggressorSide, MarketTrade, TradeCoverage
+                        trade_p_raw = trade.get("p") if trade.get("p") is not None else trade.get("price", "0")
+                        trade_q_raw = trade.get("q") if trade.get("q") is not None else trade.get("quantity", "0")
+                        trade_price = Decimal(str(trade_p_raw))
+                        trade_qty = Decimal(str(trade_q_raw))
+                        trade_time = int(trade.get("T") or trade.get("E") or trade.get("time") or int(time.time() * 1000))
+                        seq_id = trade.get("a") or trade.get("trade_id") or trade.get("sequence_id") or 0
+                        is_buyer_maker = trade.get("m", False)
+                        side = AggressorSide.SELL if is_buyer_maker else AggressorSide.BUY
+
+                        m_trade = MarketTrade(
+                            symbol=symbol.upper(),
+                            price=trade_price,
+                            quantity=trade_qty,
+                            aggressor_side=side,
+                            exchange_time_ms=trade_time,
+                            sequence_id=seq_id,
+                        )
+
+                        safety_obj = self.metrics.get_market_data_safety(symbol, time.time())
+                        t_status = safety_obj.get("trade_status", "HEALTHY")
+                        feed_safe = safety_obj.get("safe", True) and t_status == "HEALTHY"
+                        trade_cov = TradeCoverage(
+                            feed_safe=feed_safe,
+                            known_gap=(t_status == "UNSAFE"),
+                            buffer_overflow=False,
+                            unresolved_sequence=False,
+                            interval_retained=True,
+                        )
+                        self.liquidity_engine.on_trade(m_trade, trade_cov)
+                    except Exception as e:
+                        logger.error(f"Error forwarding trade to liquidity engine: {e}", exc_info=True)
                 
                 # Feed price to outcomes tracker
                 trade_price = float(trade.get("p", 0.0) or trade.get("price", 0.0) or 0.0)
