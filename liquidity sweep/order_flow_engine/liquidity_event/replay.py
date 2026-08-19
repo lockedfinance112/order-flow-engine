@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import argparse
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 import gzip
@@ -8,6 +9,7 @@ from hashlib import sha256
 import json
 import logging
 from pathlib import Path
+import sys
 import tempfile
 from typing import Any
 
@@ -47,12 +49,33 @@ from .sweep_adapter import SweepsMonitorAdapter
 logger = logging.getLogger(__name__)
 
 
-class ReplayTradeCoverageProvider:
-    def __init__(self, coverage: TradeCoverage | None = None) -> None:
-        self._cov = coverage or TradeCoverage.safe_zero_activity()
+class ReplayTradeCoverageProvider(TradeCoverageProvider):
+    def __init__(
+        self,
+        symbol_bounds: Mapping[str, tuple[int, int]] | None = None,
+    ) -> None:
+        self._symbol_bounds = dict(symbol_bounds or {})
 
     def coverage(self, symbol: str, start_ms: int, end_ms: int) -> TradeCoverage:
-        return self._cov
+        bounds = self._symbol_bounds.get(symbol)
+        if bounds is None:
+            return TradeCoverage(
+                feed_safe=False,
+                known_gap=False,
+                buffer_overflow=False,
+                unresolved_sequence=False,
+                interval_retained=False,
+            )
+        first_trade_ms, last_proven_trade_ms = bounds
+        if start_ms < first_trade_ms or end_ms > last_proven_trade_ms:
+            return TradeCoverage(
+                feed_safe=False,
+                known_gap=False,
+                buffer_overflow=False,
+                unresolved_sequence=False,
+                interval_retained=False,
+            )
+        return TradeCoverage.safe_zero_activity()
 
 
 @dataclass(frozen=True)
@@ -89,12 +112,10 @@ class ReplayInput:
             if self.sweep is not None:
                 return self.sweep.detection_time_ms
             if self.sweep_callback is not None:
-                return int(
-                    self.sweep_callback.get("detection_time_ms")
-                    or self.sweep_callback.get("timestamp_ms")
-                    or self.sweep_callback.get("event_time_ms")
-                    or 0
-                )
+                det = self.sweep_callback.get("detection_time_ms")
+                if det is None:
+                    raise ValueError("Sweep callback missing mandatory detection_time_ms")
+                return int(det)
         raise ValueError(f"Invalid replay input state: {self}")
 
     @property
@@ -202,8 +223,8 @@ class LiquidityReplayRunner:
 
                     if event_type == "aggTrade":
                         symbol = data.get("s", "").upper()
-                        price = float(data["p"])
-                        size = float(data["q"])
+                        price = Decimal(str(data["p"]))
+                        quantity = Decimal(str(data["q"]))
                         is_buyer_maker = data.get("m", False)
                         side = AggressorSide.SELL if is_buyer_maker else AggressorSide.BUY
                         trade_time = int(data.get("T", data.get("E", 0)))
@@ -211,7 +232,7 @@ class LiquidityReplayRunner:
                         trade = MarketTrade(
                             symbol=symbol,
                             price=price,
-                            quantity=size,
+                            quantity=quantity,
                             aggressor_side=side,
                             exchange_time_ms=trade_time,
                             sequence_id=seq_id,
@@ -241,6 +262,20 @@ class LiquidityReplayRunner:
         # Stable canonical sort
         sorted_inputs = sorted(self.inputs, key=lambda x: x.processing_key)
 
+        # Build symbol trade bounds for coverage provider
+        symbol_bounds: dict[str, tuple[int, int]] = {}
+        for inp in sorted_inputs:
+            if inp.source_type == "TRADE" and inp.trade is not None:
+                sym = inp.trade.symbol
+                t_time = inp.trade.exchange_time_ms
+                if sym not in symbol_bounds:
+                    symbol_bounds[sym] = (t_time, t_time)
+                else:
+                    first_t, last_t = symbol_bounds[sym]
+                    symbol_bounds[sym] = (min(first_t, t_time), max(last_t, t_time))
+
+        coverage_provider = ReplayTradeCoverageProvider(symbol_bounds)
+
         # Fresh isolated SQLite authority per replay run
         temp_dir = tempfile.TemporaryDirectory()
         db_path = Path(temp_dir.name) / "replay_authority.sqlite3"
@@ -266,12 +301,16 @@ class LiquidityReplayRunner:
                 emitted_results.append(r)
                 recorder.enqueue(r)
 
+            def on_rejected(rej: RejectedSweepInput) -> None:
+                recorder.enqueue(rej)
+
             engine = LiquidityEventEngine(
                 policy=self.policy,
                 store=store,
                 authority=authority,
                 on_transition=on_transition,
                 on_result=on_result,
+                on_rejected=on_rejected,
             )
 
             safe_trade_cov = TradeCoverage(
@@ -293,17 +332,7 @@ class LiquidityReplayRunner:
                     if inp.sweep is not None:
                         obs = inp.sweep
                     elif inp.sweep_callback is not None:
-                        det_time = int(
-                            inp.sweep_callback.get("detection_time_ms")
-                            or inp.sweep_callback.get("timestamp_ms")
-                            or 0
-                        )
-                        if det_time == 0 and "timestamp" in inp.sweep_callback:
-                            try:
-                                from .sweep_adapter import parse_utc_ms
-                                det_time = parse_utc_ms(inp.sweep_callback["timestamp"])
-                            except Exception:
-                                det_time = 0
+                        det_time = int(inp.sweep_callback["detection_time_ms"])
                         adapted = adapter.adapt(inp.sweep_callback, det_time)
                         if adapted.observation is not None:
                             obs = adapted.observation
@@ -311,21 +340,22 @@ class LiquidityReplayRunner:
                             recorder.enqueue(adapted.rejected)
 
                     if obs is not None:
-                        engine.on_sweep(obs, ReplayTradeCoverageProvider(TradeCoverage.safe_zero_activity()))
+                        engine.on_sweep(obs, coverage_provider)
 
-            # Terminal Advance (Symbol-Local) via production engine API
+            # Terminal Advance (Symbol-Local) via production engine API using PROVEN trade horizon only
             for symbol in list(engine._runtimes.keys()):
                 runtime = engine.symbol_runtime(symbol)
                 if runtime.active_trackers:
-                    last_time = runtime.max_seen_exchange_time_ms or 0
-                    engine.advance_time(
-                        symbol=symbol,
-                        as_of_exchange_time_ms=last_time,
-                        coverage=safe_trade_cov,
-                        terminal_input=True,
-                    )
+                    proven_horizon = runtime.proven_trade_coverage_time_ms
+                    if proven_horizon is not None:
+                        engine.advance_time(
+                            symbol=symbol,
+                            as_of_exchange_time_ms=proven_horizon,
+                            coverage=TradeCoverage.safe_zero_activity(),
+                            terminal_input=True,
+                        )
 
-            # Flush replay recorder
+            # Single synchronous replay flush
             recorder.flush_replay()
 
             # Certify
@@ -346,6 +376,12 @@ class LiquidityReplayRunner:
             missing_events = len(expected_event_ids - set(recorder._written_event_ids))
             missing_trans = len(expected_transition_keys - set(recorder._written_transition_keys))
 
+            # Mark telemetry stopped after clean flush
+            if recorder.artifact_integrity == ArtifactIntegrity.COMPLETE:
+                recorder.telemetry.status = "STOPPED"
+            else:
+                recorder.telemetry.status = "DEGRADED"
+
             return LiquidityReplayResult(
                 artifact_integrity=integrity,
                 event_count=len(emitted_results),
@@ -361,8 +397,36 @@ class LiquidityReplayRunner:
             )
         finally:
             authority.close()
-            recorder.close()
             try:
                 temp_dir.cleanup()
             except Exception:
                 pass
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Exact Liquidity Event Replay Runner")
+    parser.add_argument("--output-dir", required=True, help="Directory to emit canonical artifacts")
+    parser.add_argument("--market-recordings", nargs="*", default=[], help="Paths to market recordings (.jsonl, .jsonl.gz)")
+    parser.add_argument("--sweeps", nargs="*", default=[], help="Paths to sweeps JSON files")
+    args = parser.parse_args(argv)
+
+    sweep_callbacks: list[dict[str, Any]] = []
+    for s_path in args.sweeps:
+        with open(s_path, "r", encoding="utf-8") as f:
+            cbs = json.load(f)
+            if isinstance(cbs, list):
+                sweep_callbacks.extend(cbs)
+            elif isinstance(cbs, dict):
+                sweep_callbacks.append(cbs)
+
+    runner = LiquidityReplayRunner.from_recordings(
+        market_paths=args.market_recordings,
+        sweep_callbacks=sweep_callbacks,
+        output_dir=args.output_dir,
+    )
+    result = runner.run()
+    return result.exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
