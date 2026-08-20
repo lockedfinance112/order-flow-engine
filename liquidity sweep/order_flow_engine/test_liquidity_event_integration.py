@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,6 +39,39 @@ from liquidity_event.recorder import LiquidityEventRecorder
 from main import LiveTradeCoverageProvider, OrderFlowEngine
 from scoring import OrderFlowScorer
 from trade_stream import TradeStream
+
+@pytest.fixture(autouse=True)
+def auto_cleanup_engines():
+    engines = []
+    orig_init = OrderFlowEngine.__init__
+
+    def tracking_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        engines.append(self)
+
+    OrderFlowEngine.__init__ = tracking_init
+    try:
+        yield
+    finally:
+        OrderFlowEngine.__init__ = orig_init
+        for eng in engines:
+            if hasattr(eng, "liquidity_identity_authority") and eng.liquidity_identity_authority:
+                try:
+                    eng.liquidity_identity_authority.close()
+                except Exception:
+                    pass
+            if hasattr(eng, "regime_feed") and eng.regime_feed and hasattr(eng.regime_feed, "bar_store"):
+                try:
+                    eng.regime_feed.bar_store.close()
+                except Exception:
+                    pass
+            if hasattr(eng, "regime_engine") and eng.regime_engine and hasattr(eng.regime_engine, "bar_store"):
+                try:
+                    eng.regime_engine.bar_store.close()
+                except Exception:
+                    pass
+        import gc
+        gc.collect()
 
 
 def test_frozen_authority_flags():
@@ -148,12 +182,8 @@ def test_trade_feed_creates_canonical_market_trade():
 def test_tradestream_end_to_end_mapping():
     async def _run():
         engine = OrderFlowEngine()
-        received_trades = []
-
-        # Intercept queue to drive directly into queue
         stream = TradeStream(engine._queue_trade)
 
-        # Raw Binance aggTrade payload: buyer is maker (m=True) -> side=SELL
         raw_binance_msg = {
             "e": "aggTrade",
             "E": 123456789,
@@ -225,6 +255,47 @@ def test_trade_guardian_coverage_is_explicit():
     asyncio.run(_run())
 
 
+def test_optional_depth_failure_does_not_invalidate_trade_coverage():
+    async def _run():
+        engine = OrderFlowEngine()
+        # Mark local order book invalid while trade stream is healthy
+        state = engine.metrics.get_state("btcusdt")
+        state.local_book._is_valid = False
+
+        now = time.time()
+        now_ms = int(now * 1000)
+
+        raw_trade = {
+            "p": "100.50",
+            "q": "2.0",
+            "m": False,
+            "T": now_ms,
+            "a": 12345,
+            "timestamp": now,
+            "price": 100.50,
+            "quantity": 2.0,
+            "side": "BUY",
+        }
+        await engine.trade_queue.put(("btcusdt", raw_trade))
+
+        with patch.object(engine.liquidity_engine, "on_trade") as mock_on_trade:
+            task = asyncio.create_task(engine._process_trades_loop())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            assert mock_on_trade.called
+            _, cov = mock_on_trade.call_args[0]
+            assert cov.feed_safe is True
+            assert cov.known_gap is False
+            assert cov.valid is True
+
+    asyncio.run(_run())
+
+
 def test_depth_feed_creates_canonical_depth_observation():
     async def _run():
         engine = OrderFlowEngine()
@@ -254,7 +325,7 @@ def test_depth_feed_creates_canonical_depth_observation():
 
 
 def test_live_coverage_provider_does_not_certify_unproven_history():
-    provider = LiveTradeCoverageProvider(retention_ms=120_000)
+    provider = LiveTradeCoverageProvider(retention_ms=180_000)
     provider.record_trade("BTCUSDT", exchange_time_ms=10_000, feed_safe=True, known_gap=False)
     provider.record_trade("BTCUSDT", exchange_time_ms=20_000, feed_safe=True, known_gap=False)
 
@@ -275,7 +346,7 @@ def test_live_coverage_provider_does_not_certify_unproven_history():
 
 
 def test_live_coverage_provider_preserves_historical_gap():
-    provider = LiveTradeCoverageProvider(retention_ms=120_000)
+    provider = LiveTradeCoverageProvider(retention_ms=180_000)
     provider.record_trade("BTCUSDT", exchange_time_ms=10_000, feed_safe=True, known_gap=False)
     provider.record_trade("BTCUSDT", exchange_time_ms=15_000, feed_safe=False, known_gap=True)
     provider.record_trade("BTCUSDT", exchange_time_ms=20_000, feed_safe=True, known_gap=False)
@@ -287,8 +358,86 @@ def test_live_coverage_provider_preserves_historical_gap():
     assert cov.known_gap is True
 
 
+def test_end_to_end_trade_sequence_discontinuity_cannot_be_certified_safe():
+    async def _run():
+        engine = OrderFlowEngine()
+        trade1 = {
+            "p": "100.0",
+            "q": "1.0",
+            "m": False,
+            "T": 10_000,
+            "a": 100,
+            "side": "BUY",
+            "timestamp": 10.0,
+            "price": 100.0,
+            "quantity": 1.0,
+        }
+        trade2 = {
+            "p": "100.5",
+            "q": "1.0",
+            "m": False,
+            "T": 15_000,
+            "a": 105,  # Missing 101, 102, 103, 104 -> Sequence Gap!
+            "side": "BUY",
+            "timestamp": 15.0,
+            "price": 100.5,
+            "quantity": 1.0,
+        }
+        await engine.trade_queue.put(("btcusdt", trade1))
+        await engine.trade_queue.put(("btcusdt", trade2))
+
+        task = asyncio.create_task(engine._process_trades_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        cov = engine.liquidity_coverage_provider.coverage("BTCUSDT", 10_000, 15_000)
+        assert cov.known_gap is True
+        assert cov.valid is False
+
+    asyncio.run(_run())
+
+
+def test_evicted_live_coverage_interval_fails_closed():
+    policy = LiquidityClassificationPolicy()
+    retention_ms = policy.market_buffer_retention_ms  # 180_000 ms
+    provider = LiveTradeCoverageProvider(retention_ms=retention_ms)
+
+    provider.record_trade("BTCUSDT", exchange_time_ms=10_000, feed_safe=True, sequence_id=1)
+    provider.record_trade("BTCUSDT", exchange_time_ms=20_000, feed_safe=True, sequence_id=2)
+
+    # Evict early interval by advancing beyond retention_ms
+    later_time_ms = 20_000 + retention_ms + 10_000  # 210_000 ms
+    provider.record_trade("BTCUSDT", exchange_time_ms=later_time_ms, feed_safe=True, sequence_id=3)
+
+    # Query early evicted interval [10_000, 20_000]
+    cov_evicted = provider.coverage("BTCUSDT", 10_000, 20_000)
+    assert cov_evicted.interval_retained is False
+    assert cov_evicted.feed_safe is False
+    assert cov_evicted.valid is False
+
+
+def test_partially_covered_interval_fails_closed():
+    provider = LiveTradeCoverageProvider(retention_ms=180_000)
+    provider.record_trade("BTCUSDT", exchange_time_ms=100_000, feed_safe=True, sequence_id=1)
+    provider.record_trade("BTCUSDT", exchange_time_ms=120_000, feed_safe=True, sequence_id=2)
+
+    # Requested interval starts before retained coverage
+    cov_underflow = provider.coverage("BTCUSDT", 90_000, 110_000)
+    assert cov_underflow.interval_retained is False
+    assert cov_underflow.valid is False
+
+    # Requested interval ends after retained coverage
+    cov_overflow = provider.coverage("BTCUSDT", 110_000, 130_000)
+    assert cov_overflow.interval_retained is False
+    assert cov_overflow.valid is False
+
+
 def test_late_sweep_cannot_reconstruct_across_unproven_interval():
-    provider = LiveTradeCoverageProvider(retention_ms=120_000)
+    provider = LiveTradeCoverageProvider(retention_ms=180_000)
     provider.record_trade("BTCUSDT", exchange_time_ms=20_000, feed_safe=True, known_gap=False)
 
     # Sweep from timestamp 5000 before recorded trade horizon
@@ -570,10 +719,101 @@ def test_real_recorder_failure_isolation():
     assert base_res == fail_res
 
 
+def test_recorder_failure_classification_exact_isolation():
+    async def _run():
+        with tempfile.TemporaryDirectory() as dir_b, tempfile.TemporaryDirectory() as dir_f:
+            with patch("config.LIQUIDITY_EVENT_OUTPUT_DIR", dir_b):
+                engine_baseline = OrderFlowEngine()
+            with patch("config.LIQUIDITY_EVENT_OUTPUT_DIR", dir_f):
+                engine_failure = OrderFlowEngine()
+
+            # Force failure on engine_failure recorder
+            if engine_failure.liquidity_recorder:
+                engine_failure.liquidity_recorder.telemetry.status = "DEGRADED"
+                engine_failure.liquidity_recorder.enqueue = MagicMock(side_effect=RuntimeError("I/O write failure"))
+
+            sweep = {
+                "sweep_id": "swp-isolation-1",
+                "symbol": "BTCUSDT",
+                "type": "BULLISH",
+                "sweep_level": 100.0,
+                "timestamp": "1970-01-01T00:00:00Z",
+                "source_file_id": "SWEEPS_MONITOR_CSV",
+                "source_row_hash": "a" * 64,
+                "detection_time_ms": 0,
+            }
+            with patch("time.time", return_value=0.0):
+                initial_trade = {"p": "99.98", "q": "1.0", "m": True, "T": 0, "a": 1, "side": "SELL", "timestamp": 0.0, "price": 99.98, "quantity": 1.0}
+                await engine_baseline.trade_queue.put(("btcusdt", initial_trade))
+                await engine_failure.trade_queue.put(("btcusdt", initial_trade))
+
+                task_b0 = asyncio.create_task(engine_baseline._process_trades_loop())
+                task_f0 = asyncio.create_task(engine_failure._process_trades_loop())
+                await asyncio.sleep(0.05)
+                task_b0.cancel()
+                task_f0.cancel()
+                try:
+                    await task_b0
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    await task_f0
+                except asyncio.CancelledError:
+                    pass
+
+                await engine_baseline._handle_sweep(sweep)
+                await engine_failure._handle_sweep(sweep)
+
+                # Drive subsequent trades to resolve both events identically
+                trades = [
+                    {"p": "100.02", "q": "2.0", "m": False, "T": 1_000, "a": 2, "side": "BUY", "timestamp": 1.0, "price": 100.02, "quantity": 2.0},  # Reclaim
+                    {"p": "100.02", "q": "2.0", "m": False, "T": 2_000, "a": 3, "side": "BUY", "timestamp": 2.0, "price": 100.02, "quantity": 2.0},
+                    {"p": "100.02", "q": "2.0", "m": False, "T": 4_000, "a": 4, "side": "BUY", "timestamp": 4.0, "price": 100.02, "quantity": 2.0},  # Hold qualified
+                    {"p": "100.02", "q": "2.0", "m": False, "T": 6_000, "a": 5, "side": "BUY", "timestamp": 6.0, "price": 100.02, "quantity": 2.0},  # Watermark settlement
+                ]
+                for t in trades:
+                    await engine_baseline.trade_queue.put(("btcusdt", t))
+                    await engine_failure.trade_queue.put(("btcusdt", t))
+
+                task_b = asyncio.create_task(engine_baseline._process_trades_loop())
+                task_f = asyncio.create_task(engine_failure._process_trades_loop())
+                await asyncio.sleep(0.05)
+                task_b.cancel()
+                task_f.cancel()
+                try:
+                    await task_b
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    await task_f
+                except asyncio.CancelledError:
+                    pass
+
+            assert len(engine_baseline.recent_liquidity_results) == 1
+            assert len(engine_failure.recent_liquidity_results) == 1
+
+            res_b = engine_baseline.recent_liquidity_results[0]
+            res_f = engine_failure.recent_liquidity_results[0]
+
+            assert res_b["classification"] == res_f["classification"]
+            assert res_b["reason_code"] == res_f["reason_code"]
+            assert res_b["market_resolution_time_ms"] == res_f["market_resolution_time_ms"]
+            assert res_b["classification_time_ms"] == res_f["classification_time_ms"]
+            assert res_b["confidence"] == res_f["confidence"]
+            assert res_b["confidence_type"] == res_f["confidence_type"]
+            assert res_b["reasons"] == res_f["reasons"]
+            assert res_b["contradictions"] == res_f["contradictions"]
+            assert res_b["context_coverage"] == res_f["context_coverage"]
+
+            engine_baseline.liquidity_identity_authority.close()
+            engine_failure.liquidity_identity_authority.close()
+
+    asyncio.run(_run())
+
+
 def test_adapter_and_engine_rejections_update_telemetry_without_double_counting():
     async def _run():
         engine = OrderFlowEngine()
-        # Feed invalid sweep (e.g. invalid side / missing required parameters)
         invalid_sweep = {
             "sweep_id": "bad-swp-1",
             "symbol": "BTCUSDT",
@@ -598,19 +838,64 @@ def test_partial_init_recorder_failure_leaves_engine_operational():
         assert engine.metrics is not None
         assert engine.scorer is not None
         assert engine.paper_trader is not None
-        # Operations remain safe
         payload = engine._build_liquidity_events_payload()
         assert payload["engine"]["enabled"] is False
+
+
+def test_partial_init_authority_cleanup_on_later_failure():
+    closed_authorities = []
+    orig_close = SQLiteIdentityAuthority.close
+
+    def spy_close(self):
+        closed_authorities.append(self)
+        orig_close(self)
+
+    with patch("liquidity_event.recorder.LiquidityEventRecorder.__init__", side_effect=RuntimeError("Recorder fail")), \
+         patch.object(SQLiteIdentityAuthority, "close", spy_close):
+        engine = OrderFlowEngine()
+        assert len(closed_authorities) >= 1
+        assert engine.liquidity_engine is None
+        assert engine.liquidity_identity_authority is None
+
+
+def test_partial_init_recorder_and_authority_cleanup_on_engine_failure():
+    flushed_recorders = []
+    closed_authorities = []
+    orig_flush = LiquidityEventRecorder.flush
+    orig_close = SQLiteIdentityAuthority.close
+
+    def spy_flush(self):
+        flushed_recorders.append(self)
+        orig_flush(self)
+
+    def spy_close(self):
+        closed_authorities.append(self)
+        orig_close(self)
+
+    with patch("liquidity_event.LiquidityEventEngine.__init__", side_effect=RuntimeError("Engine fail")), \
+         patch.object(LiquidityEventRecorder, "flush", spy_flush), \
+         patch.object(SQLiteIdentityAuthority, "close", spy_close):
+        engine = OrderFlowEngine()
+        assert len(flushed_recorders) >= 1
+        assert len(closed_authorities) >= 1
+        assert engine.liquidity_engine is None
 
 
 def test_shutdown_flushes_recorder_and_closes_identity_authority():
     async def _run():
         engine = OrderFlowEngine()
-        with patch.object(engine.liquidity_recorder, "flush") as mock_flush, \
-             patch.object(engine.liquidity_identity_authority, "close") as mock_auth_close:
-            await engine._shutdown_liquidity_event_engine()
-            assert mock_flush.called
-            assert mock_auth_close.called
+        if hasattr(engine, "regime_feed") and engine.regime_feed and hasattr(engine.regime_feed, "bar_store"):
+            engine.regime_feed.bar_store.close()
+        if hasattr(engine, "regime_engine") and engine.regime_engine and hasattr(engine.regime_engine, "bar_store"):
+            engine.regime_engine.bar_store.close()
+        recorder_flush_spy = MagicMock(wraps=engine.liquidity_recorder.flush)
+        engine.liquidity_recorder.flush = recorder_flush_spy
+        auth_close_spy = MagicMock(wraps=engine.liquidity_identity_authority.close)
+        engine.liquidity_identity_authority.close = auth_close_spy
+
+        await engine._shutdown_liquidity_event_engine()
+        assert recorder_flush_spy.called
+        assert auth_close_spy.called
 
     asyncio.run(_run())
 
@@ -618,6 +903,10 @@ def test_shutdown_flushes_recorder_and_closes_identity_authority():
 def test_degraded_shutdown_remains_safe():
     async def _run():
         engine = OrderFlowEngine()
+        if hasattr(engine, "regime_feed") and engine.regime_feed and hasattr(engine.regime_feed, "bar_store"):
+            engine.regime_feed.bar_store.close()
+        if hasattr(engine, "regime_engine") and engine.regime_engine and hasattr(engine.regime_engine, "bar_store"):
+            engine.regime_engine.bar_store.close()
         if engine.liquidity_recorder:
             engine.liquidity_recorder.telemetry.status = "DEGRADED"
 

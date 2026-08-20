@@ -34,13 +34,16 @@ import collections
 
 # Configure file logging to avoid messing up the rich console output
 log_file = os.path.join(os.path.dirname(__file__), "order_flow.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(log_file, mode="a", encoding="utf-8")
-    ]
-)
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        ]
+    )
+
 logger = logging.getLogger("OrderFlow.Main")
 
 @dataclass(frozen=True)
@@ -49,63 +52,132 @@ class _LiveCoverageSegment:
     end_ms: int
     feed_safe: bool
     known_gap: bool
+    unresolved_sequence: bool
 
 class LiveTradeCoverageProvider:
     """Live interval-aware trade coverage provider maintaining historical segments per symbol."""
     def __init__(self, retention_ms: int = 180_000):
         self._retention_ms = retention_ms
         self._segments: Dict[str, List[_LiveCoverageSegment]] = collections.defaultdict(list)
-        self._bounds: Dict[str, Tuple[int, int]] = {}
+        self._last_seq_id: Dict[str, int] = {}
+        self._last_trade_time_ms: Dict[str, int] = {}
 
-    def record_trade(self, symbol: str, exchange_time_ms: int, feed_safe: bool, known_gap: bool) -> None:
+    def record_trade(
+        self,
+        symbol: str,
+        exchange_time_ms: int,
+        feed_safe: bool,
+        known_gap: bool = False,
+        unresolved_sequence: bool = False,
+        sequence_id: Optional[int] = None,
+    ) -> None:
         sym = symbol.upper()
         segs = self._segments[sym]
-        prev_max = self._bounds.get(sym, (exchange_time_ms, exchange_time_ms))[1]
-        start_ms = min(exchange_time_ms, prev_max)
-        end_ms = max(exchange_time_ms, prev_max)
+        prev_seq = self._last_seq_id.get(sym)
+        prev_time = self._last_trade_time_ms.get(sym, exchange_time_ms)
+
+        has_gap = known_gap
+        has_unresolved = unresolved_sequence
+
+        if sequence_id is not None and prev_seq is not None:
+            if sequence_id > prev_seq + 1:
+                has_gap = True
+            elif sequence_id < prev_seq:
+                has_unresolved = True
+
+        if sequence_id is not None:
+            self._last_seq_id[sym] = sequence_id
+        self._last_trade_time_ms[sym] = exchange_time_ms
+
+        start_ms = min(exchange_time_ms, prev_time)
+        end_ms = max(exchange_time_ms, prev_time)
 
         segs.append(_LiveCoverageSegment(
             start_ms=start_ms,
             end_ms=end_ms,
             feed_safe=feed_safe,
-            known_gap=known_gap,
+            known_gap=has_gap,
+            unresolved_sequence=has_unresolved,
         ))
 
-        if sym in self._bounds:
-            min_ms, max_ms = self._bounds[sym]
-            self._bounds[sym] = (min(min_ms, exchange_time_ms), max(max_ms, exchange_time_ms))
-        else:
-            self._bounds[sym] = (exchange_time_ms, exchange_time_ms)
-
-        cutoff = max(0, self._bounds[sym][1] - self._retention_ms)
+        # Advance bounds with the retained coverage by pruning old segments
+        max_seen = max(s.end_ms for s in segs)
+        cutoff = max(0, max_seen - self._retention_ms)
         self._segments[sym] = [s for s in segs if s.end_ms >= cutoff]
 
     def coverage(self, symbol: str, start_ms: int, end_ms: int):
         from liquidity_event import TradeCoverage
         sym = symbol.upper()
-        if sym not in self._bounds:
-            return TradeCoverage(feed_safe=False, known_gap=False, buffer_overflow=False, unresolved_sequence=False, interval_retained=False)
+        segs = self._segments.get(sym, [])
+        if not segs:
+            return TradeCoverage(
+                feed_safe=False,
+                known_gap=False,
+                buffer_overflow=False,
+                unresolved_sequence=False,
+                interval_retained=False,
+            )
 
-        min_ms, max_ms = self._bounds[sym]
-        if start_ms < min_ms or end_ms > max_ms:
-            return TradeCoverage(feed_safe=False, known_gap=False, buffer_overflow=False, unresolved_sequence=False, interval_retained=False)
+        retained_min = min(s.start_ms for s in segs)
+        retained_max = max(s.end_ms for s in segs)
 
-        segs = self._segments[sym]
+        if start_ms < retained_min or end_ms > retained_max:
+            return TradeCoverage(
+                feed_safe=False,
+                known_gap=False,
+                buffer_overflow=False,
+                unresolved_sequence=False,
+                interval_retained=False,
+            )
+
+        overlapping = [s for s in segs if max(s.start_ms, start_ms) <= min(s.end_ms, end_ms)]
+        if not overlapping:
+            return TradeCoverage(
+                feed_safe=False,
+                known_gap=False,
+                buffer_overflow=False,
+                unresolved_sequence=False,
+                interval_retained=False,
+            )
+
+        overlapping.sort(key=lambda s: (s.start_ms, s.end_ms))
+
+        current_covered = start_ms
         feed_safe = True
         known_gap = False
+        unresolved_sequence = False
 
-        for s in segs:
-            if max(s.start_ms, start_ms) <= min(s.end_ms, end_ms):
-                if not s.feed_safe:
-                    feed_safe = False
-                if s.known_gap:
-                    known_gap = True
+        for s in overlapping:
+            if s.start_ms > current_covered:
+                return TradeCoverage(
+                    feed_safe=False,
+                    known_gap=True,
+                    buffer_overflow=False,
+                    unresolved_sequence=False,
+                    interval_retained=False,
+                )
+            current_covered = max(current_covered, s.end_ms)
+            if not s.feed_safe:
+                feed_safe = False
+            if s.known_gap:
+                known_gap = True
+            if s.unresolved_sequence:
+                unresolved_sequence = True
+
+        if current_covered < end_ms:
+            return TradeCoverage(
+                feed_safe=False,
+                known_gap=False,
+                buffer_overflow=False,
+                unresolved_sequence=False,
+                interval_retained=False,
+            )
 
         return TradeCoverage(
-            feed_safe=feed_safe,
+            feed_safe=feed_safe and not known_gap and not unresolved_sequence,
             known_gap=known_gap,
             buffer_overflow=False,
-            unresolved_sequence=False,
+            unresolved_sequence=unresolved_sequence,
             interval_retained=True,
         )
 
@@ -196,11 +268,17 @@ class OrderFlowEngine:
 
                 def on_transition(t: LifecycleTransition) -> None:
                     if self.liquidity_recorder:
-                        self.liquidity_recorder.enqueue(t)
+                        try:
+                            self.liquidity_recorder.enqueue(t)
+                        except Exception as e:
+                            logger.error(f"Recorder transition enqueue failed: {e}")
 
                 def on_result(r: LiquidityEventResult) -> None:
                     if self.liquidity_recorder:
-                        self.liquidity_recorder.enqueue(r)
+                        try:
+                            self.liquidity_recorder.enqueue(r)
+                        except Exception as e:
+                            logger.error(f"Recorder result enqueue failed: {e}")
                     res_dict = {
                         "event_id": r.event_id,
                         "symbol": r.symbol,
@@ -225,7 +303,10 @@ class OrderFlowEngine:
                 def on_rejected(rej: RejectedSweepInput) -> None:
                     self.rejected_input_count += 1
                     if self.liquidity_recorder:
-                        self.liquidity_recorder.enqueue(rej)
+                        try:
+                            self.liquidity_recorder.enqueue(rej)
+                        except Exception as e:
+                            logger.error(f"Recorder rejection enqueue failed: {e}")
 
                 self.liquidity_engine = LiquidityEventEngine(
                     policy=self.liquidity_policy,
@@ -238,6 +319,16 @@ class OrderFlowEngine:
                 )
             except Exception as e:
                 logger.error(f"Failed to initialize LiquidityEventEngine: {e}", exc_info=True)
+                if self.liquidity_recorder is not None:
+                    try:
+                        self.liquidity_recorder.flush()
+                    except Exception:
+                        pass
+                if self.liquidity_identity_authority is not None:
+                    try:
+                        self.liquidity_identity_authority.close()
+                    except Exception:
+                        pass
                 self.liquidity_engine = None
                 self.liquidity_recorder = None
                 self.liquidity_identity_authority = None
@@ -1012,6 +1103,9 @@ class OrderFlowEngine:
                 self.liquidity_identity_authority.close()
         except Exception as e:
             logger.error(f"Error closing liquidity identity authority on shutdown: {e}", exc_info=True)
+        self.liquidity_recorder = None
+        self.liquidity_identity_authority = None
+        self.liquidity_engine = None
 
     async def run(self):
         logger.info(f"Starting Order Flow Engine V2.5 (Radar Universe: {len(SYMBOLS)} symbols)...")
@@ -1144,8 +1238,8 @@ class OrderFlowEngine:
 
                         safety_obj = self.metrics.get_market_data_safety(symbol, time.time())
                         t_status = safety_obj.get("trade_status", "HEALTHY")
-                        feed_safe = safety_obj.get("safe", True) and t_status == "HEALTHY"
-                        known_gap = (t_status == "UNSAFE")
+                        feed_safe = (t_status == "HEALTHY")
+                        known_gap = False
 
                         if self.liquidity_coverage_provider:
                             self.liquidity_coverage_provider.record_trade(
@@ -1153,15 +1247,22 @@ class OrderFlowEngine:
                                 exchange_time_ms=trade_time_ms,
                                 feed_safe=feed_safe,
                                 known_gap=known_gap,
+                                sequence_id=seq_id,
+                            )
+                            trade_cov = self.liquidity_coverage_provider.coverage(
+                                symbol.upper(),
+                                trade_time_ms,
+                                trade_time_ms,
+                            )
+                        else:
+                            trade_cov = TradeCoverage(
+                                feed_safe=feed_safe,
+                                known_gap=known_gap,
+                                buffer_overflow=False,
+                                unresolved_sequence=False,
+                                interval_retained=True,
                             )
 
-                        trade_cov = TradeCoverage(
-                            feed_safe=feed_safe,
-                            known_gap=known_gap,
-                            buffer_overflow=False,
-                            unresolved_sequence=False,
-                            interval_retained=True,
-                        )
                         self.liquidity_engine.on_trade(m_trade, trade_cov)
                     except Exception as e:
                         logger.error(f"Error forwarding trade to liquidity engine: {e}", exc_info=True)
