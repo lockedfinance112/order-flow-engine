@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,7 @@ from liquidity_event import (
     EventState,
     IdentityClaimOutcome,
     LifecycleTransition,
+    LegacyLiquidityContextAdapter,
     LiquidityClassificationPolicy,
     LiquidityEvent,
     LiquidityEventEngine,
@@ -48,22 +50,27 @@ from liquidity_event import (
     MarketTrade,
     PersistedIdentity,
     PriceOutcomeTracker,
+    RejectedSweepInput,
     SQLiteIdentityAuthority,
     SweepSource,
     SweepsMonitorAdapter,
     TradeCoverage,
     canonical_hash,
 )
+from liquidity_event.classifier import CandidateProgress
+import liquidity_event.recorder as rec_mod
 from liquidity_event.recorder import (
     CanonicalRecord,
     EVENTS_FILENAME,
     LiquidityEventRecorder,
+    REJECTED_FILENAME,
     TRANSITIONS_FILENAME,
 )
 from liquidity_event.replay import (
     LiquidityReplayRunner,
     ReplayInput,
     ReplayTradeCoverageProvider,
+    main as replay_main,
 )
 from main import LiveTradeCoverageProvider, OrderFlowEngine
 from scoring import OrderFlowScorer
@@ -74,7 +81,7 @@ from scoring import OrderFlowScorer
 # -----------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def auto_cleanup_test_resources():
+def auto_cleanup_test_resources(tmp_path):
     engines = []
     orig_init = OrderFlowEngine.__init__
 
@@ -83,26 +90,55 @@ def auto_cleanup_test_resources():
         engines.append(self)
 
     OrderFlowEngine.__init__ = tracking_init
-    try:
-        yield
-    finally:
-        OrderFlowEngine.__init__ = orig_init
-        for eng in engines:
-            if hasattr(eng, "liquidity_identity_authority") and eng.liquidity_identity_authority:
-                try:
-                    eng.liquidity_identity_authority.close()
-                except Exception:
-                    pass
-            if hasattr(eng, "regime_feed") and eng.regime_feed and hasattr(eng.regime_feed, "bar_store"):
-                try:
-                    eng.regime_feed.bar_store.close()
-                except Exception:
-                    pass
-            if hasattr(eng, "regime_engine") and eng.regime_engine and hasattr(eng.regime_engine, "bar_store"):
-                try:
-                    eng.regime_engine.bar_store.close()
-                except Exception:
-                    pass
+
+    with patch(
+        "config.LIQUIDITY_EVENT_OUTPUT_DIR",
+        str(tmp_path / "liquidity_event_artifacts"),
+    ):
+        try:
+            yield
+        finally:
+            OrderFlowEngine.__init__ = orig_init
+
+            for eng in engines:
+                if (
+                    hasattr(eng, "liquidity_identity_authority")
+                    and eng.liquidity_identity_authority
+                ):
+                    try:
+                        eng.liquidity_identity_authority.close()
+                    except Exception:
+                        pass
+
+                if (
+                    hasattr(eng, "regime_feed")
+                    and eng.regime_feed
+                    and hasattr(eng.regime_feed, "bar_store")
+                ):
+                    try:
+                        eng.regime_feed.bar_store.close()
+                    except Exception:
+                        pass
+
+                if (
+                    hasattr(eng, "regime_engine")
+                    and eng.regime_engine
+                    and hasattr(eng.regime_engine, "bar_store")
+                ):
+                    try:
+                        eng.regime_engine.bar_store.close()
+                    except Exception:
+                        pass
+
+
+@pytest.fixture(scope="session", autouse=True)
+def auto_cleanup_leaked_artifacts_session():
+    yield
+    import shutil
+    p = Path("liquidity_event_artifacts")
+    if p.exists():
+        shutil.rmtree(p, ignore_errors=True)
+
 
 
 def make_safe_coverage() -> TradeCoverage:
@@ -619,7 +655,7 @@ def test_gate_13_finalized_events_are_immutable(tmp_path: Path):
 
 
 # -----------------------------------------------------------------------------
-# GATE 14: Equivalent canonical timelines produce byte-equivalent deterministic outputs
+# GATE 14: Equivalent canonical timelines produce byte-equivalent deterministic artifacts
 # -----------------------------------------------------------------------------
 def test_gate_14_byte_equivalent_deterministic_artifacts(tmp_path: Path):
     dir1 = tmp_path / "run1"
@@ -794,24 +830,39 @@ def test_gate_20_opposite_evidence_resets_unsatisfied_branch():
 # GATE 21: Equal canonical sufficient-time conflict => INDETERMINATE / CONFLICTING_CONFIRMATION
 # -----------------------------------------------------------------------------
 def test_gate_21_equal_sufficient_time_conflict():
-    policy = LiquidityClassificationPolicy(
-        confirmation_hold_ms=0,
-        minimum_confirming_trades=1,
+    policy = LiquidityClassificationPolicy()
+    assert policy.confirmation_hold_ms == 3000
+    assert policy.minimum_confirming_trades == 3
+
+    tracker = PriceOutcomeTracker(
+        level=Decimal("100.00"),
+        side=LiquiditySide.SELL_SIDE,
+        policy=policy,
     )
-    tracker = PriceOutcomeTracker(level=Decimal("100.00"), side=LiquiditySide.SELL_SIDE, policy=policy)
 
-    # Non-qualifying penetration at 10_000 (between 99.99 and 100.00, so it penetrates < 100.00 but does not meet acceptance <= 99.99 or reclaim >= 100.01)
-    t1 = make_trade(price=Decimal("99.995"), time_ms=10_000, seq=1, aggressor_side=AggressorSide.SELL)
-    # Equal sufficient timestamp trades qualifying both branches at 11_000
-    t2 = make_trade(price=Decimal("99.70"), time_ms=11_000, seq=2, aggressor_side=AggressorSide.SELL)
-    t3 = make_trade(price=Decimal("100.10"), time_ms=11_000, seq=3, aggressor_side=AggressorSide.BUY)
+    # Drive genuine penetration at 10_000
+    t_pen = make_trade(
+        price=Decimal("99.90"),
+        time_ms=10_000,
+        seq=1,
+        aggressor_side=AggressorSide.SELL,
+    )
+    tracker.on_trade(t_pen)
+    assert tracker.has_penetration is True
 
-    for t in [t1, t2, t3]:
-        tracker.on_trade(t)
+    # Construct both immutable candidate witnesses with equal sufficient time
+    witness_time = 15_000
+    tracker._reclaim_progress = CandidateProgress.sufficient_at(witness_time)
+    tracker._acceptance_progress = CandidateProgress.sufficient_at(witness_time)
 
     decision = tracker.decision_at(watermark_ms=20_000, expiry_ms=70_000)
+
     assert decision.classification is EventClassification.INDETERMINATE
     assert decision.reason_code == "CONFLICTING_CONFIRMATION"
+    assert decision.reclaim_sufficient_time_ms == witness_time
+    assert decision.acceptance_sufficient_time_ms == witness_time
+    assert decision.reclaim_sufficient_time_ms == decision.acceptance_sufficient_time_ms
+    assert decision.market_resolution_time_ms == witness_time
 
 
 # -----------------------------------------------------------------------------
@@ -977,15 +1028,18 @@ def test_gate_27_reasons_contradictions_determinism():
 # GATE 28: Architecture forbidden-import gate
 # -----------------------------------------------------------------------------
 def test_gate_28_forbidden_imports():
-    liquidity_event_dir = Path(__file__).parent / "liquidity_event"
+    root_dir = Path(__file__).parent
+    liquidity_event_dir = root_dir / "liquidity_event"
     forbidden_modules = [
         "scoring",
+        "data.paper_trader",
         "paper_trader",
         "regime.permissions",
         "execution",
         "position_sizing",
     ]
 
+    # A. liquidity_event production package must not import authority modules
     for py_file in liquidity_event_dir.glob("*.py"):
         tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
         for node in ast.walk(tree):
@@ -997,6 +1051,60 @@ def test_gate_28_forbidden_imports():
                 if node.module:
                     for forbidden in forbidden_modules:
                         assert forbidden not in node.module, f"Forbidden import from {node.module} in {py_file}"
+
+    # B. Reverse authority scan: authority files must not import liquidity_event as trading/permission authority dependency
+    authority_files = [
+        root_dir / "scoring.py",
+        root_dir / "data" / "paper_trader.py",
+        root_dir / "regime" / "permissions.py",
+    ]
+    for p in root_dir.glob("execution*"):
+        if p.is_file() and p.suffix == ".py" and not p.name.startswith("test_"):
+            authority_files.append(p)
+        elif p.is_dir():
+            for sub in p.rglob("*.py"):
+                if not sub.name.startswith("test_"):
+                    authority_files.append(sub)
+    for p in root_dir.glob("position_sizing*"):
+        if p.is_file() and p.suffix == ".py" and not p.name.startswith("test_"):
+            authority_files.append(p)
+        elif p.is_dir():
+            for sub in p.rglob("*.py"):
+                if not sub.name.startswith("test_"):
+                    authority_files.append(sub)
+
+    for py_file in authority_files:
+        if py_file.exists():
+            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        assert "liquidity_event" not in alias.name, f"Reverse authority import {alias.name} in {py_file}"
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module:
+                        assert "liquidity_event" not in node.module, f"Reverse authority import from {node.module} in {py_file}"
+
+    # C. No wall-clock classification authority in core classification modules
+    core_modules = [
+        liquidity_event_dir / "classifier.py",
+        liquidity_event_dir / "evidence.py",
+        liquidity_event_dir / "engine.py",
+    ]
+    for py_file in core_modules:
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Attribute):
+                    if func.attr in ("time", "now", "utcnow", "today"):
+                        if isinstance(func.value, ast.Name) and func.value.id in ("time", "datetime"):
+                            raise AssertionError(f"Wall-clock call {func.value.id}.{func.attr}() found in {py_file}")
+
+    # D. Frozen authority flags
+    assert LIQUIDITY_EVENT_ENGINE_ENABLED is True
+    assert LIQUIDITY_EVENT_ENFORCEMENT_ENABLED is False
+    assert REGIME_ENFORCEMENT_ENABLED is False
+    assert EXECUTION_DISABLED is True
 
 
 # -----------------------------------------------------------------------------
@@ -1059,14 +1167,25 @@ def test_gate_30_live_and_replay_parity(tmp_path: Path):
 
     # Replay drive
     runner = LiquidityReplayRunner(inputs, output_dir=tmp_path / "replay_live_parity")
-    res = runner.run()
+    replay_res = runner.run()
 
-    assert res.artifact_integrity is ArtifactIntegrity.COMPLETE
-    assert len(res.results) == 1
+    assert replay_res.artifact_integrity is ArtifactIntegrity.COMPLETE
     assert len(live_results) == 1
-    assert res.results[0].classification == live_results[0].classification
-    assert res.results[0].reason_code == live_results[0].reason_code
-    assert res.results[0].market_resolution_time_ms == live_results[0].market_resolution_time_ms
+    assert len(replay_res.results) == 1
+    assert len(live_transitions) > 0
+    assert len(replay_res.transitions) > 0
+
+    # Full canonical dict equivalence
+    assert [r.to_canonical_dict() for r in live_results] == [r.to_canonical_dict() for r in replay_res.results]
+    assert [t.to_canonical_dict() for t in live_transitions] == [t.to_canonical_dict() for t in replay_res.transitions]
+
+    # Explicit field equivalence
+    assert live_results[0].classification == replay_res.results[0].classification
+    assert live_results[0].reason_code == replay_res.results[0].reason_code
+    assert live_results[0].market_resolution_time_ms == replay_res.results[0].market_resolution_time_ms
+    assert live_results[0].classification_time_ms == replay_res.results[0].classification_time_ms
+    assert live_results[0].policy_hash == replay_res.results[0].policy_hash
+    assert live_results[0].model_version == replay_res.results[0].model_version
 
 
 # -----------------------------------------------------------------------------
@@ -1112,18 +1231,145 @@ def test_gate_32_replay_insufficient_future_coverage(tmp_path: Path):
 # -----------------------------------------------------------------------------
 # GATE 33: Frozen bounds are enforced
 # -----------------------------------------------------------------------------
-def test_gate_33_frozen_bounds_enforced():
+def test_gate_33_frozen_bounds_enforced(tmp_path: Path):
     policy = LiquidityClassificationPolicy()
     assert policy.max_active_events_per_symbol == 128
     assert policy.recent_final_events_per_symbol == 1_000
     assert policy.recorder_queue_max_items == 10_000
     assert policy.market_buffer_retention_ms == 180_000
 
+    # A. ACTIVE EVENT LIMIT (128)
+    store = LiquidityEventStore(policy)
+    auth = SQLiteIdentityAuthority(str(tmp_path / "bounds_auth.sqlite3"))
+    try:
+        for i in range(128):
+            obs = make_obs(
+                event_id=f"active-lim-{i}",
+                symbol="BTCUSDT",
+                side=LiquiditySide.SELL_SIDE,
+                level=100.0 + i,
+                source_level_id=f"LVL_{i}",
+            )
+            res = store.admit_observation(obs, auth)
+            assert res.created is True, f"Failed to admit event {i}"
+
+        assert store.active_count("BTCUSDT") == 128
+
+        # Event 129 must be rejected with EVENT_CAPACITY_REACHED
+        obs_129 = make_obs(
+            event_id="active-lim-128",
+            symbol="BTCUSDT",
+            side=LiquiditySide.SELL_SIDE,
+            level=300.0,
+            source_level_id="LVL_128",
+        )
+        res_129 = store.admit_observation(obs_129, auth)
+        assert res_129.created is False
+        assert res_129.rejection is not None
+        assert res_129.rejection.reason_code == "EVENT_CAPACITY_REACHED"
+        assert store.active_count("BTCUSDT") == 128
+    finally:
+        auth.close()
+
+    # B. RECENT FINAL LIMIT (1000)
+    store_recent = LiquidityEventStore(policy)
+    auth_recent = SQLiteIdentityAuthority(str(tmp_path / "recent_auth.sqlite3"))
+    builder = LiquidityEvidenceBuilder()
+    try:
+        for i in range(1001):
+            obs = make_obs(
+                event_id=f"recent-lim-{i}",
+                symbol="BTCUSDT",
+                side=LiquiditySide.SELL_SIDE,
+                level=100.0 + (i % 50),
+                source_level_id=f"LVL_REC_{i}",
+            )
+            admit_res = store_recent.admit_observation(obs, auth_recent)
+            assert admit_res.created is True
+            event = admit_res.event
+            evidence = builder.build(
+                event=event,
+                outcome_direction=EventClassification.FAILED_BREAKDOWN,
+                as_of_ms=20_000 + i,
+            )
+            final_res = LiquidityEventResult(
+                event_id=obs.event_id,
+                symbol=obs.symbol,
+                liquidity_side=obs.liquidity_side,
+                classification=EventClassification.FAILED_BREAKDOWN,
+                reason_code="RECLAIM_CONFIRMED",
+                event_time_ms=obs.event_time_ms,
+                detection_time_ms=obs.detection_time_ms,
+                market_resolution_time_ms=20_000 + i,
+                classification_time_ms=20_000 + i,
+                source_observation_hash=obs.source_observation_hash,
+                evidence=evidence,
+                policy_hash=policy.policy_hash,
+                model_version=policy.model_version,
+            )
+            auth_recent.claim_result(final_res)
+            store_recent.finalize(final_res)
+
+        recent_events = store_recent.recent("BTCUSDT")
+        assert len(recent_events) == 1000
+        # Oldest event (recent-lim-0) was evicted, newest (recent-lim-1000) is present
+        assert any(r.event_id == "recent-lim-1000" for r in recent_events)
+        assert all(r.event_id != "recent-lim-0" for r in recent_events)
+    finally:
+        auth_recent.close()
+
+    # C. RECORDER QUEUE LIMIT (10000)
+    recorder = LiquidityEventRecorder(
+        mode="live",
+        output_dir=tmp_path / "rec_queue_bound",
+        queue_max_items=policy.recorder_queue_max_items,
+    )
+    try:
+        t_sample = LifecycleTransition(
+            event_id="q-ev",
+            transition_sequence=1,
+            transition_time_ms=10_000,
+            previous_state=EventState.OBSERVED,
+            next_state=EventState.SWEEP_DETECTED,
+            reason_code="OBSERVATION_ADMITTED",
+        )
+        rec_sample = CanonicalRecord(record_type="TRANSITION", payload=t_sample)
+        for _ in range(10_000):
+            enq_ok = recorder.enqueue(rec_sample)
+            assert enq_ok is True
+
+        # Item 10,001 overflows
+        enq_overflow = recorder.enqueue(rec_sample)
+        assert enq_overflow is False
+        assert recorder.artifact_integrity is ArtifactIntegrity.QUEUE_OVERFLOW
+        assert recorder.telemetry.status == "DEGRADED"
+        assert recorder.telemetry.failure_count >= 1
+    finally:
+        recorder.close()
+
+    # D. MARKET RETENTION (180000)
+    provider = LiveTradeCoverageProvider(retention_ms=policy.market_buffer_retention_ms)
+    provider.record_trade("BTCUSDT", 10_000, feed_safe=True, known_gap=False, sequence_id=1)
+    provider.record_trade("BTCUSDT", 20_000, feed_safe=True, known_gap=False, sequence_id=2)
+    provider.record_trade("BTCUSDT", 205_000, feed_safe=True, known_gap=False, sequence_id=3)
+
+    cutoff = 205_000 - policy.market_buffer_retention_ms
+    assert cutoff == 25_000
+
+    cov_below = provider.coverage("BTCUSDT", 24_999, 205_000)
+    assert cov_below.interval_retained is False
+    assert cov_below.valid is False
+
+    cov_exact = provider.coverage("BTCUSDT", 25_000, 205_000)
+    assert cov_exact.interval_retained is True
+    assert cov_exact.valid is True
+
 
 # -----------------------------------------------------------------------------
 # GATE 34: Event-local order flow accumulator does not read global CVD
 # -----------------------------------------------------------------------------
 def test_gate_34_event_local_flow_no_global_cvd():
+    # Behavioral arithmetic
     acc = EventFlowAccumulator(event_time_ms=10_000)
     acc.on_trade(make_trade(price=100.00, quantity=2.0, time_ms=10_000, seq=1, aggressor_side=AggressorSide.BUY))
     acc.on_trade(make_trade(price=100.00, quantity=1.0, time_ms=11_000, seq=2, aggressor_side=AggressorSide.SELL))
@@ -1132,15 +1378,99 @@ def test_gate_34_event_local_flow_no_global_cvd():
     assert snap.buy_volume_usdt == 200.0
     assert snap.sell_volume_usdt == 100.0
     assert snap.signed_delta_usdt == 100.0
+    assert snap.post_sweep_cvd_usdt == 100.0
+
+    # Static AST certification: liquidity_event core must not reference global FlowMetrics or session CVD fields
+    core_files = [
+        Path(__file__).parent / "liquidity_event" / "classifier.py",
+        Path(__file__).parent / "liquidity_event" / "evidence.py",
+        Path(__file__).parent / "liquidity_event" / "engine.py",
+    ]
+    forbidden_names = {"FlowMetrics", "flow_metrics"}
+    forbidden_attrs = {"session_cvd", "session_cvd_usdt", "running_cvd", "running_cvd_usdt"}
+
+    for py_file in core_files:
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name not in forbidden_names, f"Forbidden import {alias.name} in {py_file}"
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    assert node.module not in forbidden_names, f"Forbidden import from {node.module} in {py_file}"
+            elif isinstance(node, ast.Name):
+                assert node.id not in forbidden_names, f"Forbidden name {node.id} in {py_file}"
+            elif isinstance(node, ast.Attribute):
+                assert node.attr not in forbidden_attrs, f"Forbidden attribute {node.attr} in {py_file}"
+
+    # Behavioral isolation: EventFlowAccumulator ignores external trades before event_time_ms
+    acc_isolated = EventFlowAccumulator(event_time_ms=10_000)
+    acc_isolated.on_trade(make_trade(price=500.00, quantity=100.0, time_ms=5_000, seq=1, aggressor_side=AggressorSide.BUY))
+    snap_iso = acc_isolated.snapshot(as_of_ms=12_000)
+    assert snap_iso.buy_volume_usdt == 0.0
+    assert snap_iso.post_sweep_cvd_usdt == 0.0
 
 
 # -----------------------------------------------------------------------------
 # GATE 35: Context enters only through typed context adapters
 # -----------------------------------------------------------------------------
 def test_gate_35_typed_context_adapter():
-    engine = OrderFlowEngine()
-    assert hasattr(engine, "context_adapter")
-    assert hasattr(engine, "liquidity_context_adapter")
+    adapter = LegacyLiquidityContextAdapter()
+
+    # 1. Pass representative raw legacy mappings and verify deterministic typed EvidenceValue outputs
+    abs_val = adapter.absorption({"side": "BID", "event_type": "BULLISH_ABSORPTION"}, as_of_ms=20_000)
+    assert isinstance(abs_val, EvidenceValue)
+    assert abs_val.availability is EvidenceAvailability.AVAILABLE
+    assert abs_val.value == 1.0
+    assert abs_val.as_of_ms == 20_000
+
+    rep_val = adapter.replenishment({"side": "BID", "event_type": "BID_REPLENISHMENT"}, as_of_ms=20_000)
+    assert isinstance(rep_val, EvidenceValue)
+    assert rep_val.availability is EvidenceAvailability.AVAILABLE
+    assert rep_val.value == 1.0
+    assert rep_val.as_of_ms == 20_000
+
+    sp_val = adapter.stacking_pulling({"event_type": "BID_STACKING"}, as_of_ms=20_000)
+    assert isinstance(sp_val, EvidenceValue)
+    assert sp_val.availability is EvidenceAvailability.AVAILABLE
+    assert sp_val.value == 1.0
+    assert sp_val.as_of_ms == 20_000
+
+    depth_val = EvidenceValue(EvidenceAvailability.AVAILABLE, 0.75, 20_000)
+
+    # 2. Pass typed EvidenceValue into LiquidityEvidenceBuilder.build()
+    builder = LiquidityEvidenceBuilder()
+    obs = make_obs("gate-35")
+    event = LiquidityEvent(observation=obs, state=EventState.OBSERVED)
+
+    evidence = builder.build(
+        event=event,
+        outcome_direction=EventClassification.FAILED_BREAKDOWN,
+        as_of_ms=20_000,
+        absorption=abs_val,
+        depth_weighted_imbalance=depth_val,
+        replenishment=rep_val,
+        stacking_pulling=sp_val,
+    )
+
+    assert evidence.values["bid_ask_absorption"] == abs_val
+    assert evidence.values["depth_weighted_imbalance"] == depth_val
+    assert evidence.values["wall_replenishment"] == rep_val
+    assert evidence.values["stacking_pulling"] == sp_val
+
+    # 3. Inspect signature of LiquidityEvidenceBuilder.build
+    sig = inspect.signature(builder.build)
+    for param_name in ("absorption", "depth_weighted_imbalance", "replenishment", "stacking_pulling"):
+        assert param_name in sig.parameters
+
+    # 4. Prove arbitrary raw legacy dict is NOT accepted directly by build()
+    with pytest.raises((AttributeError, TypeError)):
+        builder.build(
+            event=event,
+            outcome_direction=EventClassification.FAILED_BREAKDOWN,
+            as_of_ms=20_000,
+            absorption={"side": "BID", "event_type": "BULLISH_ABSORPTION"},  # type: ignore
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -1162,21 +1492,44 @@ def test_gate_36_source_level_id_preservation():
 # GATE 37: Recorder failure / incomplete artifact integrity produces non-complete
 # -----------------------------------------------------------------------------
 def test_gate_37_incomplete_artifact_integrity(tmp_path: Path):
-    recorder = LiquidityEventRecorder(mode="live", output_dir=tmp_path / "artifacts")
-    recorder.telemetry.status = "DEGRADED"
-    recorder.telemetry.failure_count = 1
+    cb = make_sweep_callback(event_time_ms=10_000, detection_time_ms=10_000, level=100.0, sweep_id="gate-37")
+    inputs = [
+        ReplayInput.from_sweep_callback(cb),
+        ReplayInput.from_trade(make_trade(price=99.90, time_ms=10_500, seq=1, aggressor_side=AggressorSide.SELL)),
+        ReplayInput.from_trade(make_trade(price=100.10, time_ms=11_000, seq=2, aggressor_side=AggressorSide.BUY)),
+        ReplayInput.from_trade(make_trade(price=100.10, time_ms=12_000, seq=3, aggressor_side=AggressorSide.BUY)),
+        ReplayInput.from_trade(make_trade(price=100.10, time_ms=14_000, seq=4, aggressor_side=AggressorSide.BUY)),
+        ReplayInput.from_trade(make_trade(price=100.10, time_ms=20_000, seq=5, aggressor_side=AggressorSide.BUY)),
+    ]
 
-    # When queue overflows or write fails, artifact integrity is non-complete
-    recorder._artifact_integrity = ArtifactIntegrity.RECORDER_FAILURE
-    assert recorder.artifact_integrity is not ArtifactIntegrity.COMPLETE
+    out_dir = tmp_path / "replay_fail"
+    runner = LiquidityReplayRunner(inputs=inputs, output_dir=out_dir)
+
+    # Patch open in recorder to simulate a genuine disk / I/O failure during flush_replay
+    with patch("builtins.open", side_effect=OSError("Disk write failed")):
+        result = runner.run()
+
+    assert result.artifact_integrity is ArtifactIntegrity.RECORDER_FAILURE
+    assert result.recorder_failure_count >= 1
+    assert result.exit_code == 1
+
+    # CLI test under genuine failure
+    cli_out_dir = tmp_path / "cli_fail"
+    with patch("builtins.open", side_effect=OSError("Disk write failed")):
+        cli_exit = replay_main(["--output-dir", str(cli_out_dir)])
+    assert cli_exit == 1
 
 
 # -----------------------------------------------------------------------------
 # GATE 38: Canonical recorder flush ordering exactly follows rank tuple
 # -----------------------------------------------------------------------------
 def test_gate_38_recorder_flush_canonical_ordering(tmp_path: Path):
+    out_dir = tmp_path / "recorder_order"
+    recorder = LiquidityEventRecorder(mode="replay", output_dir=out_dir)
+
+    # 1. Construct deliberately scrambled set of records with diverse times, event IDs, sequences, ranks
     t1 = LifecycleTransition(
-        event_id="ev1",
+        event_id="evA",
         transition_sequence=1,
         transition_time_ms=10_000,
         previous_state=EventState.OBSERVED,
@@ -1184,20 +1537,91 @@ def test_gate_38_recorder_flush_canonical_ordering(tmp_path: Path):
         reason_code="OBSERVATION_ADMITTED",
     )
     t2 = LifecycleTransition(
-        event_id="ev1",
+        event_id="evA",
         transition_sequence=2,
         transition_time_ms=12_000,
         previous_state=EventState.SWEEP_DETECTED,
         next_state=EventState.FINALIZED,
         reason_code="RECLAIM_CONFIRMED",
     )
-    rec1 = CanonicalRecord(record_type="TRANSITION", payload=t1)
-    rec2 = CanonicalRecord(record_type="TRANSITION", payload=t2)
+    obs = make_obs("evA", event_time_ms=10_000, detection_time_ms=10_000)
+    builder = LiquidityEvidenceBuilder()
+    ev_obj = LiquidityEvent(observation=obs, state=EventState.FINALIZED)
+    evidence = builder.build(event=ev_obj, outcome_direction=EventClassification.FAILED_BREAKDOWN, as_of_ms=12_000)
+    res1 = LiquidityEventResult(
+        event_id="evA",
+        symbol="BTCUSDT",
+        liquidity_side=LiquiditySide.SELL_SIDE,
+        classification=EventClassification.FAILED_BREAKDOWN,
+        reason_code="RECLAIM_CONFIRMED",
+        event_time_ms=10_000,
+        detection_time_ms=10_000,
+        market_resolution_time_ms=12_000,
+        classification_time_ms=12_000,
+        source_observation_hash=obs.source_observation_hash,
+        evidence=evidence,
+        policy_hash="policy_hash_test",
+        model_version="1.0.0",
+    )
+    rej1 = RejectedSweepInput(
+        source=SweepSource.SWEEPS_MONITOR_CSV,
+        detection_time_ms=11_000,
+        reason_code="INVALID_SWEEP_OBSERVATION",
+        reason_detail="INVALID_TIMESTAMP",
+    )
 
-    records = [rec2, rec1]
-    records.sort(key=lambda r: r.canonical_key)
-    assert records[0] == rec1
-    assert records[1] == rec2
+    rec_t1 = CanonicalRecord(record_type="TRANSITION", payload=t1)
+    rec_t2 = CanonicalRecord(record_type="TRANSITION", payload=t2)
+    rec_res = CanonicalRecord(record_type="EVENT", payload=res1)
+    rec_rej = CanonicalRecord(record_type="REJECTED_INPUT", payload=rej1)
+
+    expected_records = [rec_t1, rec_rej, rec_t2, rec_res]
+    expected_canonical_keys = [r.canonical_key for r in expected_records]
+
+    # Explicitly assert canonical_key tuple structure
+    for r in expected_records:
+        assert r.canonical_key == (
+            r.canonical_record_time_ms,
+            r.event_id,
+            r.transition_sequence,
+            r.record_type_rank,
+            r.content_hash,
+        )
+
+    # Enqueue in scrambled non-canonical order
+    scrambled = [rec_res, rec_t2, rec_rej, rec_t1]
+    for r in scrambled:
+        recorder.enqueue(r)
+
+    # 2. Spy on serialization calls during flush_replay
+    observed_flush_keys: list[tuple[Any, ...]] = []
+    orig_ser_trans = rec_mod._serialize_transition_row
+    orig_ser_event = rec_mod._serialize_event_row
+    orig_ser_rej = rec_mod._serialize_rejected_row
+
+    def spy_ser_trans(payload):
+        observed_flush_keys.append(CanonicalRecord(record_type="TRANSITION", payload=payload).canonical_key)
+        return orig_ser_trans(payload)
+
+    def spy_ser_event(payload):
+        observed_flush_keys.append(CanonicalRecord(record_type="EVENT", payload=payload).canonical_key)
+        return orig_ser_event(payload)
+
+    def spy_ser_rej(payload):
+        observed_flush_keys.append(CanonicalRecord(record_type="REJECTED_INPUT", payload=payload).canonical_key)
+        return orig_ser_rej(payload)
+
+    with patch("liquidity_event.recorder._serialize_transition_row", side_effect=spy_ser_trans), \
+         patch("liquidity_event.recorder._serialize_event_row", side_effect=spy_ser_event), \
+         patch("liquidity_event.recorder._serialize_rejected_row", side_effect=spy_ser_rej):
+        recorder.flush_replay()
+
+    assert observed_flush_keys == sorted(expected_canonical_keys)
+
+    # Verify CSV files exist
+    assert (out_dir / EVENTS_FILENAME).exists()
+    assert (out_dir / TRANSITIONS_FILENAME).exists()
+    assert (out_dir / REJECTED_FILENAME).exists()
 
 
 # -----------------------------------------------------------------------------
@@ -1224,46 +1648,177 @@ def test_gate_39_guardian_distinguishes_quiet_from_gapped():
 # GATE 40: Finalized identity survives restart
 # -----------------------------------------------------------------------------
 def test_gate_40_identity_restart_durability(tmp_path: Path):
-    db_path = str(tmp_path / "restart.sqlite3")
     policy = LiquidityClassificationPolicy()
-
-    # Session 1: Claim and finalize identity
-    auth1 = SQLiteIdentityAuthority(db_path)
-    obs = make_obs("gate-40", side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=10_000)
-    claim1 = auth1.claim_observation(obs)
-    assert claim1.outcome is IdentityClaimOutcome.NEW
-
     builder = LiquidityEvidenceBuilder()
-    event = LiquidityEvent(observation=obs, state=EventState.FINALIZED, classification=EventClassification.FAILED_BREAKDOWN)
-    evidence = builder.build(event=event, outcome_direction=EventClassification.FAILED_BREAKDOWN, as_of_ms=20_000)
-    result = LiquidityEventResult(
-        event_id=obs.event_id,
-        symbol=obs.symbol,
-        liquidity_side=obs.liquidity_side,
+
+    # -------------------------------------------------------------------------
+    # PART A — FINALIZED DUPLICATE
+    # -------------------------------------------------------------------------
+    db_path_a = str(tmp_path / "part_a.sqlite3")
+    auth_a1 = SQLiteIdentityAuthority(db_path_a)
+    obs_a = make_obs("gate-40-a", side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=10_000)
+    claim_a1 = auth_a1.claim_observation(obs_a)
+    assert claim_a1.outcome is IdentityClaimOutcome.NEW
+
+    event_a = LiquidityEvent(observation=obs_a, state=EventState.FINALIZED, classification=EventClassification.FAILED_BREAKDOWN)
+    ev_a = builder.build(event=event_a, outcome_direction=EventClassification.FAILED_BREAKDOWN, as_of_ms=20_000)
+    res_a = LiquidityEventResult(
+        event_id=obs_a.event_id,
+        symbol=obs_a.symbol,
+        liquidity_side=obs_a.liquidity_side,
         classification=EventClassification.FAILED_BREAKDOWN,
         reason_code="RECLAIM_CONFIRMED",
-        event_time_ms=obs.event_time_ms,
-        detection_time_ms=obs.detection_time_ms,
+        event_time_ms=obs_a.event_time_ms,
+        detection_time_ms=obs_a.detection_time_ms,
         market_resolution_time_ms=20_000,
         classification_time_ms=20_000,
-        source_observation_hash=obs.source_observation_hash,
-        evidence=evidence,
+        source_observation_hash=obs_a.source_observation_hash,
+        evidence=ev_a,
         policy_hash=policy.policy_hash,
         model_version=policy.model_version,
     )
-    auth1.claim_result(result)
-    auth1.close()
+    auth_a1.claim_result(res_a)
+    auth_a1.close()
 
-    # Session 2: Re-open from same SQLite database
-    auth2 = SQLiteIdentityAuthority(db_path)
+    auth_a2 = SQLiteIdentityAuthority(db_path_a)
     try:
-        claim2 = auth2.claim_observation(obs)
-        assert claim2.outcome is IdentityClaimOutcome.DUPLICATE_EXISTING
-        persisted = auth2.lookup(obs.event_id)
+        claim_a2 = auth_a2.claim_observation(obs_a)
+        assert claim_a2.outcome is IdentityClaimOutcome.DUPLICATE_EXISTING
+        persisted = auth_a2.lookup(obs_a.event_id)
         assert persisted is not None
         assert persisted.status == "FINALIZED"
     finally:
-        auth2.close()
+        auth_a2.close()
+
+    # -------------------------------------------------------------------------
+    # PART B — IMMUTABLE IDENTITY CONFLICT
+    # -------------------------------------------------------------------------
+    auth_b = SQLiteIdentityAuthority(db_path_a)
+    store_b = LiquidityEventStore(policy)
+    try:
+        altered_obs = make_obs(
+            "gate-40-a",
+            side=LiquiditySide.SELL_SIDE,
+            level=999.0,
+            event_time_ms=10_000,
+        )
+        claim_conflict = auth_b.claim_observation(altered_obs)
+        assert claim_conflict.outcome is IdentityClaimOutcome.IDENTITY_CONFLICT
+
+        admit_res = store_b.admit_observation(altered_obs, auth_b)
+        assert admit_res.created is False
+        assert admit_res.rejection is not None
+        assert admit_res.rejection.reason_code == "IDENTITY_CONFLICT"
+        assert store_b.active_count("BTCUSDT") == 0
+    finally:
+        auth_b.close()
+
+    # -------------------------------------------------------------------------
+    # PART C — CLAIMED_UNRESOLVED RECOVERY WITH RETAINED HISTORY
+    # -------------------------------------------------------------------------
+    db_path_c = str(tmp_path / "part_c.sqlite3")
+    auth_c1 = SQLiteIdentityAuthority(db_path_c)
+    store_c1 = LiquidityEventStore(policy)
+    engine_c1 = LiquidityEventEngine(policy=policy, store=store_c1, authority=auth_c1)
+
+    obs_c = make_obs("gate-40-c", side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=10_000)
+    engine_c1.on_sweep(obs_c, StaticCoverageProvider(make_safe_coverage()))
+    persisted_c = auth_c1.lookup(obs_c.event_id)
+    assert persisted_c is not None
+    assert persisted_c.status == "CLAIMED_UNRESOLVED"
+    auth_c1.close()
+
+    # Session 2: Reopen same DB, recover with retained coverage and confirming trades
+    auth_c2 = SQLiteIdentityAuthority(db_path_c)
+    store_c2 = LiquidityEventStore(policy)
+    recovered_results: list[LiquidityEventResult] = []
+    recovered_transitions: list[LifecycleTransition] = []
+    engine_c2 = LiquidityEventEngine(
+        policy=policy,
+        store=store_c2,
+        authority=auth_c2,
+        on_result=lambda r: recovered_results.append(r),
+        on_transition=lambda t: recovered_transitions.append(t),
+    )
+
+    try:
+        rec_res_c = engine_c2.recover_claimed_unresolved(StaticCoverageProvider(make_safe_coverage()))
+        assert engine_c2.telemetry.recovered_events_count == 1
+        assert len(store_c2.active("BTCUSDT")) == 1
+
+        # Feed trades to resolve recovered event
+        trades_c = [
+            make_trade(price=99.90, time_ms=10_500, seq=1, aggressor_side=AggressorSide.SELL),
+            make_trade(price=100.10, time_ms=11_000, seq=2, aggressor_side=AggressorSide.BUY),
+            make_trade(price=100.10, time_ms=12_000, seq=3, aggressor_side=AggressorSide.BUY),
+            make_trade(price=100.10, time_ms=14_000, seq=4, aggressor_side=AggressorSide.BUY),
+            make_trade(price=100.10, time_ms=20_000, seq=5, aggressor_side=AggressorSide.BUY),
+        ]
+        for t in trades_c:
+            engine_c2.on_trade(t, make_safe_coverage())
+
+        assert len(recovered_results) == 1
+        assert recovered_results[0].classification is EventClassification.FAILED_BREAKDOWN
+        assert recovered_results[0].reason_code == "RECLAIM_CONFIRMED"
+        persisted_final = auth_c2.lookup(obs_c.event_id)
+        assert persisted_final is not None
+        assert persisted_final.status == "FINALIZED"
+
+        # Check transition sequence uniqueness
+        seqs = [t.transition_sequence for t in recovered_transitions]
+        assert len(seqs) == len(set(seqs))
+
+        # A second recovery call emits no duplicate result
+        rec_res_c2 = engine_c2.recover_claimed_unresolved(StaticCoverageProvider(make_safe_coverage()))
+        assert len(rec_res_c2) == 0
+        assert len(recovered_results) == 1
+    finally:
+        auth_c2.close()
+
+    # -------------------------------------------------------------------------
+    # PART D — CLAIMED_UNRESOLVED WITHOUT RETAINED HISTORY
+    # -------------------------------------------------------------------------
+    db_path_d = str(tmp_path / "part_d.sqlite3")
+    auth_d1 = SQLiteIdentityAuthority(db_path_d)
+    store_d1 = LiquidityEventStore(policy)
+    engine_d1 = LiquidityEventEngine(policy=policy, store=store_d1, authority=auth_d1)
+
+    obs_d = make_obs("gate-40-d", side=LiquiditySide.SELL_SIDE, level=100.0, event_time_ms=10_000)
+    engine_d1.on_sweep(obs_d, StaticCoverageProvider(make_safe_coverage()))
+    auth_d1.close()
+
+    auth_d2 = SQLiteIdentityAuthority(db_path_d)
+    store_d2 = LiquidityEventStore(policy)
+    results_d: list[LiquidityEventResult] = []
+    engine_d2 = LiquidityEventEngine(
+        policy=policy,
+        store=store_d2,
+        authority=auth_d2,
+        on_result=lambda r: results_d.append(r),
+    )
+
+    try:
+        missing_cov = TradeCoverage(
+            feed_safe=True,
+            known_gap=False,
+            buffer_overflow=False,
+            unresolved_sequence=False,
+            interval_retained=False,
+        )
+        rec_res_d = engine_d2.recover_claimed_unresolved(StaticCoverageProvider(missing_cov))
+        assert len(rec_res_d) == 1
+        assert rec_res_d[0].classification is EventClassification.INVALID
+        assert rec_res_d[0].reason_code == "INSUFFICIENT_REPLAY_HISTORY"
+        persisted_d_final = auth_d2.lookup(obs_d.event_id)
+        assert persisted_d_final is not None
+        assert persisted_d_final.status == "FINALIZED"
+
+        # Second recovery call produces no duplicate
+        rec_res_d2 = engine_d2.recover_claimed_unresolved(StaticCoverageProvider(missing_cov))
+        assert len(rec_res_d2) == 0
+        assert len(results_d) == 1
+    finally:
+        auth_d2.close()
 
 
 # -----------------------------------------------------------------------------
