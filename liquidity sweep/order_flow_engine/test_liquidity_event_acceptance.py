@@ -847,20 +847,54 @@ def test_gate_23_evicted_and_boundary_history_fails_closed():
     provider = LiveTradeCoverageProvider(retention_ms=policy.market_buffer_retention_ms)
 
     # Initial trades around 10_000
-    provider.record_trade("BTCUSDT", 10_000, True, False, 1)
-    provider.record_trade("BTCUSDT", 20_000, True, False, 2)
+    provider.record_trade(
+        "BTCUSDT",
+        10_000,
+        feed_safe=True,
+        known_gap=False,
+        sequence_id=1,
+    )
+    provider.record_trade(
+        "BTCUSDT",
+        20_000,
+        feed_safe=True,
+        known_gap=False,
+        sequence_id=2,
+    )
 
     # Advance time beyond retention horizon (180_000 ms)
     later_time = 20_000 + policy.market_buffer_retention_ms + 5_000  # 205_000 ms
-    provider.record_trade("BTCUSDT", later_time, True, False, 3)
+    provider.record_trade(
+        "BTCUSDT",
+        later_time,
+        feed_safe=True,
+        known_gap=False,
+        sequence_id=3,
+    )
 
-    # Wholly evicted interval
+    # Wholly evicted interval (10_000 - 20_000)
     cov_evicted = provider.coverage("BTCUSDT", 10_000, 20_000)
+    assert cov_evicted.interval_retained is False
     assert cov_evicted.valid is False
 
-    # Boundary crossing interval (starts before retention cutoff 25_000)
-    cov_boundary = provider.coverage("BTCUSDT", 24_000, later_time)
-    assert cov_boundary.valid is False
+    # Boundary crossing intervals (starts before retention cutoff 25_000)
+    cov_24 = provider.coverage("BTCUSDT", 24_000, later_time)
+    assert cov_24.interval_retained is False
+    assert cov_24.valid is False
+
+    cov_24999 = provider.coverage("BTCUSDT", 24_999, later_time)
+    assert cov_24999.interval_retained is False
+    assert cov_24999.valid is False
+
+    # Retained boundary interval (25_000 is exactly at cutoff 25_000)
+    cov_25 = provider.coverage("BTCUSDT", 25_000, later_time)
+    assert cov_25.interval_retained is True
+    assert cov_25.valid is True
+
+    # Inside retained interval (25_001 is above cutoff 25_000)
+    cov_25001 = provider.coverage("BTCUSDT", 25_001, later_time)
+    assert cov_25001.interval_retained is True
+    assert cov_25001.valid is True
 
 
 # -----------------------------------------------------------------------------

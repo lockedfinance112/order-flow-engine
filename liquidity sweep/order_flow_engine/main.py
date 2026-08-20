@@ -100,10 +100,23 @@ class LiveTradeCoverageProvider:
             unresolved_sequence=has_unresolved,
         ))
 
-        # Advance bounds with the retained coverage by pruning old segments
+        # Advance bounds with the retained coverage by pruning old segments and clamping crossing segments
         max_seen = max(s.end_ms for s in segs)
         cutoff = max(0, max_seen - self._retention_ms)
-        self._segments[sym] = [s for s in segs if s.end_ms >= cutoff]
+        retained: List[_LiveCoverageSegment] = []
+        for s in segs:
+            if s.end_ms < cutoff:
+                continue
+            if s.start_ms < cutoff:
+                s = _LiveCoverageSegment(
+                    start_ms=cutoff,
+                    end_ms=s.end_ms,
+                    feed_safe=s.feed_safe,
+                    known_gap=s.known_gap,
+                    unresolved_sequence=s.unresolved_sequence,
+                )
+            retained.append(s)
+        self._segments[sym] = retained
 
     def coverage(self, symbol: str, start_ms: int, end_ms: int):
         from liquidity_event import TradeCoverage

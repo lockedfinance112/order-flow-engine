@@ -913,3 +913,50 @@ def test_degraded_shutdown_remains_safe():
         await engine._shutdown_liquidity_event_engine()
 
     asyncio.run(_run())
+
+
+def test_retention_crossing_segment_is_clamped_to_cutoff():
+    policy = LiquidityClassificationPolicy()
+    retention_ms = policy.market_buffer_retention_ms
+
+    provider = LiveTradeCoverageProvider(retention_ms=retention_ms)
+    provider.record_trade(
+        "BTCUSDT",
+        10_000,
+        feed_safe=True,
+        known_gap=False,
+        sequence_id=1,
+    )
+    provider.record_trade(
+        "BTCUSDT",
+        20_000,
+        feed_safe=True,
+        known_gap=False,
+        sequence_id=2,
+    )
+    provider.record_trade(
+        "BTCUSDT",
+        205_000,
+        feed_safe=True,
+        known_gap=False,
+        sequence_id=3,
+    )
+
+    cutoff = 205_000 - retention_ms
+    assert cutoff == 25_000
+
+    cov_below = provider.coverage("BTCUSDT", cutoff - 1, 205_000)
+    assert cov_below.interval_retained is False
+    assert cov_below.valid is False
+
+    cov_exact = provider.coverage("BTCUSDT", cutoff, 205_000)
+    assert cov_exact.interval_retained is True
+    assert cov_exact.feed_safe is True
+    assert cov_exact.known_gap is False
+    assert cov_exact.unresolved_sequence is False
+    assert cov_exact.valid is True
+
+    retained_segments = provider._segments.get("BTCUSDT", [])
+    assert len(retained_segments) > 0
+    for seg in retained_segments:
+        assert seg.start_ms >= cutoff
