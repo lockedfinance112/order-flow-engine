@@ -11,7 +11,7 @@ from rich.live import Live
 
 import config
 from config import (
-    WINDOWS, EVENT_COOLDOWN_SECONDS, SYMBOLS, 
+    WINDOWS, EVENT_COOLDOWN_SECONDS, SYMBOLS,
     DASHBOARD_REFRESH_SECONDS, MAX_RECENT_EVENTS, MAX_DISPLAY_SYMBOLS
 )
 from trade_stream import TradeStream
@@ -29,6 +29,9 @@ import ai_providers
 from binance_context import BinanceContextManager
 from data.paper_trader import PaperTrader
 
+from dataclasses import dataclass
+import collections
+
 # Configure file logging to avoid messing up the rich console output
 log_file = os.path.join(os.path.dirname(__file__), "order_flow.log")
 logging.basicConfig(
@@ -40,20 +43,67 @@ logging.basicConfig(
 )
 logger = logging.getLogger("OrderFlow.Main")
 
+@dataclass(frozen=True)
+class _LiveCoverageSegment:
+    start_ms: int
+    end_ms: int
+    feed_safe: bool
+    known_gap: bool
+
 class LiveTradeCoverageProvider:
-    """Live trade coverage provider forwarding Guardian stream safety to the liquidity engine."""
-    def __init__(self, metrics: FlowMetrics):
-        self._metrics = metrics
+    """Live interval-aware trade coverage provider maintaining historical segments per symbol."""
+    def __init__(self, retention_ms: int = 180_000):
+        self._retention_ms = retention_ms
+        self._segments: Dict[str, List[_LiveCoverageSegment]] = collections.defaultdict(list)
+        self._bounds: Dict[str, Tuple[int, int]] = {}
+
+    def record_trade(self, symbol: str, exchange_time_ms: int, feed_safe: bool, known_gap: bool) -> None:
+        sym = symbol.upper()
+        segs = self._segments[sym]
+        prev_max = self._bounds.get(sym, (exchange_time_ms, exchange_time_ms))[1]
+        start_ms = min(exchange_time_ms, prev_max)
+        end_ms = max(exchange_time_ms, prev_max)
+
+        segs.append(_LiveCoverageSegment(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            feed_safe=feed_safe,
+            known_gap=known_gap,
+        ))
+
+        if sym in self._bounds:
+            min_ms, max_ms = self._bounds[sym]
+            self._bounds[sym] = (min(min_ms, exchange_time_ms), max(max_ms, exchange_time_ms))
+        else:
+            self._bounds[sym] = (exchange_time_ms, exchange_time_ms)
+
+        cutoff = max(0, self._bounds[sym][1] - self._retention_ms)
+        self._segments[sym] = [s for s in segs if s.end_ms >= cutoff]
 
     def coverage(self, symbol: str, start_ms: int, end_ms: int):
         from liquidity_event import TradeCoverage
-        now = time.time()
-        safety_obj = self._metrics.get_market_data_safety(symbol, now)
-        t_status = safety_obj.get("trade_status", "HEALTHY")
-        feed_safe = safety_obj.get("safe", True) and t_status == "HEALTHY"
+        sym = symbol.upper()
+        if sym not in self._bounds:
+            return TradeCoverage(feed_safe=False, known_gap=False, buffer_overflow=False, unresolved_sequence=False, interval_retained=False)
+
+        min_ms, max_ms = self._bounds[sym]
+        if start_ms < min_ms or end_ms > max_ms:
+            return TradeCoverage(feed_safe=False, known_gap=False, buffer_overflow=False, unresolved_sequence=False, interval_retained=False)
+
+        segs = self._segments[sym]
+        feed_safe = True
+        known_gap = False
+
+        for s in segs:
+            if max(s.start_ms, start_ms) <= min(s.end_ms, end_ms):
+                if not s.feed_safe:
+                    feed_safe = False
+                if s.known_gap:
+                    known_gap = True
+
         return TradeCoverage(
             feed_safe=feed_safe,
-            known_gap=(t_status == "UNSAFE"),
+            known_gap=known_gap,
             buffer_overflow=False,
             unresolved_sequence=False,
             interval_retained=True,
@@ -76,7 +126,7 @@ class OrderFlowEngine:
 
         # Instantiate RegimeEngine (TICS Phase 1B - Shadow Mode)
         from regime.engine import RegimeEngine
-        
+
         def get_liquidity_data(sym: str) -> dict:
             state = self.metrics.get_state(sym)
             return {
@@ -84,7 +134,7 @@ class OrderFlowEngine:
                 "bid_depth_top5_usdt": state.bid_depth_top5_usdt,
                 "ask_depth_top5_usdt": state.ask_depth_top5_usdt
             }
-            
+
         import config as cfg
         self.regime_engine = RegimeEngine(
             symbols=SYMBOLS,
@@ -94,111 +144,121 @@ class OrderFlowEngine:
         )
 
         # Instantiate LiquidityEventEngine (TICS Phase 1C.1 - Shadow Mode)
+        self.liquidity_engine = None
+        self.liquidity_recorder = None
+        self.liquidity_identity_authority = None
+        self.liquidity_store = None
+        self.liquidity_adapter = None
+        self.liquidity_context_adapter = None
+        self.context_adapter = None
+        self.liquidity_coverage_provider = None
+        self.recent_liquidity_results = []
+        self.active_liquidity_events = {}
+        self.rejected_input_count = 0
+
         if getattr(config, "LIQUIDITY_EVENT_ENGINE_ENABLED", False):
-            from liquidity_event import (
-                AggressorSide,
-                DepthObservation,
-                LegacyLiquidityContextAdapter,
-                LifecycleTransition,
-                LiquidityClassificationPolicy,
-                LiquidityEventEngine,
-                LiquidityEventResult,
-                LiquidityEventStore,
-                LiquidityEvidenceBuilder,
-                MarketTrade,
-                RejectedSweepInput,
-                SQLiteIdentityAuthority,
-                SweepsMonitorAdapter,
-                TradeCoverage,
-            )
-            from liquidity_event.recorder import LiquidityEventRecorder
+            try:
+                from liquidity_event import (
+                    AggressorSide,
+                    DepthObservation,
+                    LegacyLiquidityContextAdapter,
+                    LifecycleTransition,
+                    LiquidityClassificationPolicy,
+                    LiquidityEventEngine,
+                    LiquidityEventResult,
+                    LiquidityEventStore,
+                    LiquidityEvidenceBuilder,
+                    MarketTrade,
+                    RejectedSweepInput,
+                    SQLiteIdentityAuthority,
+                    SweepsMonitorAdapter,
+                    TradeCoverage,
+                )
+                from liquidity_event.recorder import LiquidityEventRecorder
 
-            os.makedirs(config.LIQUIDITY_EVENT_OUTPUT_DIR, exist_ok=True)
-            db_path = os.path.join(config.LIQUIDITY_EVENT_OUTPUT_DIR, "liquidity_identity.sqlite3")
-            self.liquidity_policy = LiquidityClassificationPolicy()
-            self.liquidity_identity_authority = SQLiteIdentityAuthority(db_path)
-            self.liquidity_store = LiquidityEventStore(self.liquidity_policy)
-            self.liquidity_evidence_builder = LiquidityEvidenceBuilder()
-            self.liquidity_recorder = LiquidityEventRecorder(
-                mode="live",
-                output_dir=config.LIQUIDITY_EVENT_OUTPUT_DIR,
-                queue_max_items=self.liquidity_policy.recorder_queue_max_items,
-            )
-            self.liquidity_adapter = SweepsMonitorAdapter(self.liquidity_policy)
-            self.liquidity_context_adapter = LegacyLiquidityContextAdapter()
-            self.context_adapter = self.liquidity_context_adapter
-            self.liquidity_coverage_provider = LiveTradeCoverageProvider(self.metrics)
-            self.recent_liquidity_results: list[dict] = []
-            self.active_liquidity_events: dict[str, dict] = {}
-            self.rejected_input_count = 0
+                os.makedirs(config.LIQUIDITY_EVENT_OUTPUT_DIR, exist_ok=True)
+                db_path = os.path.join(config.LIQUIDITY_EVENT_OUTPUT_DIR, "liquidity_identity.sqlite3")
+                self.liquidity_policy = LiquidityClassificationPolicy()
+                self.liquidity_identity_authority = SQLiteIdentityAuthority(db_path)
+                self.liquidity_store = LiquidityEventStore(self.liquidity_policy)
+                self.liquidity_evidence_builder = LiquidityEvidenceBuilder()
+                self.liquidity_recorder = LiquidityEventRecorder(
+                    mode="live",
+                    output_dir=config.LIQUIDITY_EVENT_OUTPUT_DIR,
+                    queue_max_items=self.liquidity_policy.recorder_queue_max_items,
+                )
+                self.liquidity_adapter = SweepsMonitorAdapter(self.liquidity_policy)
+                self.liquidity_context_adapter = LegacyLiquidityContextAdapter()
+                self.context_adapter = self.liquidity_context_adapter
+                self.liquidity_coverage_provider = LiveTradeCoverageProvider(
+                    retention_ms=self.liquidity_policy.market_buffer_retention_ms
+                )
 
-            def on_transition(t: LifecycleTransition) -> None:
-                if self.liquidity_recorder:
-                    self.liquidity_recorder.enqueue(t)
+                def on_transition(t: LifecycleTransition) -> None:
+                    if self.liquidity_recorder:
+                        self.liquidity_recorder.enqueue(t)
 
-            def on_result(r: LiquidityEventResult) -> None:
-                if self.liquidity_recorder:
-                    self.liquidity_recorder.enqueue(r)
-                res_dict = {
-                    "event_id": r.event_id,
-                    "symbol": r.symbol,
-                    "side": r.liquidity_side.value,
-                    "classification": r.classification.value,
-                    "reason_code": r.reason_code,
-                    "event_time_ms": r.event_time_ms,
-                    "detection_time_ms": r.detection_time_ms,
-                    "market_resolution_time_ms": r.market_resolution_time_ms,
-                    "classification_time_ms": r.classification_time_ms,
-                    "confidence": r.evidence.confidence,
-                    "confidence_type": r.evidence.confidence_type.value,
-                    "reasons": list(r.evidence.reasons),
-                    "contradictions": list(r.evidence.contradictions),
-                    "context_coverage": r.evidence.context_coverage,
-                }
-                self.recent_liquidity_results.append(res_dict)
-                if len(self.recent_liquidity_results) > 100:
-                    self.recent_liquidity_results.pop(0)
-                self.active_liquidity_events.pop(r.event_id, None)
+                def on_result(r: LiquidityEventResult) -> None:
+                    if self.liquidity_recorder:
+                        self.liquidity_recorder.enqueue(r)
+                    res_dict = {
+                        "event_id": r.event_id,
+                        "symbol": r.symbol,
+                        "side": r.liquidity_side.value,
+                        "classification": r.classification.value,
+                        "reason_code": r.reason_code,
+                        "event_time_ms": r.event_time_ms,
+                        "detection_time_ms": r.detection_time_ms,
+                        "market_resolution_time_ms": r.market_resolution_time_ms,
+                        "classification_time_ms": r.classification_time_ms,
+                        "confidence": r.evidence.confidence,
+                        "confidence_type": r.evidence.confidence_type.value,
+                        "reasons": list(r.evidence.reasons),
+                        "contradictions": list(r.evidence.contradictions),
+                        "context_coverage": r.evidence.context_coverage,
+                    }
+                    self.recent_liquidity_results.append(res_dict)
+                    if len(self.recent_liquidity_results) > 100:
+                        self.recent_liquidity_results.pop(0)
+                    self.active_liquidity_events.pop(r.event_id, None)
 
-            def on_rejected(rej: RejectedSweepInput) -> None:
-                self.rejected_input_count += 1
-                if self.liquidity_recorder:
-                    self.liquidity_recorder.enqueue(rej)
+                def on_rejected(rej: RejectedSweepInput) -> None:
+                    self.rejected_input_count += 1
+                    if self.liquidity_recorder:
+                        self.liquidity_recorder.enqueue(rej)
 
-            self.liquidity_engine = LiquidityEventEngine(
-                policy=self.liquidity_policy,
-                store=self.liquidity_store,
-                authority=self.liquidity_identity_authority,
-                evidence_builder=self.liquidity_evidence_builder,
-                on_transition=on_transition,
-                on_result=on_result,
-                on_rejected=on_rejected,
-            )
-        else:
-            self.liquidity_engine = None
-            self.liquidity_recorder = None
-            self.liquidity_identity_authority = None
-            self.liquidity_store = None
-            self.liquidity_adapter = None
-            self.liquidity_context_adapter = None
-            self.context_adapter = None
-            self.liquidity_coverage_provider = None
-            self.recent_liquidity_results = []
-            self.active_liquidity_events = {}
-            self.rejected_input_count = 0
-        
+                self.liquidity_engine = LiquidityEventEngine(
+                    policy=self.liquidity_policy,
+                    store=self.liquidity_store,
+                    authority=self.liquidity_identity_authority,
+                    evidence_builder=self.liquidity_evidence_builder,
+                    on_transition=on_transition,
+                    on_result=on_result,
+                    on_rejected=on_rejected,
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize LiquidityEventEngine: {e}", exc_info=True)
+                self.liquidity_engine = None
+                self.liquidity_recorder = None
+                self.liquidity_identity_authority = None
+                self.liquidity_store = None
+                self.liquidity_adapter = None
+                self.liquidity_context_adapter = None
+                self.context_adapter = None
+                self.liquidity_coverage_provider = None
+
         # Event Recorders per symbol (v2.9)
         from data.recorder import StreamRecorder
         self.recorders: Dict[str, StreamRecorder] = {}
         if config.RECORDING_ENABLED:
             for sym in SYMBOLS:
                 self.recorders[sym.lower()] = StreamRecorder(sym)
-        
+
         # Segregated trade queue and streams
         self.trade_queue = asyncio.Queue()
         self.stream = TradeStream(self._queue_trade)
         self.depth_stream = OrderBookStream(self._handle_depth)
-        
+
         # Sweeps monitoring and scoring
         self.scorer = OrderFlowScorer(self.metrics)
         self.sweeps_monitor = SweepsMonitor(self._handle_sweep)
@@ -220,7 +280,7 @@ class OrderFlowEngine:
         self.current_decisions: Dict[str, dict] = {}
         self.cooldown_ends: Dict[str, float] = {}
         self.scanner_cycle_id = 0
-        
+
         # Initialize startup default decision states for all configured symbols
         for sym in SYMBOLS:
             sym_lower = sym.lower()
@@ -322,7 +382,11 @@ class OrderFlowEngine:
     async def _handle_depth(self, symbol: str, depth_data: dict):
         """Websocket callback to update order book pressure metrics directly."""
         now = time.time()
-        self.metrics.update_depth(symbol.lower(), depth_data, now)
+        try:
+            self.metrics.update_depth(symbol.lower(), depth_data, now)
+        except Exception as e:
+            logger.warning(f"Error updating flow metrics depth for {symbol}: {e}")
+
         if config.RECORDING_ENABLED:
             rec = self.recorders.get(symbol.lower())
             if rec:
@@ -332,12 +396,25 @@ class OrderFlowEngine:
         if self.liquidity_engine:
             try:
                 from liquidity_event import DepthObservation
-                bids_raw = depth_data.get("bids", depth_data.get("b", []))
-                asks_raw = depth_data.get("asks", depth_data.get("a", []))
+                bids_raw = depth_data.get("bids", depth_data.get("b"))
+                asks_raw = depth_data.get("asks", depth_data.get("a"))
+                if bids_raw is None or asks_raw is None:
+                    logger.warning(f"Rejecting malformed depth missing bids/asks for {symbol}")
+                    return
                 bids = tuple((Decimal(str(p)), Decimal(str(q))) for p, q in bids_raw)
                 asks = tuple((Decimal(str(p)), Decimal(str(q))) for p, q in asks_raw)
-                depth_time = int(depth_data.get("exchange_time_ms") or depth_data.get("E") or depth_data.get("T") or int(now * 1000))
-                seq_id = depth_data.get("last_update_id") or depth_data.get("u") or 0
+
+                depth_time = depth_data.get("exchange_time_ms") or depth_data.get("E") or depth_data.get("T")
+                if depth_time is None or isinstance(depth_time, bool):
+                    logger.warning(f"Rejecting malformed depth missing exchange timestamp for {symbol}")
+                    return
+                depth_time = int(depth_time)
+
+                seq_id = depth_data.get("last_update_id") or depth_data.get("u")
+                if seq_id is None:
+                    logger.warning(f"Rejecting malformed depth missing sequence/update ID for {symbol}")
+                    return
+                seq_id = int(seq_id)
 
                 d_obs = DepthObservation(
                     symbol=symbol.upper(),
@@ -353,17 +430,17 @@ class OrderFlowEngine:
     async def _handle_sweep(self, sweep: dict):
         """Triggered when SweepsMonitor detects a new liquidity sweep event."""
         sweep_id = sweep["sweep_id"]
-        
+
         # Ensure we only score this sweep once (prevent duplicates if file updates)
         if sweep_id in self.processed_sweep_ids:
             return
         self.processed_sweep_ids.add(sweep_id)
-        
+
         symbol = sweep["symbol"].lower()
         sweep_type = sweep["type"]
         level = sweep["sweep_level"]
         source_time = sweep["timestamp"]
-        
+
         # Retrieve depth timestamp specifically for this symbol
         state = self.metrics.get_state(symbol)
         last_depth_ts = state.last_depth_timestamp
@@ -371,16 +448,16 @@ class OrderFlowEngine:
         # Prune old alerts history (> 15 minutes old)
         now = time.time()
         self.alerts_history = [a for a in self.alerts_history if now - a["timestamp"] <= 900]
-        
+
         # Calculate confluence score
         score, details, status, ob_imbalance, depth_age = self.scorer.evaluate_sweep(
             symbol, sweep_type, level, self.alerts_history, last_depth_ts
         )
-        
+
         # Format descriptive log message
         details_str = ", ".join(details["details"]) if details["details"] else "No confluence factors detected"
         notes = f"{sweep_type.upper()} Sweep @ {level:.2f} | Score: {score}/10 | [{details_str}]"
-        
+
         # Log to file, CSV, and show on terminal dashboard
         metrics_1m = self.metrics.get_metrics_for_window(symbol, "1m")
         self._trigger_event(
@@ -414,6 +491,7 @@ class OrderFlowEngine:
                         "detection_time_ms": adapted.observation.detection_time_ms,
                     }
                 elif adapted.rejected is not None:
+                    self.rejected_input_count += 1
                     if self.liquidity_recorder:
                         self.liquidity_recorder.enqueue(adapted.rejected)
             except Exception as e:
@@ -428,7 +506,7 @@ class OrderFlowEngine:
             m1m = self.metrics.get_metrics_for_window(symbol, "1m")
             m5m = self.metrics.get_metrics_for_window(symbol, "5m")
             m15m = self.metrics.get_metrics_for_window(symbol, "15m")
-            
+
             # Read-only components read directly from canonical stored decisions
             # DO NOT recompute scanner decisions from read-only consumers.
             decision = self.current_decisions.get(sym_lower)
@@ -448,7 +526,7 @@ class OrderFlowEngine:
                 a["type"] for a in self.alerts_history
                 if a["symbol"].lower() == sym_lower and (now - a["timestamp"]) <= 300.0
             ]
-            
+
             symbol_data[symbol] = {
                 "price": m1m.get("latest_price", 0.0),
                 "session_cvd_usdt": state.session_cvd_usdt,
@@ -460,7 +538,7 @@ class OrderFlowEngine:
                 "buy_ratio_5m": m5m.get("buy_ratio", 0.5),
                 "imbalance": state.bid_ask_imbalance,
                 "spread": state.spread,
-                
+
                 # Canonical scanner decisions
                 "next_action": decision["action"],
                 "decision_reason": decision["reason"],
@@ -470,7 +548,7 @@ class OrderFlowEngine:
                 "action_version": decision["action_version"],
                 "active_sweep": decision["active_sweep"],
                 "recent_events": recent_events,
-                
+
                 "last_large_trade_time": state.last_large_trade_time,
                 "last_event_time": state.last_event_time,
                 "latest_event": state.latest_event,
@@ -487,11 +565,11 @@ class OrderFlowEngine:
         prev_decision = self.current_decisions.get(sym_lower)
         previous_action = prev_decision["action"] if prev_decision else "WARMING_UP"
         action_version = prev_decision["action_version"] if prev_decision else 0
-        
+
         # Increment action version only if the action changes
         if decision["action"] != previous_action:
             action_version += 1
-            
+
         # Check transition cooldown condition:
         # A cooldown starts ONLY when a new confirmed signal transition is committed
         is_new_confirmation = (
@@ -499,10 +577,10 @@ class OrderFlowEngine:
             and decision["action"] in ("CONFIRMED_LONG", "CONFIRMED_SHORT")
             and previous_action != decision["action"]
         )
-        
+
         if is_new_confirmation:
             self.cooldown_ends[sym_lower] = now + 180.0 # COOLDOWN_DURATION_SECONDS
-            
+
         # Update canonical current_decisions dictionary
         # DO NOT recompute scanner decisions from read-only consumers.
         self.current_decisions[sym_lower] = {
@@ -514,7 +592,7 @@ class OrderFlowEngine:
             "action_version": action_version,
             "active_sweep": decision["active_sweep"]
         }
-        
+
         # Mirror gates in scorer for backward compatibility
         self.scorer.symbol_gates[sym_lower] = decision["gates"]
 
@@ -525,7 +603,7 @@ class OrderFlowEngine:
             request = data.decode("utf-8", errors="ignore")
             if not request:
                 return
-                
+
             lines = request.split("\r\n")
             if not lines:
                 return
@@ -579,12 +657,12 @@ class OrderFlowEngine:
                         symbol = body.get("symbol", "").lower()
                         side = body.get("side", "").upper()
                         qty = float(body.get("quantity", 0.0))
-                        
+
                         price = self.metrics.get_metrics_for_window(symbol, "1m").get("latest_price", 0.0)
                         if price <= 0:
                             state = self.metrics.get_state(symbol)
                             price = (state.best_bid + state.best_ask) / 2.0 if (state.best_bid + state.best_ask) > 0 else 0.0
-                            
+
                         if price <= 0:
                             response = self._json_response({"ok": False, "error": f"No mark price available for {symbol.upper()}"}, "400 Bad Request")
                         else:
@@ -636,7 +714,7 @@ class OrderFlowEngine:
                             for q in parts[1].split("&"):
                                 if q.startswith("sym="):
                                     sym_name = q.split("=")[1].lower()
-                    
+
                     state = self.metrics.get_state(sym_name)
                     hist_snapshots = []
                     for ts, bids, asks in list(state.stacking_pulling.history)[-300:]:
@@ -645,7 +723,7 @@ class OrderFlowEngine:
                             "bids": bids,
                             "asks": asks
                         })
-                        
+
                     recent_trades = []
                     for t in list(state.trades)[-200:]:
                         recent_trades.append({
@@ -655,7 +733,7 @@ class OrderFlowEngine:
                             "side": t.aggressor_side,
                             "notional": t.notional
                         })
-                        
+
                     payload = {
                         "symbol": sym_name,
                         "price": state.best_bid if state.best_bid > 0 else 0.0,
@@ -673,7 +751,7 @@ class OrderFlowEngine:
                         "book_history": hist_snapshots,
                         "trades": recent_trades,
                         "active_walls": state.wall_tracker.get_active_walls(
-                            (state.best_bid + state.best_ask)/2.0 if (state.best_bid + state.best_ask) > 0 else 1.0, 
+                            (state.best_bid + state.best_ask)/2.0 if (state.best_bid + state.best_ask) > 0 else 1.0,
                             state.bid_depth_top5_usdt if state.bid_depth_top5_usdt > 0 else 1.0
                         )
                     }
@@ -721,24 +799,24 @@ class OrderFlowEngine:
                 elif path == "/api":
                     trade_status = self.stream.get_status()
                     depth_status = self.depth_stream.get_status()
-                    
+
                     now_time = time.time()
                     guardian_status = "HEALTHY"
                     unsafe_symbols = []
                     degraded_symbols = []
-                    
+
                     for sym in SYMBOLS:
                         safety_obj = self.metrics.get_market_data_safety(sym, now_time)
                         if not safety_obj["safe"]:
                             unsafe_symbols.append(sym.upper())
                         elif safety_obj["trade_status"] == "DEGRADED" or safety_obj["depth_status"] == "DEGRADED":
                             degraded_symbols.append(sym.upper())
-                            
+
                     if unsafe_symbols:
                         guardian_status = "UNSAFE"
                     elif degraded_symbols:
                         guardian_status = "DEGRADED"
-                    
+
                     if self.dashboard.is_multi:
                         symbols_payload = {}
                         for sym in SYMBOLS:
@@ -747,15 +825,15 @@ class OrderFlowEngine:
                             m1m = self.metrics.get_metrics_for_window(sym, "1m")
                             m5m = self.metrics.get_metrics_for_window(sym, "5m")
                             m15m = self.metrics.get_metrics_for_window(sym, "15m")
-                            
+
                             # Read canonical decision
                             decision = self.current_decisions.get(sym_lower)
                             bias_action = decision["action"]
-                            
+
                             self.metrics.check_duplication(sym, m5m, m15m)
                             mid_price = (state.best_bid + state.best_ask) / 2.0
                             safety_obj = self.metrics.get_market_data_safety(sym, now_time)
-                            
+
                             symbols_payload[sym] = {
                                 "price": m1m.get("latest_price", 0.0),
                                 "session_cvd_usdt": state.session_cvd_usdt,
@@ -799,7 +877,7 @@ class OrderFlowEngine:
                                 "active_walls": state.wall_tracker.get_active_walls(mid_price, state.bid_depth_top5_usdt),
                                 "regime": self.regime_engine.get_regime_state(sym)
                             }
-                        
+
                         current_prices = {s: self.metrics.get_metrics_for_window(s, "1m").get("latest_price", 0.0) for s in SYMBOLS}
                         payload = {
                             "is_multi": True,
@@ -821,10 +899,10 @@ class OrderFlowEngine:
                         m5m = self.metrics.get_metrics_for_window(sym, "5m")
                         m15m = self.metrics.get_metrics_for_window(sym, "15m")
                         state = self.metrics.get_state(sym)
-                        
+
                         decision = self.current_decisions.get(sym_lower)
                         bias_action = decision["action"]
-                        
+
                         payload = {
                             "is_multi": False,
                             "trade_ws_status": trade_status,
@@ -848,7 +926,7 @@ class OrderFlowEngine:
                             "binance_context": self.binance_context.get_context().get("symbols", {}).get(sym.upper(), {}),
                             "binance_context_status": self.binance_context.get_status()
                         }
-                        
+
                     response = self._json_response(payload)
                 elif path == "/":
                     body = self.dashboard.render_html()
@@ -938,11 +1016,11 @@ class OrderFlowEngine:
     async def run(self):
         logger.info(f"Starting Order Flow Engine V2.5 (Radar Universe: {len(SYMBOLS)} symbols)...")
 
-        
+
         # Start HTTP server on the configured stable dashboard port.
         port = config.WEB_DASHBOARD_PORT
         http_server = await asyncio.start_server(self._handle_http_client, '127.0.0.1', port)
-        
+
         # Log web address
         logger.info(f"Web Dashboard started at http://localhost:{port}")
         print(f"\n=======================================================")
@@ -995,10 +1073,10 @@ class OrderFlowEngine:
         while True:
             try:
                 symbol, trade = await self.trade_queue.get()
-                
+
                 # Add to sliding window metrics specifically for this symbol
                 alerts = self.metrics.add_trade(symbol, trade)
-                
+
                 # Feed trade to TICS Regime Engine
                 self.regime_engine.on_trade(symbol, trade)
 
@@ -1006,30 +1084,80 @@ class OrderFlowEngine:
                 if self.liquidity_engine:
                     try:
                         from liquidity_event import AggressorSide, MarketTrade, TradeCoverage
-                        trade_p_raw = trade.get("p") if trade.get("p") is not None else trade.get("price", "0")
-                        trade_q_raw = trade.get("q") if trade.get("q") is not None else trade.get("quantity", "0")
+
+                        trade_p_raw = trade.get("price") if trade.get("price") is not None else trade.get("p")
+                        if trade_p_raw is None or trade_p_raw == "":
+                            logger.warning(f"Rejecting malformed trade missing price for {symbol}: {trade}")
+                            self.trade_queue.task_done()
+                            continue
                         trade_price = Decimal(str(trade_p_raw))
+
+                        trade_q_raw = trade.get("quantity") if trade.get("quantity") is not None else trade.get("q")
+                        if trade_q_raw is None or trade_q_raw == "":
+                            logger.warning(f"Rejecting malformed trade missing quantity for {symbol}: {trade}")
+                            self.trade_queue.task_done()
+                            continue
                         trade_qty = Decimal(str(trade_q_raw))
-                        trade_time = int(trade.get("T") or trade.get("E") or trade.get("time") or int(time.time() * 1000))
-                        seq_id = trade.get("a") or trade.get("trade_id") or trade.get("sequence_id") or 0
-                        is_buyer_maker = trade.get("m", False)
-                        side = AggressorSide.SELL if is_buyer_maker else AggressorSide.BUY
+
+                        trade_time_ms = trade.get("trade_time_ms")
+                        if trade_time_ms is None and "T" in trade:
+                            trade_time_ms = trade["T"]
+                        if trade_time_ms is None or isinstance(trade_time_ms, bool):
+                            logger.warning(f"Rejecting malformed trade missing exchange timestamp for {symbol}: {trade}")
+                            self.trade_queue.task_done()
+                            continue
+                        trade_time_ms = int(trade_time_ms)
+
+                        seq_id = trade.get("aggregate_trade_id")
+                        if seq_id is None and "a" in trade:
+                            seq_id = trade["a"]
+                        if seq_id is None:
+                            logger.warning(f"Rejecting malformed trade missing sequence ID for {symbol}: {trade}")
+                            self.trade_queue.task_done()
+                            continue
+
+                        if "side" in trade:
+                            side_str = str(trade["side"]).upper()
+                            if side_str == "BUY":
+                                side = AggressorSide.BUY
+                            elif side_str == "SELL":
+                                side = AggressorSide.SELL
+                            else:
+                                logger.warning(f"Rejecting malformed trade invalid side {side_str} for {symbol}")
+                                self.trade_queue.task_done()
+                                continue
+                        elif "m" in trade:
+                            side = AggressorSide.SELL if trade["m"] else AggressorSide.BUY
+                        else:
+                            logger.warning(f"Rejecting malformed trade missing side for {symbol}: {trade}")
+                            self.trade_queue.task_done()
+                            continue
 
                         m_trade = MarketTrade(
                             symbol=symbol.upper(),
                             price=trade_price,
                             quantity=trade_qty,
                             aggressor_side=side,
-                            exchange_time_ms=trade_time,
+                            exchange_time_ms=trade_time_ms,
                             sequence_id=seq_id,
                         )
 
                         safety_obj = self.metrics.get_market_data_safety(symbol, time.time())
                         t_status = safety_obj.get("trade_status", "HEALTHY")
                         feed_safe = safety_obj.get("safe", True) and t_status == "HEALTHY"
+                        known_gap = (t_status == "UNSAFE")
+
+                        if self.liquidity_coverage_provider:
+                            self.liquidity_coverage_provider.record_trade(
+                                symbol=symbol.upper(),
+                                exchange_time_ms=trade_time_ms,
+                                feed_safe=feed_safe,
+                                known_gap=known_gap,
+                            )
+
                         trade_cov = TradeCoverage(
                             feed_safe=feed_safe,
-                            known_gap=(t_status == "UNSAFE"),
+                            known_gap=known_gap,
                             buffer_overflow=False,
                             unresolved_sequence=False,
                             interval_retained=True,
@@ -1037,7 +1165,7 @@ class OrderFlowEngine:
                         self.liquidity_engine.on_trade(m_trade, trade_cov)
                     except Exception as e:
                         logger.error(f"Error forwarding trade to liquidity engine: {e}", exc_info=True)
-                
+
                 # Feed price to outcomes tracker
                 trade_price = float(trade.get("p", 0.0) or trade.get("price", 0.0) or 0.0)
                 if trade_price > 0:
@@ -1075,23 +1203,23 @@ class OrderFlowEngine:
                 logger.error(f"Error in trade processing loop: {e}", exc_info=True)
                 await asyncio.sleep(1)
 
-    def _trigger_event(self, symbol: str, event_type: str, window: str, metrics: dict, notes: str, 
+    def _trigger_event(self, symbol: str, event_type: str, window: str, metrics: dict, notes: str,
                        sweep_id: str = "", source_sweep_time: str = "",
                        confluence_score: Optional[int] = None, matched_conditions: str = "",
                        order_book_imbalance_at_score: Optional[float] = None,
                        depth_snapshot_age_ms: Optional[float] = None):
         """Logs event to CSV, updates the dashboard events, and respects cooldown per symbol:event."""
         now = time.time()
-        
+
         # Track event cooldown key: symbol:event:window
         c_key = f"{symbol.lower()}:{event_type}:{window}"
-        
+
         # Exclude LARGE_TRADE and confluences from standard cooldown checks
         if event_type not in ["LARGE_TRADE", "SWEEP_CONFLUENCE", "LOW_CONFLUENCE"]:
             last_time = self.last_triggered.get(c_key, 0.0)
             last_price = self.last_triggered_price.get(c_key, 0.0)
             current_price = metrics.get("latest_price", 0.0)
-            
+
             # Bypass cooldown if price has changed by >= 0.05%
             price_moved_significantly = False
             if last_price > 0 and current_price > 0:
@@ -1099,7 +1227,7 @@ class OrderFlowEngine:
 
             if now - last_time < EVENT_COOLDOWN_SECONDS and not price_moved_significantly:
                 return  # Cooldown active, discard duplicate alert
-                
+
             self.last_triggered[c_key] = now
             self.last_triggered_price[c_key] = current_price
 
@@ -1141,10 +1269,10 @@ class OrderFlowEngine:
     def _run_auto_paper_trade(self, symbol: str, price: float, action: str):
         if not self.paper_trader.auto_trade_enabled:
             return
-            
+
         symbol = symbol.lower()
         pos = self.paper_trader.positions.get(symbol)
-        
+
         # Determine if we should exit current position
         if pos:
             should_close = False
@@ -1153,7 +1281,7 @@ class OrderFlowEngine:
                 profit_pct = (price - pos["entry_price"]) / pos["entry_price"]
             else:
                 profit_pct = (pos["entry_price"] - price) / pos["entry_price"]
-                
+
             if profit_pct >= 0.01:
                 should_close = True
                 logger.info(f"[AUTO PAPER TRADE] 1% Profit Target hit for {symbol.upper()}! Closing position at {price} (Entry: {pos['entry_price']})")
@@ -1164,12 +1292,12 @@ class OrderFlowEngine:
                 should_close = True
             elif pos["side"] == "SELL" and action in ("CONFIRMED_LONG", "LONG (SWEEP)", "LONG_BIAS", "WATCH_LONG"):
                 should_close = True
-                
+
             if should_close:
                 close_side = "SELL" if pos["side"] == "BUY" else "BUY"
                 self.paper_trader.execute_order(symbol, close_side, pos["qty"], price)
                 logger.info(f"[AUTO PAPER TRADE] Closed position for {symbol.upper()} at {price} due to exit condition.")
-                
+
         # Determine if we should open a new position
         pos = self.paper_trader.positions.get(symbol)
         if not pos:
@@ -1189,37 +1317,37 @@ class OrderFlowEngine:
             # 3. Data integrity validation
             if symbol_state.duplication_suspected:
                 return
-                
+
             # Highest Probability Entry Filters (Confluence Alignment):
             metrics_5m = self.metrics.get_metrics_for_window(symbol, "5m")
             buy_ratio_5m = metrics_5m.get("buy_ratio", 0.5)
             imbalance = symbol_state.bid_ask_imbalance
             cvd = symbol_state.session_cvd_usdt
-            
+
             is_high_prob_long = (
                 action in ("CONFIRMED_LONG", "LONG (SWEEP)", "LONG_BIAS")
                 and buy_ratio_5m >= 0.58
                 and imbalance >= 0.20
                 and cvd > 0
             )
-            
+
             is_high_prob_short = (
                 action in ("CONFIRMED_SHORT", "SHORT (SWEEP)", "SHORT_BIAS")
                 and buy_ratio_5m <= 0.42
                 and imbalance <= -0.20
                 and cvd < 0
             )
-            
+
             current_prices = {s: self.metrics.get_metrics_for_window(s, "1m").get("latest_price", 0.0) for s in SYMBOLS}
             current_prices[symbol] = price
-            
+
             state = self.paper_trader.get_portfolio_state(current_prices)
             equity = state["equity"]
-            
+
             # Simple trade sizing: 10% of equity, with 5x leverage
             trade_size_usdt = equity * 0.10 * 5.0
             qty = trade_size_usdt / price
-            
+
             if is_high_prob_long:
                 self.paper_trader.execute_order(symbol, "BUY", qty, price)
                 logger.info(f"[AUTO PAPER TRADE] Opened HIGH PROBABILITY LONG for {symbol.upper()} at {price} (Qty: {qty:.4f})")
@@ -1231,25 +1359,25 @@ class OrderFlowEngine:
         """Periodically refreshes the dashboard UI and runs slower event checks per symbol."""
         # Wait a moment for trades to start flowing
         await asyncio.sleep(2)
-        
+
         with Live(self.dashboard.layout, refresh_per_second=1, screen=True) as live:
             while True:
                 try:
                     self.scanner_cycle_id += 1
                     trade_ws_status = self.stream.get_status()
                     depth_ws_status = self.depth_stream.get_status()
-                    
+
                     symbol_data = {}
-                    
+
                     # 1. Evaluate metrics and signals per symbol
                     for symbol in SYMBOLS:
                         state = self.metrics.get_state(symbol)
                         metrics_1m = self.metrics.get_metrics_for_window(symbol, "1m")
                         metrics_5m = self.metrics.get_metrics_for_window(symbol, "5m")
                         metrics_15m = self.metrics.get_metrics_for_window(symbol, "15m")
-                        
+
                         price = metrics_1m.get("latest_price", 0.0)
-                        
+
                         if price > 0:
                             # Ticker updates on tracker
                             self.signal_tracker.update_price(symbol, price)
@@ -1270,7 +1398,7 @@ class OrderFlowEngine:
 
                             # 3. Check Absorption (1m and 5m)
                             imbalance = state.bid_ask_imbalance
-                            
+
                             abs_1m = self.detector.check_absorption(symbol, state.trades, 60)
                             if abs_1m[0]:
                                 raw_type = abs_1m[0]
@@ -1373,7 +1501,7 @@ class OrderFlowEngine:
                         m1m = self.metrics.get_metrics_for_window(sym, "1m")
                         m5m = self.metrics.get_metrics_for_window(sym, "5m")
                         m15m = self.metrics.get_metrics_for_window(sym, "15m")
-                        
+
                         live.update(self.dashboard.render(
                             price=sym_data["price"],
                             running_cvd=state.running_cvd_usdt,
@@ -1409,7 +1537,7 @@ class OrderFlowEngine:
             logger.info(f"AI Auto-Interpretation loop active. Run cadence: {config.AI_INTERVAL_SECONDS} seconds.")
         else:
             logger.info("AI Auto-Interpretation loop disabled (AI_ENABLED=false).")
-        
+
         while True:
             try:
                 if not self.ai_runtime_config.enabled:
@@ -1427,7 +1555,7 @@ class OrderFlowEngine:
                 break
             except Exception as e:
                 logger.error(f"Error in AI interpretation loop: {e}", exc_info=True)
-            
+
             await asyncio.sleep(config.AI_INTERVAL_SECONDS)
 
     async def _binance_context_loop(self):

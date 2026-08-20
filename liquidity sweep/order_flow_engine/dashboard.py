@@ -32,11 +32,11 @@ class OrderFlowDashboard:
         self.layout = Layout()
         self.symbols = [s.lower() for s in symbols]
         self.is_multi = len(self.symbols) > 1
-        
+
         # Historical lists across all tracked symbols
         self.recent_events = collections.deque(maxlen=10)
         self.recent_large_trades = collections.deque(maxlen=10)
-        
+
         # Setup initial layout structure
         if self.is_multi:
             self._setup_layout_multi()
@@ -93,11 +93,11 @@ class OrderFlowDashboard:
         cache_file = os.path.join(os.path.dirname(__file__), "ai_cache.json")
         ai_text = Text()
         ai_text.append("AI Market Summary:\n", style="bold yellow")
-        
+
         if not os.path.exists(cache_file):
             ai_text.append("  No AI interpretations generated yet.\n", style="dim gray")
             return Panel(ai_text, border_style="magenta", title="AI Interpretation")
-            
+
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -110,40 +110,40 @@ class OrderFlowDashboard:
                     ai_text.append(Text.from_markup(f"  [yellow]Fallback at:[/] {data.get('fallback_at')}\n"))
             else:
                 ai_text.append(f"  Cache: {cache_ts}\n")
-                
+
             if not data.get("ok", False):
                 ai_text.append(Text.from_markup(f"  [red]Error:[/] {data.get('error', 'AI inactive')}\n"))
                 return Panel(ai_text, border_style="magenta", title="AI Interpretation")
-                
+
             interpretation = data.get("interpretation", {})
             regime = interpretation.get("regime", "mixed").upper()
             risk = interpretation.get("overall_risk", "medium").upper()
-            
+
             risk_color = "green" if risk == "LOW" else ("yellow" if risk == "MEDIUM" else "red")
-            
+
             ai_text.append(Text.from_markup(f"  Regime: [cyan]{regime}[/]  |  Risk: [{risk_color}]{risk}[/]\n\n"))
             summary = interpretation.get("market_summary", "No summary.")
-            
+
             # Wrap summary text cleanly
             ai_text.append(f"{summary}\n", style="white")
-            
+
             cleanest = interpretation.get("cleanest_bias_symbols", [])
             if cleanest:
                 clean_str = ", ".join([s.replace("USDT", "") for s in cleanest])
                 ai_text.append(Text.from_markup(f"\n  Cleanest: [green]{clean_str}[/]\n"))
 
-                
+
         except Exception as e:
             ai_text.append(f"  Failed to parse cache: {str(e)}\n", style="red")
-            
+
         return Panel(ai_text, border_style="magenta", title="AI Interpretation")
 
-    def render(self, price: float, running_cvd: float, session_cvd: float, 
+    def render(self, price: float, running_cvd: float, session_cvd: float,
                 metrics_1m: dict, metrics_5m: dict, metrics_15m: dict,
                 best_bid: float = 0.0, best_ask: float = 0.0, spread: float = 0.0,
                 bid_depth: float = 0.0, ask_depth: float = 0.0, imbalance: float = 0.0,
                 microprice: float = 0.0,
-                burst_status: Optional[dict] = None, 
+                burst_status: Optional[dict] = None,
                 absorption_status_1m: Tuple[Optional[str], str] = (None, ""),
                 absorption_status_5m: Tuple[Optional[str], str] = (None, ""),
                 divergence_status: Tuple[Optional[str], str] = (None, ""),
@@ -157,7 +157,7 @@ class OrderFlowDashboard:
         header_text.append("ORDER FLOW SCANNER V2.5  ", style="bold cyan")
         header_text.append("|  BINANCE USD-M FUTURES  ", style="dim white")
         header_text.append(f"|  {self.symbols[0].upper()}  \n", style="bold yellow")
-        
+
         # Current Aggression estimation based on 5m buy ratio
         ratio_5m = metrics_5m.get("buy_ratio", 0.5)
         if ratio_5m >= 0.58:
@@ -214,7 +214,7 @@ class OrderFlowDashboard:
         # --- 3. ORDER BOOK PANEL ---
         ob_text = Text()
         ob_text.append("Order Book Pressure (Top 5 Levels in USDT Notional):\n", style="bold cyan")
-        
+
         # Color coding the imbalance value
         if imbalance >= 0.15:
             imbalance_style = "bold green"
@@ -227,7 +227,7 @@ class OrderFlowDashboard:
         ob_text.append(f"  Bid Depth top-5 ($): {format_usdt(bid_depth)}  |  Ask Depth top-5 ($): {format_usdt(ask_depth)}\n", style="white")
         ob_text.append(f"  Bid/Ask Imbalance: [{imbalance_style}]{imbalance:+.4f}[/{imbalance_style}]  |  ", style="white")
         ob_text.append(f"Microprice: {microprice:,.2f} USD\n", style="bold yellow")
-        
+
         # Visual progress bar for imbalance
         bar_length = 40
         num_green = int((imbalance + 1.0) / 2.0 * bar_length)
@@ -246,9 +246,9 @@ class OrderFlowDashboard:
         for lt in reversed(self.recent_large_trades):
             alerts_text.append(Text.from_markup(f"  {lt}\n"))
 
-        
+
         alerts_text.append("\nOrder Flow State Alerts:\n", style="bold yellow")
-        
+
         # Trade Burst
         if burst_status:
             alerts_text.append(
@@ -262,7 +262,7 @@ class OrderFlowDashboard:
         if abs_1m_type:
             color = "green" if "BULLISH" in abs_1m_type else "red"
             alerts_text.append(f"  ⚠️ [bold {color}]{abs_1m_type} (1m)[/bold {color}] detected!\n")
-        
+
         # Absorption 5m
         abs_5m_type, abs_5m_notes = absorption_status_5m
         if abs_5m_type:
@@ -290,11 +290,11 @@ class OrderFlowDashboard:
                 footer_text.append(f"  {ev}\n")
 
         self.layout["footer"].update(Panel(footer_text, border_style="red"))
-        
+
         return self.layout
 
-    def render_multi(self, symbol_data: Dict[str, dict], 
-                      trade_ws_status: str = "DISCONNECTED", 
+    def render_multi(self, symbol_data: Dict[str, dict],
+                      trade_ws_status: str = "DISCONNECTED",
                       depth_ws_status: str = "DISCONNECTED") -> Layout:
         """
         Renders the multi-symbol radar table sorted by USDT notional activity score.
@@ -304,7 +304,7 @@ class OrderFlowDashboard:
         header_text.append("ORDER FLOW SCANNER V3.0  ", style="bold cyan")
         header_text.append("|  BINANCE USD-M FUTURES  ", style="dim white")
         header_text.append(f"|  TOP {len(self.symbols)} RADAR (Normalized)\n", style="bold yellow")
-        
+
         # Aggregate states across active symbols
         all_synced = True
         any_gap = False
@@ -358,17 +358,17 @@ class OrderFlowDashboard:
             d5_usdt = data.get("delta_5m_usdt", 0.0)
             imb = data.get("imbalance", 0.0)
             action = data.get("next_action", "WAITING")
-            
+
             # score bonuses
             large_trade_age = now - data.get("last_large_trade_time", 0.0)
             lt_bonus = 50.0 if large_trade_age <= 60 else 0.0
-            
+
             event_age = now - data.get("last_event_time", 0.0)
             ev_bonus = 100.0 if event_age <= 60 else 0.0
 
             # Huge bonus to place active sweep confluences at the top of the radar
             sweep_bonus = 500.0 if "SWEEP" in action else 0.0
-            
+
             # Activity Score = |1m_delta_usdt| / 10000 + |5m_delta_usdt| / 25000 + |imbalance|*100 + bonuses
             score = abs(d1_usdt) / 10000.0 + abs(d5_usdt) / 25000.0 + abs(imb) * 100.0 + lt_bonus + ev_bonus + sweep_bonus
             ranked_symbols.append((score, symbol, data))
@@ -382,7 +382,7 @@ class OrderFlowDashboard:
                 price_str = f"{price:,.2f}"
             else:
                 price_str = f"{price:.4f}"
-                
+
             # Aggression
             r5m = data.get("buy_ratio_5m", 0.5)
             if r5m >= 0.58:
@@ -391,12 +391,12 @@ class OrderFlowDashboard:
                 aggression = "[bold red]SELLERS[/bold red]"
             else:
                 aggression = "[yellow]NEUTRAL[/yellow]"
-                
+
             # Delta fields (Formatted in compact USDT format)
             m1 = data.get("metrics_1m", {})
             m5 = data.get("metrics_5m", {})
             m15 = data.get("metrics_15m", {})
-            
+
             if m1.get("status") == "WARMING_UP":
                 d1_str = f"[yellow]{m1.get('warmup_text')}[/yellow]"
             else:
@@ -414,16 +414,16 @@ class OrderFlowDashboard:
             else:
                 d15 = m15.get("delta_usdt", 0.0)
                 d15_str = f"[green]+{format_usdt(d15)}[/green]" if d15 >= 0 else f"[red]{format_usdt(d15)}[/red]"
-            
+
             # Ratios
             b1 = data.get("buy_ratio_1m", 0.5) * 100.0
             s1 = data.get("sell_ratio_1m", 0.5) * 100.0
             ratio_str = f"[green]{b1:.0f}[/green]/[red]{s1:.0f}[/red]"
-            
+
             # CVD
             cvd = data.get("session_cvd_usdt", 0.0)
             cvd_str = f"[green]{format_usdt(cvd)}[/green]" if cvd >= 0 else f"[red]{format_usdt(cvd)}[/red]"
-            
+
             # Imbalance formatting
             imb = data.get("imbalance", 0.0)
             if abs(imb) >= 0.15:
@@ -431,7 +431,7 @@ class OrderFlowDashboard:
                 imb_str = f"[{imb_color}]{imb:+.2f}[/{imb_color}]"
             else:
                 imb_str = f"[dim]{imb:+.2f}[/dim]"
-                
+
             # Style the Next Action Suggestion Column
             action = data.get("next_action", "WAITING")
             if action == "LONG (SWEEP)":
@@ -444,9 +444,9 @@ class OrderFlowDashboard:
                 action_str = "[red]SHORT_BIAS[/red]"
             else:
                 action_str = "[dim]WAITING[/dim]"
-                
+
             latest_ev = "[bold red]WINDOW_DUPLICATION_SUSPECTED[/bold red]" if data.get("duplication_suspected") else data.get("latest_event", "")
-            
+
             table.add_row(
                 sym.upper().replace("USDT", ""),
                 price_str,
@@ -471,7 +471,7 @@ class OrderFlowDashboard:
         for lt in list(self.recent_large_trades)[-5:]:
             alerts_text.append(Text.from_markup(f"  {lt}\n"))
 
-            
+
         alerts_text.append("\nOrder Book Stale Check:\n", style="bold yellow")
         for symbol in self.symbols:
             data = symbol_data.get(symbol, {})
@@ -498,7 +498,7 @@ class OrderFlowDashboard:
                 footer_text.append(f"  {ev}\n")
 
         self.layout["footer"].update(Panel(footer_text, border_style="red"))
-        
+
         return self.layout
 
     def render_html(self) -> str:
@@ -658,7 +658,7 @@ class OrderFlowDashboard:
         .neutral { color: var(--yellow); }
         .bold { font-weight: bold; }
         .dim { color: var(--text-muted); opacity: 0.6; }
-        
+
         .list-items {
             list-style: none;
             padding: 0;
@@ -740,7 +740,7 @@ class OrderFlowDashboard:
         .badge.low { color: var(--green); border-color: var(--green); }
         .badge.medium { color: var(--yellow); border-color: var(--yellow); }
         .badge.high { color: var(--red); border-color: var(--red); }
-        
+
         .badge.regime-trending { color: var(--primary); border-color: var(--primary); }
         .badge.regime-choppy { color: var(--yellow); border-color: var(--yellow); }
         .badge.regime-absorbing { color: var(--magenta); border-color: var(--magenta); }
@@ -770,7 +770,7 @@ class OrderFlowDashboard:
         .health-healthy { color: var(--green); border-color: var(--green); background: rgba(0, 230, 115, 0.05); }
         .health-degraded { color: var(--yellow); border-color: var(--yellow); background: rgba(255, 204, 0, 0.05); }
         .health-bad { color: var(--red); border-color: var(--red); background: rgba(255, 51, 51, 0.05); }
-        
+
         .ai-sym-grid {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1016,15 +1016,15 @@ class OrderFlowDashboard:
         }
         #ai-refresh-btn,
         .ai-action-btn {
-            background: var(--primary); 
-            color: #0f172a; 
-            border: none; 
-            padding: 6px 12px; 
-            border-radius: 8px; 
-            font-family: inherit; 
-            font-size: 12px; 
-            font-weight: 600; 
-            cursor: pointer; 
+            background: var(--primary);
+            color: #0f172a;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-family: inherit;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
             transition: all 0.2s ease;
             min-height: 32px;
         }
@@ -1179,7 +1179,7 @@ class OrderFlowDashboard:
                 padding: 9px 7px;
                 }
         }
-        
+
         /* Notification & Alerts Panel Styles */
         .panel-header-flex {
             display: flex;
@@ -1290,7 +1290,7 @@ class OrderFlowDashboard:
         .alert-sell .alert-badge { background: rgba(255, 23, 68, 0.2); }
         .alert-watch-long .alert-badge { background: rgba(255, 215, 0, 0.15); }
         .alert-watch-short .alert-badge { background: rgba(255, 140, 0, 0.15); }
-        
+
         .alert-symbol {
             font-weight: bold;
             color: var(--text);
@@ -1299,7 +1299,7 @@ class OrderFlowDashboard:
             color: var(--text-muted);
             font-size: 11px;
         }
-        
+
         /* Custom Toast Container */
         #toast-container {
             position: fixed;
@@ -1563,7 +1563,7 @@ class OrderFlowDashboard:
                         <span>AI Market Read</span>
                         <button id="ai-refresh-btn" onclick="triggerAiRefresh()">Refresh AI</button>
                     </div>
-                    
+
                     <div class="ai-meta">
                         Provider: <span id="ai-provider" class="bold" style="color: var(--text-main);">-</span> | Model: <span id="ai-model" class="bold" style="color: var(--text-main);">-</span>
                     </div>
@@ -1572,20 +1572,20 @@ class OrderFlowDashboard:
                     </div>
                     <div id="ai-cache-state" class="ai-cache-state stale">AI cache: unknown</div>
                     <div id="ai-sync-warning" class="ai-detail-warning"></div>
-                    
+
                     <div class="ai-meta-badges">
                         <span id="ai-regime-badge" class="badge">Regime: -</span>
                         <span id="ai-risk-badge" class="badge">Risk: -</span>
                     </div>
-                    
+
                     <div class="ai-section-title">Market Summary</div>
                     <p id="ai-summary">Waiting for AI summary data...</p>
-                    
+
                     <div class="ai-section-title">Cleanest Biases</div>
                     <div id="ai-cleanest-biases" class="ai-chip-list">
                         <span style="color: var(--text-muted);">None</span>
                     </div>
-                    
+
                     <div class="ai-section-title">Suppressed Signals</div>
                     <div id="ai-suppressed-signals" class="ai-chip-list">
                         <span style="color: var(--text-muted);">None</span>
@@ -1632,7 +1632,7 @@ class OrderFlowDashboard:
                         <button class="clear-alerts-btn" onclick="resetPaperTrader()">Reset Account ($10K)</button>
                     </div>
                 </div>
-                
+
                 <div class="paper-grid" style="display: grid; grid-template-columns: 1fr 1.5fr; gap: 20px;">
                     <!-- Left side: Portfolio Summary and Manual trade Form -->
                     <div style="display: flex; flex-direction: column; gap: 16px;">
@@ -1654,7 +1654,7 @@ class OrderFlowDashboard:
                                 <span id="paper-unrealized" style="font-weight: bold;">$0.00</span>
                             </div>
                         </div>
-                        
+
                         <!-- Manual Trade Entry Form -->
                         <div class="paper-order-form" style="background: var(--bg-base); padding: 16px; border-radius: 8px; border: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px;">
                             <div style="font-size: 13px; font-weight: bold; border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 4px;">Manual Execution Order</div>
@@ -1682,7 +1682,7 @@ class OrderFlowDashboard:
                             <div id="paper-order-msg" style="font-size: 11px; text-align: center; min-height: 14px; font-family: 'JetBrains Mono', monospace; font-weight: bold;"></div>
                         </div>
                     </div>
-                    
+
                     <!-- Right side: Active Positions and Trade Log -->
                     <div style="display: flex; flex-direction: column; gap: 12px; min-width: 0;">
                         <!-- Active Positions Table -->
@@ -1707,7 +1707,7 @@ class OrderFlowDashboard:
                                 </table>
                             </div>
                         </div>
-                        
+
                         <!-- Trade History logs -->
                         <div style="background: var(--bg-base); border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-width: 0; flex: 1;">
                             <div style="font-size: 13px; font-weight: bold; border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 6px;">Executions Log</div>
@@ -1757,7 +1757,7 @@ class OrderFlowDashboard:
                       <h2 id="modal-title" style="margin: 0; color: var(--primary); font-size: 24px;">SYMBOL DETAILS</h2>
                       <button onclick="closeSymbolDetails()" style="background: var(--red); color: white; border: none; border-radius: 6px; padding: 8px 20px; cursor: pointer; font-family: inherit; font-weight: bold; transition: opacity 0.2s;">CLOSE</button>
                  </div>
-                 
+
                  <div style="display: flex; gap: 24px;">
                       <!-- Left Column: Live Ladder -->
                       <div style="flex: 0 0 350px; background: var(--bg-base); border: 1px solid var(--border); border-radius: 8px; padding: 16px;">
@@ -1777,7 +1777,7 @@ class OrderFlowDashboard:
                                 </table>
                            </div>
                       </div>
-                      
+
                       <!-- Right Column: Interactive Heatmap -->
                       <div style="flex: 1; display: flex; flex-direction: column; gap: 16px;">
                            <div style="background: var(--bg-base); border: 1px solid var(--border); border-radius: 8px; padding: 16px; position: relative;">
@@ -1792,7 +1792,7 @@ class OrderFlowDashboard:
                                 <canvas id="heatmap-canvas" width="850" height="400" style="width: 100%; height: 400px; display: block; background: #080d1a; border-radius: 6px; border: 1px solid var(--border);"></canvas>
                                 <div id="heatmap-tooltip" style="position: absolute; display: none; background: rgba(15, 23, 42, 0.95); border: 1px solid var(--primary); padding: 8px; border-radius: 4px; font-size: 11px; z-index: 10; pointer-events: none; color: white; font-family: 'JetBrains Mono', monospace;"></div>
                            </div>
-                           
+
                            <!-- Microstructure Stats -->
                            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;">
                                 <div style="background: var(--bg-base); border: 1px solid var(--border); border-radius: 8px; padding: 12px; text-align: center;">
@@ -1883,22 +1883,22 @@ class OrderFlowDashboard:
             const aiBias = String(enriched.bias || 'WAITING');
             const scannerSymbol = scannerSymbolFor(symbol);
             const scannerAction = scannerSymbol.next_action || scannerActionFor(symbol, aiData) || 'WAITING';
-            
+
             enriched.scanner_data = scannerSymbol;
             enriched.binance_context = scannerSymbol.binance_context || enriched.binance_context || {};
             enriched.scanner_action = scannerAction;
-            
+
             const ignoreStates = ["WARMING_UP", "DATA_INVALID", "DATA_STALE"];
             if (aiBias !== scannerAction && !ignoreStates.includes(scannerAction)) {
                 enriched.ai_reported_bias = enriched.ai_reported_bias || aiBias;
                 enriched.ai_mismatch = true;
                 enriched.previous_ai_explanation = enriched.explanation;
-                
+
                 // Construct deterministic explanation
                 const reason = scannerSymbol.decision_reason || 'Flow candidate evaluation active';
                 const gates = scannerSymbol.check_gates || {};
                 const failedGates = Object.keys(gates).filter(k => gates[k] === 'FAIL');
-                
+
                 let gatesText = '';
                 if (failedGates.length > 0) {
                     gatesText = ' | Failed gates: ' + failedGates.join(', ');
@@ -1908,7 +1908,7 @@ class OrderFlowDashboard:
                 enriched.ai_mismatch = false;
                 enriched.ai_reported_bias = aiBias;
             }
-            
+
             // Derive bias for rendering from scanner_action to keep it authoritative
             enriched.bias = scannerAction;
             return enriched;
@@ -2222,7 +2222,7 @@ class OrderFlowDashboard:
             let anyGap = false;
             let anyResync = false;
             let anyWarming = false;
-            
+
             Object.keys(data.symbols || {}).forEach(sym => {
                 const s = data.symbols[sym];
                 if (s.book_state === 'SEQUENCE_GAP') anyGap = true;
@@ -2230,7 +2230,7 @@ class OrderFlowDashboard:
                 if (s.book_state !== 'HEALTHY') allSynced = false;
                 if (s.metrics_15m && s.metrics_15m.status === 'WARMING_UP') anyWarming = true;
             });
-            
+
             const bookStatusEl = document.getElementById('ws-book-status');
             if (bookStatusEl) {
                 if (anyGap) { bookStatusEl.innerText = 'SEQUENCE_GAP'; bookStatusEl.className = 'disconnected'; }
@@ -2238,13 +2238,13 @@ class OrderFlowDashboard:
                 else if (allSynced && Object.keys(data.symbols || {}).length > 0) { bookStatusEl.innerText = 'SYNCED'; bookStatusEl.className = 'connected'; }
                 else { bookStatusEl.innerText = 'INITIALISING'; bookStatusEl.className = 'disconnected'; }
             }
-            
+
             const winStatusEl = document.getElementById('ws-window-status');
             if (winStatusEl) {
                 if (anyWarming) { winStatusEl.innerText = 'WARMING'; winStatusEl.className = 'stale'; }
                 else { winStatusEl.innerText = 'VALID'; winStatusEl.className = 'connected'; }
             }
-            
+
             const contextStatusEl = document.getElementById('ws-context-status');
             if (contextStatusEl) {
                 if (data.binance_context_status && data.binance_context_status.ok) {
@@ -2255,7 +2255,7 @@ class OrderFlowDashboard:
                     contextStatusEl.className = 'disconnected';
                 }
             }
-            
+
             const aiStatusEl = document.getElementById('ws-ai-status');
             if (aiStatusEl) {
                 if (latestAiPayload && latestAiPayload.ok) {
@@ -2325,19 +2325,19 @@ class OrderFlowDashboard:
                 const d1mClass = d1mWarming ? 'neutral' : (d1m >= 0 ? 'positive' : 'negative');
                 const d5mClass = d5mWarming ? 'neutral' : (d5m >= 0 ? 'positive' : 'negative');
                 const d15mClass = d15mWarming ? 'neutral' : (d15m >= 0 ? 'positive' : 'negative');
-                
+
                 const imb = item.data.imbalance;
                 let imbClass = '';
                 if (Math.abs(imb) >= 0.15) {
                     imbClass = imb >= 0 ? 'positive' : 'negative';
                 }
-                
+
                 const r5m = item.data.metrics_5m.buy_ratio;
                 let aggression = 'NEUTRAL';
                 let aggClass = 'neutral';
                 if (r5m >= 0.58) { aggression = 'BUYERS'; aggClass = 'positive'; }
                 else if (r5m <= 0.42) { aggression = 'SELLERS'; aggClass = 'negative'; }
-                
+
                 const action = item.data.next_action || 'WAITING';
                 let actionClass = 'dim';
                 if (action === 'LONG (SWEEP)') actionClass = 'positive bold';
@@ -2346,21 +2346,21 @@ class OrderFlowDashboard:
                 else if (action === 'SHORT_BIAS') actionClass = 'negative';
                 const binanceCtx = item.data.binance_context || {};
                 const contextLabel = binanceCtx.context_confirm || 'INSUFFICIENT';
-                
+
                 const tradesHealth = item.data.trade_health_status || 'STALE';
                 const depthHealth = item.data.depth_health_status || 'STALE';
                 const bookSync = item.data.book_state || 'INITIALISING';
                 const windowHealth = d15mWarming ? 'WARMING' : 'VALID';
-                
+
                 const eventText = item.data.duplication_suspected ? 'WINDOW_DUPLICATION_SUSPECTED' : (item.data.latest_event || '-');
                 const eventStyle = item.data.duplication_suspected ? 'color: var(--red); font-weight: bold;' : 'color: var(--text-muted); font-weight: bold;';
-                
+
                 const regObj = item.data.regime || {};
                 const primaryRegime = regObj.primary_regime || 'UNKNOWN';
                 const confidence = regObj.confidence ? Math.round(regObj.confidence * 100) + '%' : '0%';
                 const volOverlay = regObj.volatility || 'UNKNOWN';
                 const liqOverlay = regObj.liquidity || 'UNKNOWN';
-                
+
                 const row = document.createElement('tr');
                 row.style.cursor = 'pointer';
                 row.onclick = () => selectSymbol(item.symbol);
@@ -2430,10 +2430,10 @@ class OrderFlowDashboard:
             if (latestAiPayload) {
                 updateAiUI(latestAiPayload, true);
             }
-            
+
             // Process real-time BUY/SELL notifications
             processSignalAlerts(data);
-            
+
             // Refresh paper trading UI
             updatePaperTraderUI(data);
         }
@@ -2608,21 +2608,21 @@ class OrderFlowDashboard:
 
         function processSignalAlerts(data) {
             if (!data || !data.symbols) return;
-            
+
             const includeWatch = document.getElementById('alert-watch').checked;
-            
+
             Object.keys(data.symbols).forEach(sym => {
                 const s = data.symbols[sym];
                 const symbolUpper = sym.toUpperCase();
                 const action = s.next_action || 'WAITING';
                 const lastAction = lastSignalStates[sym];
-                
+
                 // We only alert on transitions (when the action changes)
                 if (lastAction !== undefined && lastAction !== action) {
                     let triggerAlert = false;
                     let type = ''; // BUY, SELL, WATCH_LONG, WATCH_SHORT
                     let message = '';
-                    
+
                     if (action === 'CONFIRMED_LONG' || action === 'LONG (SWEEP)' || action === 'LONG_BIAS') {
                         triggerAlert = true;
                         type = 'BUY';
@@ -2642,12 +2642,12 @@ class OrderFlowDashboard:
                             message = `${symbolUpper} Watch Sell: Delta/Aggression turning bearish. Price: ${s.price}`;
                         }
                     }
-                    
+
                     if (triggerAlert) {
                         triggerSystemAlert(symbolUpper, type, message);
                     }
                 }
-                
+
                 // Save current state
                 lastSignalStates[sym] = action;
             });
@@ -2660,7 +2660,7 @@ class OrderFlowDashboard:
             if (noAlertsMsg) {
                 logContainer.innerHTML = '';
             }
-            
+
             const timeStr = new Date().toLocaleTimeString();
             const alertEl = document.createElement('div');
             alertEl.className = `alert-item alert-${type.toLowerCase().replace('_', '-')}`;
@@ -2673,7 +2673,7 @@ class OrderFlowDashboard:
                 <div class="alert-time">${timeStr}</div>
             `;
             logContainer.insertBefore(alertEl, logContainer.firstChild);
-            
+
             // Limit log history to last 50 items
             if (logContainer.children.length > 50) {
                 logContainer.lastChild.remove();
@@ -2701,9 +2701,9 @@ class OrderFlowDashboard:
                 if (audioCtx.state === 'suspended') {
                     audioCtx.resume();
                 }
-                
+
                 const now = audioCtx.currentTime;
-                
+
                 if (type === 'BUY') {
                     // C5 (523.25Hz) -> E5 (659.25Hz) ascending
                     playTone(523.25, 0.1, now);
@@ -2725,17 +2725,17 @@ class OrderFlowDashboard:
             if (!audioCtx) return;
             const osc = audioCtx.createOscillator();
             const gain = audioCtx.createGain();
-            
+
             osc.type = 'sine';
             osc.frequency.setValueAtTime(freq, startTime);
-            
+
             gain.gain.setValueAtTime(0.15, startTime);
             // Exponential decay to avoid clicking sounds
             gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
-            
+
             osc.connect(gain);
             gain.connect(audioCtx.destination);
-            
+
             osc.start(startTime);
             osc.stop(startTime + duration);
         }
@@ -2744,7 +2744,7 @@ class OrderFlowDashboard:
             const container = document.getElementById('toast-container');
             const toast = document.createElement('div');
             toast.className = `toast-item toast-${type.toLowerCase().replace('_', '-')}`;
-            
+
             toast.innerHTML = `
                 <div class="toast-header">
                     <span class="toast-title">${type} ALERT</span>
@@ -2752,9 +2752,9 @@ class OrderFlowDashboard:
                 </div>
                 <div class="toast-body">${message}</div>
             `;
-            
+
             container.appendChild(toast);
-            
+
             // Auto remove after 6 seconds
             setTimeout(() => {
                 toast.style.opacity = '0';
@@ -2771,7 +2771,7 @@ class OrderFlowDashboard:
                     checkbox.checked = false;
                     return;
                 }
-                
+
                 if (Notification.permission === "default") {
                     Notification.requestPermission().then(permission => {
                         if (permission !== "granted") {
@@ -2807,7 +2807,7 @@ class OrderFlowDashboard:
         function updatePaperTraderUI(data) {
             if (!data || !data.paper_portfolio) return;
             const p = data.paper_portfolio;
-            
+
             // 1. Initialize manual order entry symbols list once
             if (!paperSymbolSelectorInitialized && data.symbols) {
                 const selector = document.getElementById('paper-order-symbol');
@@ -2822,38 +2822,38 @@ class OrderFlowDashboard:
                     paperSymbolSelectorInitialized = true;
                 }
             }
-            
+
             // 2. Set auto-trade status badge
             const autoChk = document.getElementById('paper-auto-trade');
             if (autoChk && !togglingAutoTrade) autoChk.checked = Boolean(p.auto_trade_enabled);
-            
+
             // 3. Update stats card
             const nav = p.equity;
             const cash = p.cash;
             const realized = p.realized_pnl;
             const unrealized = p.unrealized_pnl;
-            
+
             const navEl = document.getElementById('paper-nav');
             if (navEl) {
                 navEl.innerText = '$' + nav.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
                 navEl.style.color = nav >= 10000.0 ? '#00e676' : '#ff1744';
             }
-            
+
             const cashEl = document.getElementById('paper-cash');
             if (cashEl) cashEl.innerText = '$' + cash.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' USDT';
-            
+
             const realEl = document.getElementById('paper-realized');
             if (realEl) {
                 realEl.innerText = (realized >= 0 ? '+' : '') + '$' + realized.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
                 realEl.style.color = realized >= 0 ? '#00e676' : '#ff1744';
             }
-            
+
             const unrealEl = document.getElementById('paper-unrealized');
             if (unrealEl) {
                 unrealEl.innerText = (unrealized >= 0 ? '+' : '') + '$' + unrealized.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
                 unrealEl.style.color = unrealized >= 0 ? '#00e676' : '#ff1744';
             }
-            
+
             // 4. Update Open Positions Table
             const tbody = document.getElementById('paper-positions-body');
             if (tbody) {
@@ -2864,10 +2864,10 @@ class OrderFlowDashboard:
                     p.positions.forEach(pos => {
                         const row = document.createElement('tr');
                         row.style.borderBottom = '1px solid rgba(255, 255, 255, 0.05)';
-                        
+
                         const pnlSign = pos.pnl >= 0 ? '+' : '';
                         const pnlClass = pos.pnl >= 0 ? 'positive' : 'negative';
-                        
+
                         row.innerHTML = `
                             <td style="padding: 6px; font-weight: bold; color: var(--text);">${pos.symbol}</td>
                             <td style="padding: 6px; font-weight: bold;" class="${pos.side === 'BUY' ? 'positive' : 'negative'}">${pos.side === 'BUY' ? 'LONG' : 'SHORT'}</td>
@@ -2883,7 +2883,7 @@ class OrderFlowDashboard:
                     });
                 }
             }
-            
+
             // 5. Update Executions Log
             const tradesList = document.getElementById('paper-trades-list');
             if (tradesList) {
@@ -2895,21 +2895,21 @@ class OrderFlowDashboard:
                         const li = document.createElement('li');
                         li.style.borderBottom = '1px solid rgba(255, 255, 255, 0.02)';
                         li.style.paddingBottom = '4px';
-                        
+
                         const timeStr = new Date(t.timestamp * 1000).toLocaleTimeString();
                         const actionType = t.type === 'CLOSE' ? 'CLOSE' : (t.type === 'PARTIAL_CLOSE' ? 'PART_CLOSE' : 'OPEN');
                         const sideColor = t.side === 'BUY' ? '#00e676' : '#ff1744';
-                        
+
                         let pnlText = '';
                         if (t.realized_pnl !== 0.0) {
                             pnlText = ` | PnL: ${t.realized_pnl >= 0 ? '+' : ''}$${t.realized_pnl.toFixed(2)}`;
                         }
-                        
+
                         li.innerHTML = `
-                            <span style="color: var(--text-muted);">${timeStr}</span> | 
-                            <span style="font-weight: bold; color: ${sideColor};">${t.side}</span> | 
-                            <span style="font-weight: bold; color: var(--text);">${t.symbol}</span> | 
-                            <span>${t.qty.toFixed(4)} @ $${t.price.toFixed(4)}</span> | 
+                            <span style="color: var(--text-muted);">${timeStr}</span> |
+                            <span style="font-weight: bold; color: ${sideColor};">${t.side}</span> |
+                            <span style="font-weight: bold; color: var(--text);">${t.symbol}</span> |
+                            <span>${t.qty.toFixed(4)} @ $${t.price.toFixed(4)}</span> |
                             <span style="font-size: 10px; color: var(--primary); font-weight: bold;">[${actionType}]</span>${pnlText}
                         `;
                         tradesList.appendChild(li);
@@ -2922,17 +2922,17 @@ class OrderFlowDashboard:
             const msgEl = document.getElementById('paper-order-msg');
             msgEl.innerText = 'Sending order...';
             msgEl.style.color = 'var(--text-muted)';
-            
+
             try {
                 const symbol = document.getElementById('paper-order-symbol').value;
                 const usdtValue = parseFloat(document.getElementById('paper-order-qty').value);
-                
+
                 if (isNaN(usdtValue) || usdtValue <= 0) {
                     msgEl.innerText = 'Error: Invalid USDT amount.';
                     msgEl.style.color = '#ff1744';
                     return;
                 }
-                
+
                 // Fetch the current price from our client-cached data
                 const key = symbol.toUpperCase();
                 const symbolInfo = currentScannerSymbols[key] || currentScannerSymbols[key + 'USDT'] || currentScannerSymbols[key.replace('USDT', '')];
@@ -2941,28 +2941,28 @@ class OrderFlowDashboard:
                     msgEl.style.color = '#ff1744';
                     return;
                 }
-                
+
                 const price = symbolInfo.price;
                 if (!price || price <= 0) {
                     msgEl.innerText = 'Error: Symbol price zero.';
                     msgEl.style.color = '#ff1744';
                     return;
                 }
-                
+
                 // Calculate size in contracts
                 const quantity = usdtValue / price;
-                
+
                 const response = await fetch('/api/paper/order', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ symbol, side, quantity })
                 });
-                
+
                 const result = await response.json();
                 if (result.ok) {
                     msgEl.innerText = `Success: ${side} ${symbol.toUpperCase()} executed.`;
                     msgEl.style.color = '#00e676';
-                    
+
                     // Refresh immediately
                     fetchMetrics();
                 } else {
@@ -2973,7 +2973,7 @@ class OrderFlowDashboard:
                 msgEl.innerText = `Error: ${err.message}`;
                 msgEl.style.color = '#ff1744';
             }
-            
+
             setTimeout(() => { msgEl.innerText = ''; }, 5000);
         }
 
@@ -3033,10 +3033,10 @@ class OrderFlowDashboard:
             activeSymbol = sym.toLowerCase();
             document.getElementById('symbol-details-modal').style.display = 'block';
             document.getElementById('modal-title').innerText = sym.toUpperCase() + ' Details';
-            
+
             // Clear prior stats
             document.getElementById('ladder-body').innerHTML = '<tr><td colspan="3" style="text-align: center; color: var(--text-muted); padding: 20px;">Fetching book ladder...</td></tr>';
-            
+
             // Trigger loop
             if (detailsInterval) clearInterval(detailsInterval);
             fetchSymbolDetails();
@@ -3070,17 +3070,17 @@ class OrderFlowDashboard:
                 const response = await fetch(`/api/symbol?sym=${activeSymbol}`);
                 const data = await response.json();
                 lastDetailsData = data;
-                
+
                 // Update stats
                 document.getElementById('detail-spread').innerText = `${data.spread.toFixed(2)} (${data.spread_bps.toFixed(2)} bps)`;
                 document.getElementById('detail-microprice').innerText = `${data.microprice_dev.toFixed(2)} bps (Micro: ${data.microprice.toFixed(2)})`;
                 document.getElementById('detail-weighted-imbalance').innerText = data.depth_weighted_imbalance.toFixed(2);
-                document.getElementById('detail-depth-imbalances').innerText = 
+                document.getElementById('detail-depth-imbalances').innerText =
                     `${data.imbalance_0_5_bps.toFixed(2)} | ${data.imbalance_5_15_bps.toFixed(2)} | ${data.imbalance_15_30_bps.toFixed(2)}`;
-                
+
                 // Update L2 ladder
                 renderLadder(data);
-                
+
                 // Update Canvas Heatmap
                 drawHeatmap();
             } catch (err) {
@@ -3091,16 +3091,16 @@ class OrderFlowDashboard:
         function renderLadder(data) {
             const tbody = document.getElementById('ladder-body');
             tbody.innerHTML = '';
-            
+
             if (!data.book_history || data.book_history.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: var(--text-muted); padding: 20px;">No depth data available.</td></tr>';
                 return;
             }
-            
+
             const lastSnap = data.book_history[data.book_history.length - 1];
             const bids = Object.entries(lastSnap.bids).map(([p, sz]) => [parseFloat(p), sz]).sort((a,b) => b[0] - a[0]).slice(0, 15);
             const asks = Object.entries(lastSnap.asks).map(([p, sz]) => [parseFloat(p), sz]).sort((a,b) => a[0] - b[0]).slice(0, 15);
-            
+
             // Asks (descending price)
             [...asks].reverse().forEach(([price, size]) => {
                 const tr = document.createElement('tr');
@@ -3111,7 +3111,7 @@ class OrderFlowDashboard:
                 `;
                 tbody.appendChild(tr);
             });
-            
+
             // Spread divider
             const sprTr = document.createElement('tr');
             sprTr.innerHTML = `
@@ -3120,7 +3120,7 @@ class OrderFlowDashboard:
                 </td>
             `;
             tbody.appendChild(sprTr);
-            
+
             // Bids (descending price)
             bids.forEach(([price, size]) => {
                 const tr = document.createElement('tr');
@@ -3137,46 +3137,46 @@ class OrderFlowDashboard:
             const canvas = document.getElementById('heatmap-canvas');
             if (!canvas || !lastDetailsData) return;
             const ctx = canvas.getContext('2d');
-            
+
             const width = canvas.width;
             const height = canvas.height;
             ctx.clearRect(0, 0, width, height);
-            
+
             const history = lastDetailsData.book_history;
             if (history.length === 0) return;
-            
+
             let allPrices = [];
             history.forEach(snap => {
                 Object.keys(snap.bids).forEach(p => allPrices.push(parseFloat(p)));
                 Object.keys(snap.asks).forEach(p => allPrices.push(parseFloat(p)));
             });
-            
+
             if (allPrices.length === 0) return;
             const mid = lastDetailsData.price;
             let maxPrice = Math.max(...allPrices);
             let minPrice = Math.min(...allPrices);
-            
+
             const originalRange = maxPrice - minPrice;
             const range = (originalRange * heatmapZoomFactor) || 1.0;
             maxPrice = mid + range / 2;
             minPrice = mid - range / 2;
-            
+
             const minTime = history[0].timestamp;
             const maxTime = history[history.length - 1].timestamp;
             const timeRange = (maxTime - minTime) || 1.0;
-            
+
             function getX(t) {
                 return ((t - minTime) / timeRange) * (width - 80) + 40;
             }
             function getY(p) {
                 return height - (((p - minPrice) / range) * (height - 60) + 30);
             }
-            
+
             const cellWidth = Math.max(1, (width - 80) / history.length);
-            
+
             history.forEach((snap, idx) => {
                 const tX = getX(snap.timestamp);
-                
+
                 Object.entries(snap.bids).forEach(([pStr, sz]) => {
                     const price = parseFloat(pStr);
                     if (price < minPrice || price > maxPrice) return;
@@ -3185,7 +3185,7 @@ class OrderFlowDashboard:
                     ctx.fillStyle = `rgba(56, 189, 248, ${sizeNorm * 0.7})`;
                     ctx.fillRect(tX, pY - 2, cellWidth + 1, 4);
                 });
-                
+
                 Object.entries(snap.asks).forEach(([pStr, sz]) => {
                     const price = parseFloat(pStr);
                     if (price < minPrice || price > maxPrice) return;
@@ -3195,33 +3195,33 @@ class OrderFlowDashboard:
                     ctx.fillRect(tX, pY - 2, cellWidth + 1, 4);
                 });
             });
-            
+
             ctx.fillStyle = "rgba(148, 163, 184, 0.4)";
             ctx.font = "10px 'JetBrains Mono', monospace";
             ctx.textAlign = "right";
-            
+
             const intervals = 8;
             for (let i = 0; i <= intervals; i++) {
                 const targetPrice = minPrice + (range / intervals) * i;
                 const pY = getY(targetPrice);
                 ctx.fillText(targetPrice.toFixed(2), width - 5, pY + 3);
-                
+
                 ctx.strokeStyle = "rgba(51, 65, 85, 0.15)";
                 ctx.beginPath();
                 ctx.moveTo(40, pY);
                 ctx.lineTo(width - 80, pY);
                 ctx.stroke();
             }
-            
+
             const trades = lastDetailsData.trades || [];
             trades.forEach(t => {
                 if (t.timestamp < minTime || t.timestamp > maxTime) return;
                 if (t.price < minPrice || t.price > maxPrice) return;
-                
+
                 const tX = getX(t.timestamp);
                 const tY = getY(t.price);
                 const r = Math.max(3, Math.min(15, Math.sqrt(t.notional) / 100));
-                
+
                 ctx.beginPath();
                 ctx.arc(tX, tY, r, 0, 2 * Math.PI);
                 if (t.side === "BUY") {
@@ -3234,24 +3234,24 @@ class OrderFlowDashboard:
                 ctx.fill();
                 ctx.stroke();
             });
-            
+
             if (hoverPrice !== null && hoverTime !== null) {
                 const tX = getX(hoverTime);
                 const tY = getY(hoverPrice);
-                
+
                 ctx.strokeStyle = "rgba(56, 189, 248, 0.4)";
                 ctx.setLineDash([4, 4]);
-                
+
                 ctx.beginPath();
                 ctx.moveTo(40, tY);
                 ctx.lineTo(width - 80, tY);
                 ctx.stroke();
-                
+
                 ctx.beginPath();
                 ctx.moveTo(tX, 30);
                 ctx.lineTo(tX, height - 30);
                 ctx.stroke();
-                
+
                 ctx.setLineDash([]);
             }
         }
@@ -3260,22 +3260,22 @@ class OrderFlowDashboard:
             const canvas = document.getElementById('heatmap-canvas');
             if (!canvas) return;
             const tooltip = document.getElementById('heatmap-tooltip');
-            
+
             canvas.addEventListener('mousemove', (e) => {
                 if (!lastDetailsData || lastDetailsData.book_history.length === 0) return;
-                
+
                 const rect = canvas.getBoundingClientRect();
                 const mouseX = e.clientX - rect.left;
                 const mouseY = e.clientY - rect.top;
-                
+
                 const width = canvas.width;
                 const height = canvas.height;
-                
+
                 const history = lastDetailsData.book_history;
                 const minTime = history[0].timestamp;
                 const maxTime = history[history.length - 1].timestamp;
                 const timeRange = (maxTime - minTime) || 1.0;
-                
+
                 const pctX = (mouseX - 40) / (width - 80);
                 if (pctX < 0 || pctX > 1.0) {
                     tooltip.style.display = 'none';
@@ -3284,11 +3284,11 @@ class OrderFlowDashboard:
                     drawHeatmap();
                     return;
                 }
-                
+
                 const targetTime = minTime + pctX * timeRange;
                 let bestSnap = history[0];
                 let bestTimeDiff = Math.abs(bestSnap.timestamp - targetTime);
-                
+
                 history.forEach(snap => {
                     const diff = Math.abs(snap.timestamp - targetTime);
                     if (diff < bestTimeDiff) {
@@ -3296,11 +3296,11 @@ class OrderFlowDashboard:
                         bestSnap = snap;
                     }
                 });
-                
+
                 let allPrices = [];
                 Object.keys(bestSnap.bids).forEach(p => allPrices.push(parseFloat(p)));
                 Object.keys(bestSnap.asks).forEach(p => allPrices.push(parseFloat(p)));
-                
+
                 if (allPrices.length === 0) return;
                 const mid = lastDetailsData.price;
                 const maxPrice = Math.max(...allPrices);
@@ -3308,15 +3308,15 @@ class OrderFlowDashboard:
                 const range = ((maxPrice - minPrice) * heatmapZoomFactor) || 1.0;
                 const limitMax = mid + range / 2;
                 const limitMin = mid - range / 2;
-                
+
                 const pctY = 1.0 - (mouseY - 30) / (height - 60);
                 const targetPrice = limitMin + pctY * range;
-                
+
                 let closestPrice = null;
                 let closestDiff = Infinity;
                 let closestSize = 0;
                 let isBid = true;
-                
+
                 Object.entries(bestSnap.bids).forEach(([pStr, sz]) => {
                     const p = parseFloat(pStr);
                     const diff = Math.abs(p - targetPrice);
@@ -3337,15 +3337,15 @@ class OrderFlowDashboard:
                         isBid = false;
                     }
                 });
-                
+
                 if (closestPrice !== null) {
                     hoverPrice = closestPrice;
                     hoverTime = bestSnap.timestamp;
-                    
+
                     tooltip.style.display = 'block';
                     tooltip.style.left = (e.clientX - rect.left + 15) + 'px';
                     tooltip.style.top = (e.clientY - rect.top + 15) + 'px';
-                    
+
                     const sideText = isBid ? '<span style="color: var(--green);">BID</span>' : '<span style="color: var(--red);">ASK</span>';
                     tooltip.innerHTML = `
                         <strong>Price:</strong> ${closestPrice.toFixed(2)}<br>
@@ -3355,7 +3355,7 @@ class OrderFlowDashboard:
                     drawHeatmap();
                 }
             });
-            
+
             canvas.addEventListener('mouseleave', () => {
                 tooltip.style.display = 'none';
                 hoverPrice = null;
@@ -3364,9 +3364,84 @@ class OrderFlowDashboard:
             });
         });
 
+        async function fetchLiquidityEvents() {
+            try {
+                const resp = await fetch('/api/liquidity-events');
+                if (!resp.ok) return;
+                const data = await resp.json();
+                updateLiquidityEventsUI(data);
+            } catch (err) {
+                console.error("Failed to fetch liquidity events:", err);
+            }
+        }
+
+        function updateLiquidityEventsUI(data) {
+            if (!data) return;
+            const activeContainer = document.getElementById('liquidity-active-events');
+            const recentContainer = document.getElementById('liquidity-recent-events');
+
+            if (activeContainer) {
+                if (!data.active || data.active.length === 0) {
+                    activeContainer.innerHTML = '<span style="color: var(--text-muted);">No active liquidity event trackers.</span>';
+                } else {
+                    let html = '<div style="display: flex; flex-direction: column; gap: 6px;">';
+                    data.active.forEach(ev => {
+                        const sideColor = ev.side === 'BUY' ? '#00e676' : '#ff5252';
+                        const ageSec = Math.max(0, Math.floor((ev.age_ms || 0) / 1000));
+                        html += `
+                            <div style="background: var(--bg-surface); padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">
+                                <div>
+                                    <span style="font-weight: bold; color: var(--text);">${escapeHtml(ev.symbol)}</span>
+                                    <span style="color: ${sideColor}; font-size: 11px; margin-left: 6px;">${escapeHtml(ev.side)}</span>
+                                    <span style="color: var(--text-muted); font-size: 11px; margin-left: 6px;">@ ${ev.level.toFixed(2)}</span>
+                                </div>
+                                <div style="text-align: right;">
+                                    <span class="badge" style="background: var(--bg-base); font-size: 10px;">${escapeHtml(ev.state)}</span>
+                                    <span style="color: var(--text-muted); font-size: 10px; margin-left: 6px;">${ageSec}s ago</span>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    html += '</div>';
+                    activeContainer.innerHTML = html;
+                }
+            }
+
+            if (recentContainer) {
+                if (!data.recent || data.recent.length === 0) {
+                    recentContainer.innerHTML = '<span style="color: var(--text-muted);">No resolved events in current session.</span>';
+                } else {
+                    let html = '<div style="display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto;">';
+                    data.recent.slice(-10).reverse().forEach(res => {
+                        const sideColor = res.side === 'BUY' ? '#00e676' : '#ff5252';
+                        const confScore = res.confidence !== null && res.confidence !== undefined ? res.confidence.toFixed(2) : '-';
+                        html += `
+                            <div style="background: var(--bg-surface); padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">
+                                <div>
+                                    <span style="font-weight: bold; color: var(--text);">${escapeHtml(res.symbol)}</span>
+                                    <span style="color: ${sideColor}; font-size: 11px; margin-left: 6px;">${escapeHtml(res.side)}</span>
+                                    <span style="font-weight: bold; font-size: 11px; margin-left: 6px;">${escapeHtml(res.classification)}</span>
+                                    <span style="color: var(--text-muted); font-size: 10px; margin-left: 6px;">(${escapeHtml(res.reason_code)})</span>
+                                </div>
+                                <div style="text-align: right;">
+                                    <span style="font-size: 11px; color: var(--text-muted);">Uncalibrated score: <strong style="color: var(--text);">${confScore}</strong></span>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    html += '</div>';
+                    recentContainer.innerHTML = html;
+                }
+            }
+        }
+
         // Metrics polling every 1s
         setInterval(fetchMetrics, 1000);
         fetchMetrics();
+
+        // Liquidity Events polling every 1s
+        setInterval(fetchLiquidityEvents, 1000);
+        fetchLiquidityEvents();
 
         // AI Cache polling every 5s
         setInterval(fetchLatestAI, 5000);
