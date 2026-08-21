@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
-from typing import Any, Iterable
+from typing import Any, Iterable, get_args, get_type_hints
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -76,6 +76,28 @@ from main import LiveTradeCoverageProvider, OrderFlowEngine
 from scoring import OrderFlowScorer
 
 
+# Session-level isolation for OrderFlowEngine to prevent default artifact leaks across test suites
+_orig_engine_init = OrderFlowEngine.__init__
+_session_artifact_dir = tempfile.mkdtemp(prefix="orderflow_session_artifacts_")
+_default_artifact_dir = os.path.join(config.BASE_DIR, "liquidity_event_artifacts")
+
+def _isolated_engine_init(self, *args, **kwargs):
+    curr_dir = str(config.LIQUIDITY_EVENT_OUTPUT_DIR)
+    if curr_dir in (_default_artifact_dir, "liquidity_event_artifacts", os.path.abspath("liquidity_event_artifacts")) or (
+        curr_dir.endswith("liquidity_event_artifacts")
+        and not "pytest" in curr_dir
+        and not "orderflow_session_artifacts" in curr_dir
+        and not "Temp" in curr_dir
+        and not "temp" in curr_dir
+    ):
+        with patch("config.LIQUIDITY_EVENT_OUTPUT_DIR", _session_artifact_dir):
+            _orig_engine_init(self, *args, **kwargs)
+    else:
+        _orig_engine_init(self, *args, **kwargs)
+
+OrderFlowEngine.__init__ = _isolated_engine_init
+
+
 # -----------------------------------------------------------------------------
 # Test Fixtures & Helpers
 # -----------------------------------------------------------------------------
@@ -132,12 +154,19 @@ def auto_cleanup_test_resources(tmp_path):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def auto_cleanup_leaked_artifacts_session():
+def assert_no_default_liquidity_artifact_leak():
+    artifact_dir = Path("liquidity_event_artifacts")
+
+    assert not artifact_dir.exists(), (
+        "pre-existing liquidity_event_artifacts directory must be "
+        "removed before acceptance certification"
+    )
+
     yield
-    import shutil
-    p = Path("liquidity_event_artifacts")
-    if p.exists():
-        shutil.rmtree(p, ignore_errors=True)
+
+    assert not artifact_dir.exists(), (
+        "acceptance suite leaked liquidity_event_artifacts into worktree"
+    )
 
 
 
@@ -1458,7 +1487,20 @@ def test_gate_35_typed_context_adapter():
     assert evidence.values["wall_replenishment"] == rep_val
     assert evidence.values["stacking_pulling"] == sp_val
 
-    # 3. Inspect signature of LiquidityEvidenceBuilder.build
+    # 3. Certify actual parameter type annotations using get_type_hints
+    type_hints = get_type_hints(LiquidityEvidenceBuilder.build)
+    for param_name in (
+        "absorption",
+        "depth_weighted_imbalance",
+        "replenishment",
+        "stacking_pulling",
+    ):
+        assert param_name in type_hints
+        annotation_args = set(get_args(type_hints[param_name]))
+        assert EvidenceValue in annotation_args
+        assert type(None) in annotation_args
+
+    # Retain inspect.signature as an additional check
     sig = inspect.signature(builder.build)
     for param_name in ("absorption", "depth_weighted_imbalance", "replenishment", "stacking_pulling"):
         assert param_name in sig.parameters
@@ -1728,7 +1770,7 @@ def test_gate_40_identity_restart_durability(tmp_path: Path):
     assert persisted_c.status == "CLAIMED_UNRESOLVED"
     auth_c1.close()
 
-    # Session 2: Reopen same DB, recover with retained coverage and confirming trades
+    # Session 2: Reopen same DB, preload retained historical trades FIRST, then recover
     auth_c2 = SQLiteIdentityAuthority(db_path_c)
     store_c2 = LiquidityEventStore(policy)
     recovered_results: list[LiquidityEventResult] = []
@@ -1742,11 +1784,7 @@ def test_gate_40_identity_restart_durability(tmp_path: Path):
     )
 
     try:
-        rec_res_c = engine_c2.recover_claimed_unresolved(StaticCoverageProvider(make_safe_coverage()))
-        assert engine_c2.telemetry.recovered_events_count == 1
-        assert len(store_c2.active("BTCUSDT")) == 1
-
-        # Feed trades to resolve recovered event
+        # Preload retained historical trades into fresh engine before recovery
         trades_c = [
             make_trade(price=99.90, time_ms=10_500, seq=1, aggressor_side=AggressorSide.SELL),
             make_trade(price=100.10, time_ms=11_000, seq=2, aggressor_side=AggressorSide.BUY),
@@ -1757,16 +1795,24 @@ def test_gate_40_identity_restart_durability(tmp_path: Path):
         for t in trades_c:
             engine_c2.on_trade(t, make_safe_coverage())
 
+        # The recovery call itself must resolve the event using the preloaded history
+        rec_res_c = engine_c2.recover_claimed_unresolved(StaticCoverageProvider(make_safe_coverage()))
+        assert engine_c2.telemetry.recovered_events_count == 1
+        assert len(rec_res_c) == 1
         assert len(recovered_results) == 1
-        assert recovered_results[0].classification is EventClassification.FAILED_BREAKDOWN
-        assert recovered_results[0].reason_code == "RECLAIM_CONFIRMED"
+
+        assert rec_res_c[0].classification is EventClassification.FAILED_BREAKDOWN
+        assert rec_res_c[0].reason_code == "RECLAIM_CONFIRMED"
+        assert rec_res_c[0].to_canonical_dict() == recovered_results[0].to_canonical_dict()
+
         persisted_final = auth_c2.lookup(obs_c.event_id)
         assert persisted_final is not None
         assert persisted_final.status == "FINALIZED"
 
-        # Check transition sequence uniqueness
-        seqs = [t.transition_sequence for t in recovered_transitions]
-        assert len(seqs) == len(set(seqs))
+        # Check durable transition sequence continuity and uniqueness
+        persisted_sequences = auth_c2.persisted_transition_sequences(obs_c.event_id)
+        assert len(persisted_sequences) == len(set(persisted_sequences))
+        assert persisted_sequences == set(range(min(persisted_sequences), max(persisted_sequences) + 1))
 
         # A second recovery call emits no duplicate result
         rec_res_c2 = engine_c2.recover_claimed_unresolved(StaticCoverageProvider(make_safe_coverage()))
