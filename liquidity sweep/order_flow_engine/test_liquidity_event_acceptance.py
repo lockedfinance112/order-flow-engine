@@ -76,28 +76,6 @@ from main import LiveTradeCoverageProvider, OrderFlowEngine
 from scoring import OrderFlowScorer
 
 
-# Session-level isolation for OrderFlowEngine to prevent default artifact leaks across test suites
-_orig_engine_init = OrderFlowEngine.__init__
-_session_artifact_dir = tempfile.mkdtemp(prefix="orderflow_session_artifacts_")
-_default_artifact_dir = os.path.join(config.BASE_DIR, "liquidity_event_artifacts")
-
-def _isolated_engine_init(self, *args, **kwargs):
-    curr_dir = str(config.LIQUIDITY_EVENT_OUTPUT_DIR)
-    if curr_dir in (_default_artifact_dir, "liquidity_event_artifacts", os.path.abspath("liquidity_event_artifacts")) or (
-        curr_dir.endswith("liquidity_event_artifacts")
-        and not "pytest" in curr_dir
-        and not "orderflow_session_artifacts" in curr_dir
-        and not "Temp" in curr_dir
-        and not "temp" in curr_dir
-    ):
-        with patch("config.LIQUIDITY_EVENT_OUTPUT_DIR", _session_artifact_dir):
-            _orig_engine_init(self, *args, **kwargs)
-    else:
-        _orig_engine_init(self, *args, **kwargs)
-
-OrderFlowEngine.__init__ = _isolated_engine_init
-
-
 # -----------------------------------------------------------------------------
 # Test Fixtures & Helpers
 # -----------------------------------------------------------------------------
@@ -153,9 +131,9 @@ def auto_cleanup_test_resources(tmp_path):
                         pass
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="module", autouse=True)
 def assert_no_default_liquidity_artifact_leak():
-    artifact_dir = Path("liquidity_event_artifacts")
+    artifact_dir = Path(config.BASE_DIR) / "liquidity_event_artifacts"
 
     assert not artifact_dir.exists(), (
         "pre-existing liquidity_event_artifacts directory must be "
